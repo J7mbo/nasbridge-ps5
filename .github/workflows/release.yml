@@ -1,0 +1,101 @@
+# Builds NASBridge, runs the tests, and publishes the release installer.
+#
+# Push a tag named after VERSION (VERSION 0.3.0, tag v0.3.0) and this builds
+# out/NASBridge-<version>.elf with `make release` and publishes a GitHub
+# Release for that tag with it, plus the ShadowMountPlus build NASBridge works
+# best with (SMP_TAG below, from J7mbo/shadowmountplus's releases), so both
+# downloads are in one place. Run it by hand (Actions tab, "Run workflow") to build
+# and test without releasing: the ELF is then kept as the run's artifact.
+#
+# Everything builds inside the project's toolchain image, exactly as
+# `make release` does locally. The image takes a while to build the first
+# time; later runs reuse it from GitHub's cache until the Dockerfile changes.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # to create the release
+
+env:
+  # The ShadowMountPlus release attached to NASBridge's releases.
+  SMP_REPO: J7mbo/shadowmountplus
+  SMP_TAG: v1.7beta5-nasbridge.1
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the tag matches VERSION
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(cat VERSION)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match VERSION ($version): tag v$version instead."
+            exit 1
+          fi
+
+      # Before the long build, so a missing ShadowMountPlus release fails fast.
+      - name: Fetch the ShadowMountPlus build
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$SMP_TAG" --repo "$SMP_REPO" \
+            --pattern "ShadowMountPlus_${SMP_TAG}.zip" --dir out
+
+      # The Makefile names the image after the Dockerfile's hash, and builds it
+      # only if that image is missing, so building it here under the same name
+      # (with GitHub's cache) means `make` uses it as it is.
+      - name: Name the toolchain image
+        id: image
+        run: echo "tag=nasbridge-ps5-toolchain:$(sha256sum Dockerfile | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the toolchain image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.image.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test
+        run: make test
+
+      - name: Build the release installer
+        run: make release
+
+      - name: Keep the ELF with this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: NASBridge-${{ github.sha }}
+          path: out/NASBridge-*.elf
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(cat VERSION)
+          cat > release-notes.md <<EOF
+          ## Install
+
+          1. **ShadowMountPlus with NASBridge support:** unzip \`ShadowMountPlus_${SMP_TAG}.zip\` and send \`shadowmountplus.elf\` to your PS5's ELF loader (port 9021). Its source: [${SMP_REPO} at ${SMP_TAG}](https://github.com/${SMP_REPO}/tree/${SMP_TAG}).
+          2. **NASBridge:** send \`NASBridge-${version}.elf\` to the ELF loader (port 9021). A notification says when it's installed.
+
+          More in the [README](https://github.com/${GITHUB_REPOSITORY}#install).
+          EOF
+          gh release create "$GITHUB_REF_NAME" \
+            out/NASBridge-"$version".elf out/ShadowMountPlus_"$SMP_TAG".zip \
+            --title "NASBridge $version" --notes-file release-notes.md --generate-notes
