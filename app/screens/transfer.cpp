@@ -6,6 +6,7 @@
 
 #include "concepts/copy_helper.hpp"
 #include "concepts/delete_helper.hpp"
+#include "concepts/exfat_image.hpp"
 #include "concepts/file_calls.hpp"
 #include "concepts/http.hpp"
 #include "concepts/library_cache.hpp"
@@ -74,6 +75,7 @@ constexpr std::uint64_t kSyncMs = 250;
 constexpr std::uint64_t kSyncBytes = 64ull * 1024ull * 1024ull;
 
 std::string g_root; // set_transfer_root (tests); empty: data_root()
+std::atomic<bool> g_as_image{false}; // set_copy_as_image: folder games become images
 
 // Which pieces of the big file being copied are in: one file at a time.
 std::string part_record()
@@ -353,6 +355,25 @@ void set_copy_streams(int streams)
     g_copy_streams.store(streams < 1 ? 1 : (streams > kStreams ? kStreams : streams));
 }
 
+void set_copy_as_image(bool on)
+{
+    g_as_image.store(on);
+}
+
+bool copy_as_image()
+{
+    return g_as_image.load();
+}
+
+std::uint64_t image_estimate(std::uint64_t bytes)
+{
+    // The room kept free inside (exfat_image.hpp: 0.5%, 64 MiB to 512 MiB),
+    // what each file wastes of its last cluster (64 KiB; some 32 KiB a file
+    // on average, taken as 1%), and the file system's own few MB.
+    const std::uint64_t spare = std::min<std::uint64_t>(std::max<std::uint64_t>(bytes / 200, 64ull << 20), 512ull << 20);
+    return bytes + bytes / 100 + spare + (16ull << 20);
+}
+
 std::string plan_to_text(const CopyPlan &plan)
 {
     std::string text = "nasbridge-copy 1\n";
@@ -362,6 +383,12 @@ std::string plan_to_text(const CopyPlan &plan)
     line("title", plan.title);
     line("title_id", plan.title_id);
     line("image", plan.image ? "1" : "0");
+    if (plan.as_image)
+    {
+        line("as_image", "1");
+        line("image_size", std::to_string(plan.image_size));
+        line("image_layout", std::to_string(plan.image_layout));
+    }
     line("source", plan.source);
     line("destination", plan.destination);
     line("name", plan.name);
@@ -407,6 +434,12 @@ bool plan_from_text(const std::string &text, CopyPlan *plan)
             plan->title_id = value;
         else if (key == "image")
             plan->image = value == "1";
+        else if (key == "as_image")
+            plan->as_image = value == "1";
+        else if (key == "image_size")
+            plan->image_size = std::strtoull(value.c_str(), nullptr, 10);
+        else if (key == "image_layout")
+            plan->image_layout = std::strtoull(value.c_str(), nullptr, 10);
         else if (key == "source")
             plan->source = value;
         else if (key == "destination")
@@ -519,6 +552,9 @@ struct Item
 
     std::uint64_t size() const
     {
+        if (plan.as_image)
+            return plan.listed && plan.image_size > 0 ? plan.image_size
+                                                     : image_estimate(plan.listed ? plan.total : estimate);
         return plan.listed ? plan.total : estimate;
     }
 };
@@ -939,6 +975,38 @@ class Copier
             shared_->save();
         }
 
+        // A folder game as one exFAT image: laid out from the list, the same
+        // way every time, so a resumed copy lays it out again rather than
+        // keeping it. (A different layout, from another NASBridge version,
+        // starts the image again: what's there wouldn't fit it.)
+        ExfatImage image;
+        if (plan.as_image)
+        {
+            std::string problem;
+            if (!plan_exfat_image(plan.folders, image_files(plan),
+                                  plan.title_id.size() <= 11 ? plan.title_id : std::string(), &image,
+                                  &problem))
+                return fail("This game can't be copied as an exFAT image (" + problem +
+                                "). Remove it from the queue, turn off \"Copy as an exFAT image\" "
+                                "in Settings, and add it again to copy it as a folder",
+                            why);
+            const std::uint64_t layout = layout_of(image);
+            if (layout != plan.image_layout || image.size != plan.image_size)
+            {
+                if (plan.image_layout != 0 && !plan.moving)
+                    ::unlink(staging_.c_str());
+                plan.image_size = image.size;
+                plan.image_layout = layout;
+                std::lock_guard<std::mutex> hold(shared_->lock);
+                if (Item *item = shared_->item(entry_))
+                {
+                    item->plan = plan;
+                    item->done = 0;
+                }
+                shared_->save();
+            }
+        }
+
         // 2. Somewhere to put it: not over a game of the same name. (When an
         //    earlier run had begun moving the game into place and nothing is
         //    left in the staging folder, the move happened: only the rescan
@@ -952,7 +1020,7 @@ class Copier
         }
         if (::mkdir(incoming.c_str(), 0777) != 0 && errno != EEXIST)
             return fail(errno_text("Couldn't write to the drive", errno), why);
-        if (!plan.image && ::mkdir(staging_.c_str(), 0777) != 0 && errno != EEXIST)
+        if (!plan.one_file() && ::mkdir(staging_.c_str(), 0777) != 0 && errno != EEXIST)
             return fail(errno_text("Couldn't write to the drive", errno), why);
         {
             // From here it has files on the drive: removing it deletes them.
@@ -962,7 +1030,7 @@ class Copier
             shared_->save();
         }
         for (const std::string &folder : plan.folders)
-            if (!make_folders(staging_, folder))
+            if (!plan.as_image && !make_folders(staging_, folder))
                 return fail(errno_text(("Couldn't make " + folder).c_str(), errno), why);
 
         // 3. Each file, carrying on from what is already there.
@@ -970,44 +1038,59 @@ class Copier
         buffer_.reserve(kWriteBlock + 64 * 1024); // a block plus one read
         std::uint64_t done = 0;
         int files_done = 0;
-        for (std::size_t index = 0; index < plan.files.size();)
+        if (plan.as_image)
         {
-            // A run of small files goes to the copy helper in one batch (one
-            // request at a time costs more than the files themselves).
-            if (!plan.image && batch_ok_ && copy_helper_enabled() && !helper_unavailable_ &&
-                plan.files[index].size < kBatchFileMax)
+            const Result result = copy_image(plan, image, why);
+            if (result == Result::stopped)
+                return stopped_or(Outcome::paused);
+            if (result != Result::ok)
+                return stopped_or(Outcome::failed);
+            if (!check_image(plan, why))
+                return stopped_or(Outcome::failed);
+            done = image.size;
+            files_done = static_cast<int>(plan.files.size());
+        }
+        else
+        {
+            for (std::size_t index = 0; index < plan.files.size();)
             {
-                std::size_t end = index;
-                while (end < plan.files.size() && plan.files[end].size < kBatchFileMax)
-                    ++end;
-                const Result result = copy_batch(plan, index, end, &done, &files_done, why);
+                // A run of small files goes to the copy helper in one batch (one
+                // request at a time costs more than the files themselves).
+                if (!plan.image && batch_ok_ && copy_helper_enabled() && !helper_unavailable_ &&
+                    plan.files[index].size < kBatchFileMax)
+                {
+                    std::size_t end = index;
+                    while (end < plan.files.size() && plan.files[end].size < kBatchFileMax)
+                        ++end;
+                    const Result result = copy_batch(plan, index, end, &done, &files_done, why);
+                    if (result == Result::stopped)
+                        return stopped_or(Outcome::paused);
+                    if (result == Result::failed)
+                        return stopped_or(Outcome::failed);
+                    if (result == Result::ok)
+                        index = end;
+                    else
+                        batch_ok_ = false; // an older helper: one at a time from here
+                    continue;
+                }
+                const CopyFile &file = plan.files[index];
+                ++index;
+                const std::string local = plan.image ? staging_ : staging_ + "/" + file.path;
+                const std::string remote = plan.image ? plan.source : plan.source + file.path;
+                {
+                    std::lock_guard<std::mutex> hold(shared_->lock);
+                    if (Item *item = shared_->item(entry_))
+                        item->done = done;
+                    shared_->files_done = files_done;
+                }
+                const Result result = copy_file(remote, local, file.size, done, file.path, why);
                 if (result == Result::stopped)
                     return stopped_or(Outcome::paused);
                 if (result == Result::failed)
                     return stopped_or(Outcome::failed);
-                if (result == Result::ok)
-                    index = end;
-                else
-                    batch_ok_ = false; // an older helper: one at a time from here
-                continue;
+                done += file.size;
+                ++files_done;
             }
-            const CopyFile &file = plan.files[index];
-            ++index;
-            const std::string local = plan.image ? staging_ : staging_ + "/" + file.path;
-            const std::string remote = plan.image ? plan.source : plan.source + file.path;
-            {
-                std::lock_guard<std::mutex> hold(shared_->lock);
-                if (Item *item = shared_->item(entry_))
-                    item->done = done;
-                shared_->files_done = files_done;
-            }
-            const Result result = copy_file(remote, local, file.size, done, file.path, why);
-            if (result == Result::stopped)
-                return stopped_or(Outcome::paused);
-            if (result == Result::failed)
-                return stopped_or(Outcome::failed);
-            done += file.size;
-            ++files_done;
         }
         {
             std::lock_guard<std::mutex> hold(shared_->lock);
@@ -1346,6 +1429,235 @@ class Copier
             }
         }
         return Result::ok;
+    }
+
+    // ---- a folder game as one exFAT image, through the copy helper payload ----
+
+    static std::vector<ImageFile> image_files(const CopyPlan &plan)
+    {
+        std::vector<ImageFile> files;
+        files.reserve(plan.files.size());
+        for (const CopyFile &file : plan.files)
+            files.push_back({file.path, file.size});
+        return files;
+    }
+
+    // FNV-1a over the pieces: what the image's bytes will be, but for the game's.
+    static std::uint64_t layout_of(const ExfatImage &image)
+    {
+        std::uint64_t hash = 14695981039346656037ull;
+        const auto mix = [&](const void *data, std::size_t length)
+        {
+            const unsigned char *bytes = static_cast<const unsigned char *>(data);
+            for (std::size_t i = 0; i < length; ++i)
+                hash = (hash ^ bytes[i]) * 1099511628211ull;
+        };
+        for (const ImagePiece &piece : image.pieces)
+        {
+            const char kind = static_cast<char>(piece.kind);
+            mix(&kind, 1);
+            mix(&piece.length, sizeof(piece.length));
+            mix(&piece.file, sizeof(piece.file));
+            mix(piece.data.data(), piece.data.size());
+        }
+        return hash == 0 ? 1 : hash;
+    }
+
+    // The image into staging_, front to back, carrying on from what's there.
+    Result copy_image(const CopyPlan &plan, const ExfatImage &image, std::string *why)
+    {
+        if (!copy_helper_enabled())
+        {
+            *why = "Copying as an exFAT image needs the copy helper, which isn't available";
+            return Result::failed;
+        }
+        // The image in the helper's words; where each file ends in it (so the
+        // file count follows the copy), and how many are empty (no piece).
+        std::string pieces;
+        std::vector<std::uint64_t> ends;
+        std::uint64_t at = 0;
+        for (const ImagePiece &piece : image.pieces)
+        {
+            at += piece.length;
+            switch (piece.kind)
+            {
+            case ImagePiece::Kind::bytes:
+                pieces += "D " + std::to_string(piece.length) + "\n" + piece.data;
+                break;
+            case ImagePiece::Kind::zeros:
+                pieces += "Z " + std::to_string(piece.length) + "\n";
+                break;
+            case ImagePiece::Kind::file:
+            {
+                const std::string remote = plan.source + plan.files[piece.file].path;
+                pieces += "F " + std::to_string(piece.length) + " " +
+                          (smb() ? smb_location(remote).path : percent_encode_path(remote)) + "\n";
+                ends.push_back(at);
+                break;
+            }
+            }
+        }
+        const int empty = static_cast<int>(plan.files.size() - ends.size());
+        // Over WebDAV, the header lines every GET carries, kept open between files.
+        std::string headers;
+        if (!smb())
+        {
+            const std::string request = build_request(connection_, "GET", "/", "", "");
+            const std::size_t first = request.find("\r\n") + 2;
+            headers = request.substr(first, request.size() - first - 2); // not the blank line
+            const std::size_t close_at = headers.find("Connection: close\r\n");
+            if (close_at != std::string::npos)
+                headers.replace(close_at, 17, "Connection: keep-alive");
+        }
+        const SmbSignIn smb_sign_in = smb() ? sign_in() : SmbSignIn{};
+        // Big files come in a few parts at a time; small ones several at once.
+        const int workers = std::max(helper_streams(), std::min(batch_workers(), 8));
+        int failures = 0;
+        while (true)
+        {
+            if (stopping())
+                return Result::stopped;
+            std::uint64_t first = ~0ull, last = 0;
+            window_start_ = now_ms();
+            window_bytes_ = 0;
+            const auto image_progress =
+                [&](std::uint64_t position, std::uint64_t write_ms, std::uint64_t elapsed_ms, int connections)
+                {
+                    if (first == ~0ull)
+                        first = last = position;
+                    measure(position, position > last ? static_cast<std::size_t>(position - last) : 0);
+                    last = position;
+                    const int files_in =
+                        empty + static_cast<int>(std::upper_bound(ends.begin(), ends.end(), position) - ends.begin());
+                    char report[64];
+                    std::snprintf(report, sizeof(report), "helper image x%d  write %d%%", connections,
+                                  elapsed_ms > 0 ? static_cast<int>(write_ms * 100 / elapsed_ms) : 0);
+                    std::lock_guard<std::mutex> hold(shared_->lock);
+                    shared_->files_done = files_in;
+                    shared_->connections = connections > 0 ? connections : 1;
+                    shared_->conn_report = report;
+                };
+            const auto image_stopping = [this] { return stopping(); };
+            const HelperCopy copy = copy_image_with_helper(
+                connection_.host, connection_.effective_port(), image.size, staging_, headers,
+                smb() ? &smb_sign_in : nullptr, pieces, workers, image_progress, image_stopping);
+            {
+                std::lock_guard<std::mutex> hold(shared_->lock);
+                shared_->connections = 0;
+                shared_->conn_report.clear();
+            }
+            using End = HelperCopy::End;
+            if (copy.end != End::unavailable)
+                helper_used_ = true;
+            switch (copy.end)
+            {
+            case End::ok:
+                return Result::ok;
+            case End::stopped:
+                return Result::stopped;
+            case End::unavailable:
+                if (!helper_used_)
+                {
+                    *why = "The copy helper didn't start, and copying as an exFAT image needs it";
+                    return Result::failed;
+                }
+                break; // it ran before: it may come back, so try again
+            case End::unsupported:
+                if (copy.why.find("copy request") != std::string::npos)
+                    *why = "The copy helper running on the PS5 is from an older NASBridge. It "
+                           "closes after 2 minutes unused; then Resume";
+                else
+                    *why = "This NAS won't send part of a file (" + copy.why +
+                           "), which copying as an exFAT image needs";
+                return Result::failed;
+            case End::refused:
+            {
+                char text[96];
+                std::snprintf(text, sizeof(text), "The NAS refused a file (HTTP %d)", copy.status);
+                *why = copy.status != 0 ? std::string(text) + " " + copy.why.substr(copy.why.find(' ') + 1)
+                                        : "The NAS refused a file (" + copy.why + ")";
+                return Result::failed;
+            }
+            case End::file:
+                *why = "Couldn't create the image on the drive (" + copy.why + ")";
+                return Result::failed;
+            case End::write:
+                *why = "Couldn't write to the drive (" + copy.why + ")";
+                return Result::failed;
+            case End::changed:
+                *why = "A file changed on the NAS since the library was read: refresh it and try again";
+                return Result::failed;
+            case End::lost:
+            case End::network:
+                break;
+            }
+            if (stopping())
+                return Result::stopped;
+            if (first != ~0ull && last > first + kRefetch)
+                failures = 0; // it got somewhere: the count starts again
+            if (++failures > kRetries)
+            {
+                *why = copy.end == End::network ? "Lost the connection to the NAS"
+                                                : "The copy helper stopped working";
+                return Result::failed;
+            }
+            {
+                std::lock_guard<std::mutex> hold(shared_->lock);
+                shared_->detail = copy.why.empty()
+                                      ? std::string("Connection lost, trying again")
+                                      : "Connection lost (" + copy.why + "), trying again";
+                shared_->rate = 0.0;
+            }
+            for (int waited = 0; waited < failures * 2000 && !stopping(); waited += 100)
+                sleep_ms(100);
+            {
+                std::lock_guard<std::mutex> hold(shared_->lock);
+                shared_->detail.clear();
+            }
+        }
+    }
+
+    // Reads the copied image back: every folder and file where the layout
+    // put it, at its size. One that doesn't is deleted, so Resume starts it
+    // again rather than adding a broken game.
+    bool check_image(const CopyPlan &plan, std::string *why)
+    {
+        const int fd = ::open(staging_.c_str(), O_RDONLY);
+        if (fd < 0)
+        {
+            *why = errno_text("Couldn't open the copied image", errno);
+            return false;
+        }
+        const ExfatReader::ReadAt read = [fd](std::uint64_t offset, std::size_t length, std::string *out)
+        {
+            out->assign(length, '\0');
+            std::size_t got = 0;
+            while (got < length)
+            {
+                const ssize_t n = ::pread(fd, &(*out)[got], length - got, static_cast<off_t>(offset + got));
+                if (n < 0 && errno == EINTR)
+                    continue;
+                if (n <= 0)
+                    return false;
+                got += static_cast<std::size_t>(n);
+            }
+            return true;
+        };
+        std::string problem;
+        const bool ok = check_exfat_image(read, plan.folders, image_files(plan), &problem);
+        ::close(fd);
+        if (ok)
+            return true;
+        ::unlink(staging_.c_str());
+        {
+            std::lock_guard<std::mutex> hold(shared_->lock);
+            if (Item *item = shared_->item(entry_))
+                item->done = 0;
+            shared_->save();
+        }
+        *why = "The copied image didn't read back as the game (" + problem +
+               "), so it was deleted. Resume copies it again";
+        return false;
     }
 
     // ---- a file, through the copy helper payload ----
@@ -2526,6 +2838,14 @@ std::string discard_files(const CopyPlan &plan, const std::function<void(float)>
     const std::string incoming = plan.destination + "/" + kIncoming;
     const std::string staging = incoming + "/" + plan.name;
     std::string problem;
+    if (plan.as_image)
+    {
+        // One file, whatever the game holds.
+        if (::unlink(staging.c_str()) != 0 && errno != ENOENT)
+            problem = errno_text(("Couldn't delete " + plan.name).c_str(), errno);
+        ::rmdir(incoming.c_str());
+        return problem;
+    }
     const std::size_t total = plan.files.size() + plan.folders.size();
     std::size_t done = 0;
     const auto step = [&]
@@ -3107,6 +3427,11 @@ bool Transfers::enqueue(const Connection &connection, const NasGame &game, const
     plan.destination = destination;
     plan.name = copy_name(game);
     plan.nas = nas_identity(connection);
+    if (!game.image && copy_as_image())
+    {
+        plan.as_image = true;
+        plan.name += ".exfat";
+    }
     if (!safe_name(plan.name) || plan.entry.find('\n') != std::string::npos ||
         plan.title.find('\n') != std::string::npos)
     {
@@ -3320,7 +3645,7 @@ QueueStatus Transfers::queue() const
         entry.size = item.size();
         entry.done = std::min(item.done, item.size());
         entry.started = item.started;
-        entry.image = item.plan.image;
+        entry.image = item.plan.one_file();
         status.entries.push_back(entry);
     }
     status.phase = shared_->phase;

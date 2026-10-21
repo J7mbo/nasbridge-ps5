@@ -55,6 +55,14 @@ class ExfatReader
     {
     }
 
+    // How big a folder may be (bytes of entries, and entries): a cover needs
+    // little, checking a whole image more.
+    void set_limits(std::size_t max_folder_bytes, int max_folder_entries)
+    {
+        max_folder_bytes_ = max_folder_bytes;
+        max_folder_entries_ = max_folder_entries;
+    }
+
     // Reads the boot sector (at the start, or in the first MBR partition).
     bool open(std::string *why);
     const ExfatGeometry &geometry() const
@@ -90,6 +98,8 @@ class ExfatReader
     // one request per cluster.
     std::uint64_t fat_window_start_ = 0;
     std::string fat_window_;
+    std::size_t max_folder_bytes_ = 4u * 1024u * 1024u;
+    int max_folder_entries_ = 4096;
 };
 
 // Case-insensitive (ASCII) lookup in a folder listing; nullptr when absent.

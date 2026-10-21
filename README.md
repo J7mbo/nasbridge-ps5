@@ -122,6 +122,21 @@ Your NAS's games folder can hold:
 
 NASBridge only reads from your NAS. It never changes or deletes anything there.
 
+### Copying a game folder as an exFAT image
+
+Turn on **Copy as an exFAT image** in Settings > Copying, and each game
+folder you queue arrives as one `.exfat` file (`Astro Bot.exfat`) that
+ShadowMountPlus mounts, instead of a folder of files. It's made while the
+game copies, so it needs no more room than the game itself plus a little:
+up to 64 KiB per file, and 64 to 512 MB kept free inside the image.
+
+- It needs the copy helper and a NAS that sends parts of files (WebDAV range
+  requests; every SMB server does).
+- A game with two names in one folder that differ only in case can't be an
+  image, because exFAT ignores case. NASBridge says so before copying anything.
+- The setting applies to games queued after it's turned on. Image games on
+  the NAS are copied as they are either way.
+
 ## Good to know
 
 - **Deleting big games takes a while.** The PS5 deletes files at around 200
@@ -178,6 +193,9 @@ Dockerfile, Makefile, ps5.mk   the toolchain and build
 - Built on the [PS5 payload SDK](https://github.com/ps5-payload-dev/sdk).
 - SMB support uses [libsmb2](https://github.com/sahlberg/libsmb2) by Ronnie
   Sahlberg (LGPL-2.1-or-later).
+- Copying as an exFAT image follows the image layout of
+  [PS5 Dump Forge](https://github.com/quer3q/ps5-dump-forge) by quer3q
+  (GPL-3.0-or-later), and uses its up-case table.
 - Games are added to the home screen by
   [ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus).
 

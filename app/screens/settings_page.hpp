@@ -60,6 +60,7 @@ class SettingsPage
     {
         kConnections = 1,
         kSmallFiles,
+        kAsImage,
         kKeepAwake,
         kSounds,
         kDebugInfo,

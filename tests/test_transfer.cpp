@@ -5,6 +5,7 @@
 #include "wait_port.hpp"
 #include "concepts/copy_helper.hpp"
 #include "concepts/delete_helper.hpp"
+#include "concepts/exfat_image.hpp"
 #include "concepts/notify.hpp"
 #include "concepts/smp.hpp"
 #include "concepts/transfer.hpp"
@@ -177,6 +178,57 @@ NasGame folder_game(const std::string &entry, const std::string &base, std::uint
     game.title_id = "PPSA01111";
     game.size = size;
     return game;
+}
+
+// "" when every file under `folder` reads back from the image identical
+// (through NASBridge's own exFAT reader), or the first that doesn't.
+std::string image_mismatch(const std::string &image, const std::string &folder)
+{
+    const std::string list = g_work + "/image-files.txt";
+    std::system(("cd \"" + folder + "\" && find . -type f | sed 's|^\\./||' > \"" + list + "\"").c_str());
+    std::ifstream names(list);
+    std::string path;
+    int count = 0;
+    while (std::getline(names, path))
+    {
+        ExfatReader reader([&image](std::uint64_t offset, std::size_t length, std::string *out)
+                           {
+                               std::ifstream in(image, std::ios::binary);
+                               out->assign(length, '\0');
+                               in.seekg(static_cast<std::streamoff>(offset));
+                               in.read(&(*out)[0], static_cast<std::streamsize>(length));
+                               return static_cast<std::size_t>(in.gcount()) == length;
+                           });
+        reader.set_limits(64u << 20, 1 << 20);
+        std::string why;
+        std::vector<ExfatFile> entries;
+        if (!reader.open(&why) || !reader.list_root(&entries, &why))
+            return "the image doesn't open: " + why;
+        std::size_t start = 0;
+        std::string data;
+        bool found = false;
+        for (;;)
+        {
+            const std::size_t slash = path.find('/', start);
+            const std::string part = path.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+            const ExfatFile *entry = find_entry(entries, part.c_str());
+            if (entry == nullptr)
+                break;
+            if (slash == std::string::npos)
+            {
+                found = reader.read(*entry, 64u << 20, &data, &why);
+                break;
+            }
+            const ExfatFile inside = *entry;
+            if (!reader.list(inside, &entries, &why))
+                break;
+            start = slash + 1;
+        }
+        if (!found || data != read_text(folder + "/" + path))
+            return path;
+        ++count;
+    }
+    return count == 0 ? "no files" : "";
 }
 
 NasGame image_game(std::uint64_t size)
@@ -1639,6 +1691,80 @@ int main(int argc, char **argv)
             std::remove((ps5root + "/crash_multi").c_str());
             clean("Copy.exfat");
             notes();
+
+            // f. Copy as an exFAT image: a folder game becomes one .exfat file
+            //    holding every file, identical. Paused part-way and NASBridge
+            //    opened again, it carries on from the image's length.
+            set_copy_as_image(true);
+            {
+                const std::string image = dest + "/Many Files.exfat";
+                const std::string staged_image = dest + "/.nasbridge-incoming/Many Files.exfat";
+                set_control("{\"throttle\": 1000000}");
+                {
+                    Transfers first;
+                    first.set_space_check(space);
+                    first.enqueue(connection, many_game, "Many Files", dest, &why);
+                    bool one_file = false;
+                    std::uint64_t size = 0;
+                    wait_for(first, [&](const QueueStatus &q)
+                             {
+                                 if (q.entries.empty())
+                                     return true;
+                                 one_file = q.entries[0].image;
+                                 size = q.entries[0].size;
+                                 return q.entries[0].done > (6u << 20);
+                             }, 60);
+                    first.pause();
+                    wait_for(first, stopped);
+                    // At most: each file's last cluster (64 KiB), the 64 MiB kept
+                    // free inside, and the file system's own few MB.
+                    const std::uint64_t most = many_size + static_cast<std::uint64_t>(many_files) * 65536 +
+                                               (64u << 20) + (8u << 20);
+                    check(one_file && size > many_size && size <= most,
+                          "a folder game queued as an image is one file, a little bigger",
+                          std::to_string(size) + " for " + std::to_string(many_size));
+                }
+                struct stat part{};
+                check(::stat(staged_image.c_str(), &part) == 0 && part.st_size > 0 && !there(dest + "/Many Files"),
+                      "while paused, the image is one file in the staging folder");
+                set_control("{}");
+                {
+                    Transfers again;
+                    again.set_space_check(space);
+                    again.load();
+                    again.resume(connection, &why);
+                    wait_for(again, stopped, 120);
+                    check(again.queue().state == QueueState::idle && there(image) && !there(staged_image),
+                          "the image copy resumes after a restart and is moved into place",
+                          again.queue().message);
+                }
+                const std::string mismatch = image_mismatch(image, many);
+                check(mismatch.empty(), "every file in the image reads back identical", mismatch);
+                if (std::system("command -v fsck.exfat >/dev/null 2>&1") == 0)
+                    check(std::system(("fsck.exfat -n \"" + image + "\" >/dev/null 2>&1").c_str()) == 0,
+                          "fsck.exfat finds nothing wrong with the image");
+                clean("Many Files.exfat");
+                notes();
+
+                // Removed from the queue while paused: the half image is deleted.
+                set_control("{\"throttle\": 1000000}");
+                {
+                    Transfers transfers;
+                    transfers.set_space_check(space);
+                    transfers.enqueue(connection, many_game, "Many Files", dest, &why);
+                    wait_for(transfers, [](const QueueStatus &q)
+                             { return q.entries.empty() || q.entries[0].done > (2u << 20); }, 60);
+                    transfers.pause();
+                    wait_for(transfers, stopped);
+                    transfers.remove(0, &why);
+                    wait_for(transfers, [](const QueueStatus &q) { return q.entries.empty() && q.discarding.empty(); });
+                    check(!there(staged_image) && !there(dest + "/.nasbridge-incoming"),
+                          "removing a paused image copy deletes the half image");
+                }
+                set_control("{}");
+                notes();
+            }
+            set_copy_as_image(false);
 
             // e. The helper can't be started (no loader answers): copied in-app.
             set_copy_helper(copier, 18099, 18098);

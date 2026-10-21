@@ -17,6 +17,13 @@
 // <destination>/<name> (instant: same drive) and ShadowMountPlus is asked to
 // rescan at once.
 //
+// With "Copy as an exFAT image" on (Settings > Copying), a folder game is
+// queued as <name>.exfat instead: once its files are listed the image is laid
+// out (exfat_image.hpp), the copy helper writes it front to back into
+//   <destination>/.nasbridge-incoming/<name>.exfat
+// fetching the game's files into their places, and it's read back before
+// being moved into place like any image.
+//
 // Pause stops the queue after the piece being written. Resume carries on from what is
 // on the drive: each file's size says how far it got (the last 4 MiB are
 // fetched again, in case the end of the file never reached the disk). The
@@ -60,6 +67,11 @@ struct CopyPlan
     std::string title;
     std::string title_id;
     bool image = false;
+    // A folder game copied into one exFAT image (Settings > Copying): `name`
+    // ends in .exfat, and `image_size` is the image's, once listed.
+    bool as_image = false;
+    std::uint64_t image_size = 0;
+    std::uint64_t image_layout = 0; // a fingerprint of that layout: a resumed copy must match it
     std::string source;      // on the NAS, decoded: the folder ("/games/Game/") or the file
     std::string destination; // "/data/homebrew", "/mnt/usb0/homebrew", ...
     std::string name;        // the folder or file name it gets there
@@ -69,6 +81,12 @@ struct CopyPlan
     std::vector<std::string> folders; // relative, parents before children
     std::vector<CopyFile> files;
     std::uint64_t total = 0;
+
+    // One file on the PS5 (an image, or a folder game copied as one).
+    bool one_file() const
+    {
+        return image || as_image;
+    }
 };
 
 enum class TransferKind
@@ -253,11 +271,17 @@ struct SavedItem
 };
 std::string queue_to_text(const std::vector<SavedItem> &items);
 bool queue_from_text(const std::string &text, std::vector<SavedItem> *items);
+// Bytes a folder game of `bytes` takes as an exFAT image, before its files
+// are listed (an estimate a little over the real size).
+std::uint64_t image_estimate(std::uint64_t bytes);
 // Moves the saved queue somewhere else.
 void set_transfer_root(const std::string &root);
 // How many connections a copy uses (clamped 1..4). Default 1, best for a single
 // spinning HDD on the NAS. Tests raise it to exercise the parallel path.
 void set_copy_streams(int streams);
+// Whether folder games are queued to be copied as exFAT images (default off).
+void set_copy_as_image(bool on);
+bool copy_as_image();
 // How many files the delete helper deletes at once for a folder game (1..32).
 void set_delete_threads(int threads);
 // How long a deep listing may stay silent before listing folder by folder

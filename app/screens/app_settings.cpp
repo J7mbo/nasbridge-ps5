@@ -70,6 +70,8 @@ bool AppSettings::load()
             sounds = value != "0";
         else if (key == "keep_awake")
             keep_awake = value != "0";
+        else if (key == "as_image")
+            as_image = value == "1";
     }
     return true;
 }
@@ -82,6 +84,7 @@ std::string AppSettings::save() const
     payload += std::string("debug=") + (debug ? "1" : "0") + "\n";
     payload += std::string("sounds=") + (sounds ? "1" : "0") + "\n";
     payload += std::string("keep_awake=") + (keep_awake ? "1" : "0") + "\n";
+    payload += std::string("as_image=") + (as_image ? "1" : "0") + "\n";
     save::ensure_directory(kDirectory);
     return save::write_atomic(kPath, save::encode(save::Kind::prefs, kVersion, payload));
 }
@@ -92,6 +95,7 @@ void AppSettings::apply() const
     set_helper_streams(n); // the copy helper: big files, and small files at once
     set_copy_streams(n);   // copying in-app, when the helper can't run
     set_batch_workers(clamp_small_files(small_files));
+    set_copy_as_image(as_image);
     g_debug.store(debug);
     g_sounds.store(sounds);
     g_keep_awake.store(keep_awake);

@@ -89,6 +89,8 @@ void SettingsPage::build()
     copying_.add_header("Game folders of small files");
     copying_.add_stepper(kSmallFiles, "Files at once", settings_.small_files, 1, 16)
         .description = "Each small file gets its own connection. More copies a folder faster.";
+    copying_.add_toggle(kAsImage, "Copy as an exFAT image", settings_.as_image)
+        .description = "Each game folder becomes one .exfat file, which ShadowMountPlus mounts.";
     copying_.add_header("While copying");
     copying_.add_toggle(kKeepAwake, "Keep the PS5 awake", settings_.keep_awake)
         .description = "The PS5 stays out of rest mode while a copy or a delete runs.";
@@ -122,6 +124,7 @@ void SettingsPage::store()
 {
     settings_.connections = copying_.stepper_value(kConnections);
     settings_.small_files = copying_.stepper_value(kSmallFiles);
+    settings_.as_image = copying_.toggle_value(kAsImage);
     settings_.keep_awake = copying_.toggle_value(kKeepAwake);
     settings_.sounds = sound_.toggle_value(kSounds);
     settings_.debug = debug_.toggle_value(kDebugInfo);

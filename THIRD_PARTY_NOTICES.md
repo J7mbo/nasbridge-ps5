@@ -88,6 +88,17 @@ GPL-3.0-or-later), by way of the kit, whose source includes this code:
 - **Home-screen artwork** (`app/sce_sys/icon0.png`, `pic0.dds`, `pic1.dds`) is
   NASBridge's own. The backgrounds are rendered by `tools/make_background.py`.
 
+## PS5 Dump Forge (exFAT images)
+
+"Copy as an exFAT image" (`app/screens/exfat_image.cpp`) lays images out the
+way [PS5 Dump Forge](https://github.com/quer3q/ps5-dump-forge) by quer3q
+(GPL-3.0-or-later) does: 512-byte sectors, 64 KiB clusters, every file one
+contiguous run, written front to back. The layout code is NASBridge's own,
+written from the exFAT specification. The up-case table
+(`app/screens/exfat_upcase.hpp`) is the standard compressed table, taken from
+Dump Forge's `upcase_table.rs` at commit
+`14caf861d3b15da522645d335d2183b5f13fd59f`.
+
 ## libsmb2 (SMB)
 
 The app's SMB support is built on
@@ -123,7 +134,9 @@ tests' fake NAS and fake PS5 loader (`tests/`) are NASBridge's own. The SMB
 tests also build libsmb2 for the computer they run on, and run
 [Samba](https://www.samba.org/)'s `smbd` (GPL-3.0-or-later) with
 [nss_wrapper](https://cwrap.org/nss_wrapper.html) (BSD-3-Clause) from the
-toolchain image as their test NAS.
+toolchain image as their test NAS. The exFAT image tests check images with
+[exfatprogs](https://github.com/exfatprogs/exfatprogs)' `fsck.exfat`
+(GPL-2.0-or-later), also only in the toolchain image.
 
 ## Disclaimer
 

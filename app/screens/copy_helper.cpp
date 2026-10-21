@@ -6,6 +6,7 @@
 
 #include "core/save_file.hpp"
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstdlib>
@@ -39,6 +40,7 @@ constexpr const char *kProto = "NBC1";
 constexpr const char *kBatchProto = "NBB1";
 constexpr const char *kSmbProto = "NBS1";      // one file over SMB
 constexpr const char *kSmbBatchProto = "NBT1"; // small files over SMB
+constexpr const char *kImageProto = "NBI1";    // a folder game into one image
 constexpr int kStartMs = 20000;   // the loader can take a while to run it
 constexpr int kSilentMs = 90000;  // longer than the helper ever goes quiet
 
@@ -268,7 +270,7 @@ HelperCopy run_copy(const std::string &job, const std::string &payload, const Pr
             }
             else if (kind == "smb")
                 result.end = End::refused; // the NAS said no: `why` says what
-            else if (kind == "chunked")
+            else if (kind == "chunked" || kind == "ranges")
                 result.end = End::unsupported;
             else if (kind == "changed")
                 result.end = End::changed;
@@ -500,6 +502,26 @@ HelperBatch copy_smb_batch_with_helper(const std::string &ip, int port, int work
                          "\t" + std::to_string(workers) + "\t" + std::to_string(bytes.size()) +
                          "\n" + bytes,
                      files, done, synced, progress, stopping);
+}
+
+HelperCopy copy_image_with_helper(const std::string &ip, int port, std::uint64_t size,
+                                  const std::string &local, const std::string &headers,
+                                  const SmbSignIn *sign_in, const std::string &pieces, int workers,
+                                  const Progress &progress, const std::function<bool()> &stopping)
+{
+    const std::string head = sign_in != nullptr ? sign_in_bytes(*sign_in, nullptr) : headers;
+    std::string list = std::string(sign_in != nullptr ? "S " : "H ") + std::to_string(head.size()) +
+                       "\n" + head + pieces;
+    const std::string job = std::string(kImageProto) + "\t" + ip + "\t" + std::to_string(port) +
+                            "\t" + std::to_string(size) + "\t" + local + "\t" +
+                            std::to_string(list.size()) + "\t" + std::to_string(workers) + "\n";
+    HelperCopy copy = run_copy(job, list, progress, stopping);
+    if (sign_in != nullptr)
+        std::fill(list.begin(), list.end(), '\0'); // the password
+    // An older helper doesn't know images: "ERR request not a NASBridge copy request".
+    if (copy.end == HelperCopy::End::unavailable && copy.why.find("copy request") != std::string::npos)
+        copy.end = HelperCopy::End::unsupported;
+    return copy;
 }
 
 bool copy_helper_enabled()
