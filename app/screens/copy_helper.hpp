@@ -29,7 +29,7 @@ struct HelperCopy
         unsupported, // the NAS answers in a way the helper doesn't take (chunked): copy in-app
         lost,        // the helper went away mid-file: try again
         network,     // the NAS couldn't be reached, dropped or went quiet: try again
-        refused,     // the NAS answered with an error (`status`)
+        refused,     // the NAS answered with an error (`status`; SMB: 0, and `why`)
         file,        // the file couldn't be made or opened (`why`)
         write,       // writing to the drive failed (`why`)
         changed,     // the file on the NAS is a different size than listed
@@ -61,7 +61,7 @@ struct BatchFile
 {
     std::string local;   // where it goes on the PS5
     std::uint64_t size = 0;
-    std::string request; // the GET (keep-alive), sign-in and all
+    std::string request; // the GET (keep-alive), sign-in and all; SMB: the path in the share
 };
 
 struct HelperBatch
@@ -85,6 +85,31 @@ HelperBatch copy_batch_with_helper(const std::string &ip, int port, int workers,
                                    const std::function<void()> &synced,
                                    const BatchProgress &progress,
                                    const std::function<bool()> &stopping);
+
+// Over SMB: the helper signs in itself with these.
+struct SmbSignIn
+{
+    std::string share;
+    std::string user; // "guest" when none was given
+    std::string domain;
+    std::string password;
+};
+
+// copy_with_helper over SMB: `path` is the file in the share ("PS5/Game/eboot.bin").
+// Over `streams` sign-ins of its own (1 to 4), each fetching the next chunk.
+HelperCopy copy_smb_with_helper(const std::string &ip, int port, std::uint64_t size,
+                                const std::string &local, const SmbSignIn &sign_in,
+                                const std::string &path, int streams,
+                                const std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, int)> &progress,
+                                const std::function<bool()> &stopping);
+
+// copy_batch_with_helper over SMB: each file's `request` is its path in the share.
+HelperBatch copy_smb_batch_with_helper(const std::string &ip, int port, int workers,
+                                       const SmbSignIn &sign_in, const std::vector<BatchFile> &files,
+                                       const std::function<void(std::size_t)> &done,
+                                       const std::function<void()> &synced,
+                                       const BatchProgress &progress,
+                                       const std::function<bool()> &stopping);
 
 bool copy_helper_enabled();
 

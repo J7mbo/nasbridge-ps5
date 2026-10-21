@@ -32,6 +32,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace hui::concepts
@@ -67,6 +68,12 @@ class QueuePanel
     void update(float dt, const QueueStatus &queue);
     void draw(gfx::DrawList &list, std::uint32_t glass, float clock, const QueueStatus &queue,
               const CoverOf &cover_of) const;
+    // A folder game just removed with copied files to delete (the panel has
+    // closed for its page to show the deleting), once; "" otherwise.
+    std::string take_removed()
+    {
+        return std::exchange(removed_, std::string());
+    }
 
   private:
     void refuse(app::Feedback &feedback, const std::string &why, float dy = 0.0f);
@@ -95,6 +102,8 @@ class QueuePanel
     float sample_clock_ = 0.0f;
     ui::Dialog confirm_; // "Remove ... from the queue?"
     std::string confirm_entry_;
+    bool confirm_image_ = false;
+    std::string removed_;
     float age_ = 0.0f;
 };
 

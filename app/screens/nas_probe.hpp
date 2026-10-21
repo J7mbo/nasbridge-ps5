@@ -1,14 +1,15 @@
-// NASBridge - "Test connection": one WebDAV request to the NAS, off the UI thread.
+// NASBridge - "Test connection": one listing from the NAS (WebDAV or SMB), off the UI thread.
 // Copyright (C) 2026 NASBridge contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Asks the NAS for the games folder's contents (PROPFIND, Depth: 1) the way
-// the library will, and turns the answer into words: connected and what is
-// there, or what went wrong and what to check.
+// Asks the NAS for the games folder's contents the way the library will
+// (WebDAV: PROPFIND, Depth: 1; SMB: signing in and listing the folder, or the
+// shares when no folder is set yet), and turns the answer into words:
+// connected and what is there, or what went wrong and what to check.
 //
 // The request runs on a thread of its own with a 1 MiB stack (console
 // threads are never time-sliced, and the default stack is small); the screen
-// polls result() each frame. Plain HTTP and Basic sign-in only for now.
+// polls result() each frame. WebDAV: plain HTTP and Basic sign-in only for now.
 
 #pragma once
 
@@ -67,13 +68,13 @@ bool count_games(const Connection &connection, const std::vector<DavEntry> &top,
 // The test's line for a count ("Found 27 games: 12 folder games and 15 .exfat games").
 std::string describe_count(const Connection &connection, const GameCount &count);
 
-class WebDavProbe
+class NasProbe
 {
   public:
-    WebDavProbe() = default;
-    ~WebDavProbe();
-    WebDavProbe(const WebDavProbe &) = delete;
-    WebDavProbe &operator=(const WebDavProbe &) = delete;
+    NasProbe() = default;
+    ~NasProbe();
+    NasProbe(const NasProbe &) = delete;
+    NasProbe &operator=(const NasProbe &) = delete;
 
     // Starts a test of `connection`. While an older one is still out, this
     // one waits for it (see poll()). count_games: also count the games (a

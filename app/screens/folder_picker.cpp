@@ -5,7 +5,8 @@
 #include "concepts/folder_picker.hpp"
 
 #include "concepts/http.hpp"
-#include "concepts/webdav_probe.hpp"
+#include "concepts/smb.hpp"
+#include "concepts/nas_probe.hpp"
 
 #include "ui/glyphs.hpp"
 #include "ui/theme.hpp"
@@ -181,6 +182,32 @@ void *ask_main(void *argument)
 #endif
     FolderPicker::Shared::Answer answer;
     answer.path = ask->path;
+    if (ask->connection.type == ConnectionType::smb)
+    {
+        // At "/", the NAS's shares; below, the folders in them.
+        SmbSession session(ask->connection);
+        std::vector<SmbEntry> entries;
+        SmbFailure failure;
+        if (session.list(ask->path, &entries, &failure))
+        {
+            for (const SmbEntry &entry : entries)
+                if (entry.folder)
+                    answer.listing.names.push_back(entry.name);
+            std::sort(answer.listing.names.begin(), answer.listing.names.end(),
+                      [](const std::string &a, const std::string &b)
+                      { return compare_names(a, b) < 0; });
+            answer.listing.ok = true;
+        }
+        else
+        {
+            describe_smb_failure(ask->connection, failure, &answer.listing.headline,
+                                 &answer.listing.detail);
+        }
+        std::lock_guard<std::mutex> hold(ask->shared->lock);
+        ask->shared->answers.push_back(std::move(answer));
+        delete ask;
+        return nullptr;
+    }
     const HttpReply reply =
         http_request(ask->connection, "PROPFIND", ask->path,
                      "Depth: 1\r\nContent-Type: application/xml; charset=utf-8\r\n",
@@ -426,7 +453,8 @@ FolderPicker::Result FolderPicker::handle(const InputFrame &input, app::Feedback
     }
     if (input.is_pressed(Action::west))
     {
-        if (!ready || !listing->ok)
+        // SMB: the top lists shares, and the games folder is inside one.
+        if (!ready || !listing->ok || (connection_.type == ConnectionType::smb && path_ == "/"))
         {
             refuse(feedback, -1.0f, 0.0f); // still reading, or it couldn't be read
             return Result::none;
@@ -600,13 +628,18 @@ void FolderPicker::draw(gfx::DrawList &list, std::uint32_t glass, float clock) c
         cx += paint.heading_width(shown, kCrumb);
     }
 
-    // Under it, what this folder holds.
+    // Under it, what this folder holds. SMB's top holds the NAS's shares,
+    // and isn't a folder that can be chosen.
     const Listing *listing = current();
+    const bool shares = connection_.type == ConnectionType::smb && path_ == "/";
     std::string count;
     if (listing == nullptr)
         count = "Reading...";
     else if (!listing->ok)
         count = "Couldn't be read";
+    else if (shares)
+        count = std::to_string(listing->names.size()) +
+                (listing->names.size() == 1 ? " share" : " shares");
     else
         count = std::to_string(listing->names.size()) +
                 (listing->names.size() == 1 ? " folder" : " folders");
@@ -649,9 +682,11 @@ void FolderPicker::draw(gfx::DrawList &list, std::uint32_t glass, float clock) c
         list.push_opacity(a);
         list.ring(mid_x, mid_y - 30.0f, 72.0f, 1.5f, kWhite.with_alpha(0.08f));
         draw_folder(list, mid_x, mid_y - 30.0f, 64.0f, 0.55f);
-        paint.body("No folders in here", mid_x, mid_y + 92.0f, 26, theme.text, gfx::Align::center);
-        paint.body("Choose this folder with Square, or go back up.", mid_x, mid_y + 130.0f, 21,
-                   theme.text_muted, gfx::Align::center);
+        paint.body(shares ? "No shares to show" : "No folders in here", mid_x, mid_y + 92.0f, 26,
+                   theme.text, gfx::Align::center);
+        paint.body(shares ? "This user can't see any shares. Check the user name on the NAS."
+                          : "Choose this folder with Square, or go back up.",
+                   mid_x, mid_y + 130.0f, 21, theme.text_muted, gfx::Align::center);
         list.pop_opacity();
     }
     else if (listing != nullptr && !listing->ok)
@@ -696,8 +731,14 @@ void FolderPicker::draw(gfx::DrawList &list, std::uint32_t glass, float clock) c
     const ui::Hint hints[] = {{ui::Button::cross, "Open"},
                               {ui::Button::square, "Use this folder"},
                               {ui::Button::circle, path_ == "/" ? "Close" : "Up"}};
-    ui::draw_hints(list, fonts_, ui::GlyphStyle::dark(), hints, 3, kPanel.x + kPanel.w - kPad,
-                   true, layout);
+    // Without Square at SMB's top, where a share has to be opened first.
+    const ui::Hint top_hints[] = {hints[0], hints[2]};
+    if (shares)
+        ui::draw_hints(list, fonts_, ui::GlyphStyle::dark(), top_hints, 2,
+                       kPanel.x + kPanel.w - kPad, true, layout);
+    else
+        ui::draw_hints(list, fonts_, ui::GlyphStyle::dark(), hints, 3, kPanel.x + kPanel.w - kPad,
+                       true, layout);
 
     list.pop_transform();
     list.pop_opacity();

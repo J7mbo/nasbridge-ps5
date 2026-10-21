@@ -1,11 +1,13 @@
-// NASBridge - "Test connection": one WebDAV request to the NAS, off the UI thread.
+// NASBridge - "Test connection": one listing from the NAS (WebDAV or SMB), off the UI thread.
 // Copyright (C) 2026 NASBridge contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include "concepts/webdav_probe.hpp"
+#include "concepts/nas_probe.hpp"
 
 #include "concepts/http.hpp"
+#include "concepts/smb.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <vector>
 
@@ -27,18 +29,32 @@ std::string plural(int count, const char *one, const char *many)
     return std::to_string(count) + " " + (count == 1 ? one : many);
 }
 
-// What a 207 listing holds: folders (possible game folders) and .exfat images.
-ProbeResult describe_listing(const Connection &connection, const std::string &body)
+// One entry of a folder, from either kind of NAS.
+struct Listed
 {
-    std::vector<DavEntry> entries;
-    if (!parse_listing(body, folder_path(connection), &entries))
-        return failed("The NAS sent an answer NASBridge can't read",
-                      "It said the request worked, but listed nothing. Check that this is the "
-                      "NAS's WebDAV address.");
+    std::string name;
+    bool folder = false;
+};
+// Lists one folder ("/games/Game/"); false when it can't be read.
+using Lister = std::function<bool(const std::string &path, std::vector<Listed> *entries)>;
+
+template <typename Entry>
+std::vector<Listed> listed(const std::vector<Entry> &entries)
+{
+    std::vector<Listed> out;
+    out.reserve(entries.size());
+    for (const Entry &entry : entries)
+        out.push_back({entry.name, entry.folder});
+    return out;
+}
+
+// What the games folder holds: folders (possible game folders) and .exfat images.
+ProbeResult describe_entries(const Connection &connection, const std::vector<Listed> &entries)
+{
     int folders = 0;
     int images = 0;
     int other = 0;
-    for (const DavEntry &entry : entries)
+    for (const Listed &entry : entries)
     {
         if (entry.folder)
             ++folders;
@@ -61,6 +77,79 @@ ProbeResult describe_listing(const Connection &connection, const std::string &bo
     return result;
 }
 
+// What a 207 listing holds.
+ProbeResult describe_listing(const Connection &connection, const std::string &body)
+{
+    std::vector<DavEntry> entries;
+    if (!parse_listing(body, folder_path(connection), &entries))
+        return failed("The NAS sent an answer NASBridge can't read",
+                      "It said the request worked, but listed nothing. Check that this is the "
+                      "NAS's WebDAV address.");
+    return describe_entries(connection, listed(entries));
+}
+
+bool count_in(const std::string &root, const std::vector<Listed> &top, const Lister &list,
+              const std::function<bool()> &stop,
+              const std::function<void(int done, int total)> &progress, GameCount *count);
+
+// The test over SMB: sign in, then list the shares (no folder set yet) or
+// the games folder, and count the games in it.
+ProbeResult probe_smb(const Connection &connection, bool count,
+                      const std::function<bool()> &stop,
+                      const std::function<void(int, int)> &progress)
+{
+    SmbSession session(connection);
+    SmbFailure failure;
+    const auto failed_with = [&](const SmbFailure &why)
+    {
+        ProbeResult result;
+        result.state = State::failed;
+        describe_smb_failure(connection, why, &result.headline, &result.detail);
+        return result;
+    };
+    if (smb_location(connection.folder).share.empty())
+    {
+        std::vector<std::string> shares;
+        if (!session.list_shares(&shares, &failure))
+            return failed_with(failure);
+        ProbeResult result;
+        result.state = State::ok;
+        result.headline = "Connected";
+        if (shares.empty())
+        {
+            result.detail = "Signed in, but this user can't see any shares. Check the user's "
+                            "access on the NAS.";
+            return result;
+        }
+        std::string names;
+        for (std::size_t i = 0; i < shares.size() && i < 6; ++i)
+            names += (i == 0 ? "" : ", ") + shares[i];
+        if (shares.size() > 6)
+            names += " and " + std::to_string(shares.size() - 6) + " more";
+        result.detail = "Signed in. Shares: " + names +
+                        ". Pick your games folder with the folder button.";
+        return result;
+    }
+    std::vector<SmbEntry> top;
+    if (!session.list(folder_path(connection), &top, &failure))
+        return failed_with(failure);
+    ProbeResult result = describe_entries(connection, listed(top));
+    GameCount games;
+    const Lister list = [&](const std::string &path, std::vector<Listed> *entries)
+    {
+        std::vector<SmbEntry> inside;
+        SmbFailure why;
+        if (!session.list(path, &inside, &why))
+            return false;
+        *entries = listed(inside);
+        return true;
+    };
+    if (count && result.state == State::ok && !top.empty() &&
+        count_in(folder_path(connection), listed(top), list, stop, progress, &games))
+        result.detail = describe_count(connection, games);
+    return result;
+}
+
 // The whole test, start to finish, on the worker thread.
 ProbeResult probe(const Connection &connection, bool count,
                   const std::function<bool()> &stop,
@@ -70,6 +159,8 @@ ProbeResult probe(const Connection &connection, bool count,
         return failed("Use the NAS's IP address",
                       "Names like nas.local can't be looked up from the PS5 yet. Your NAS's IP "
                       "address is in its network settings, or your router's device list.");
+    if (connection.type == ConnectionType::smb)
+        return probe_smb(connection, count, stop, progress);
     const HttpReply reply =
         http_request(connection, "PROPFIND", folder_path(connection),
                      "Depth: 1\r\nContent-Type: application/xml; charset=utf-8\r\n",
@@ -99,13 +190,33 @@ bool count_games(const Connection &connection, const std::vector<DavEntry> &top,
                  const std::function<bool()> &stop,
                  const std::function<void(int done, int total)> &progress, GameCount *count)
 {
+    const Lister list = [&](const std::string &path, std::vector<Listed> *entries)
+    {
+        const HttpReply reply = http_request(
+            connection, "PROPFIND", path,
+            "Depth: 1\r\nContent-Type: application/xml; charset=utf-8\r\n", propfind_body());
+        std::vector<DavEntry> inside;
+        if (reply.status != 207 || !parse_listing(reply.body, path, &inside))
+            return false;
+        *entries = listed(inside);
+        return true;
+    };
+    return count_in(folder_path(connection), listed(top), list, stop, progress, count);
+}
+
+namespace
+{
+
+bool count_in(const std::string &root, const std::vector<Listed> &top, const Lister &list,
+              const std::function<bool()> &stop,
+              const std::function<void(int done, int total)> &progress, GameCount *count)
+{
     // The library's limits (nas_library.cpp: kDepth, kListings).
     constexpr int kDepth = 4;
     constexpr int kListings = 16;
     *count = GameCount{};
-    const std::string root = folder_path(connection);
     int total = 0;
-    for (const DavEntry &entry : top)
+    for (const Listed &entry : top)
     {
         if (entry.folder)
             ++total;
@@ -115,7 +226,7 @@ bool count_games(const Connection &connection, const std::vector<DavEntry> &top,
     int done = 0;
     if (progress)
         progress(done, total);
-    for (const DavEntry &entry : top)
+    for (const Listed &entry : top)
     {
         if (!entry.folder)
             continue;
@@ -137,16 +248,13 @@ bool count_games(const Connection &connection, const std::vector<DavEntry> &top,
         {
             const Folder folder = queue[next];
             ++listings;
-            const HttpReply reply = http_request(
-                connection, "PROPFIND", folder.path,
-                "Depth: 1\r\nContent-Type: application/xml; charset=utf-8\r\n", propfind_body());
-            std::vector<DavEntry> inside;
-            if (reply.status != 207 || !parse_listing(reply.body, folder.path, &inside))
+            std::vector<Listed> inside;
+            if (!list(folder.path, &inside))
             {
                 unreadable = unreadable || folder.depth == 0;
                 continue;
             }
-            for (const DavEntry &item : inside)
+            for (const Listed &item : inside)
             {
                 if (!item.folder)
                     image = image || ends_with_nocase(item.name, ".exfat");
@@ -169,6 +277,8 @@ bool count_games(const Connection &connection, const std::vector<DavEntry> &top,
     }
     return true;
 }
+
+} // namespace
 
 std::string describe_count(const Connection &connection, const GameCount &count)
 {
@@ -296,14 +406,14 @@ ProbeResult interpret_response(const Connection &connection, int status, const s
 
 // ---- the worker ----
 
-WebDavProbe::~WebDavProbe()
+NasProbe::~NasProbe()
 {
     stop_.store(true);
     if (have_thread_)
         pthread_join(thread_, nullptr);
 }
 
-void WebDavProbe::start(const Connection &connection, bool count_games)
+void NasProbe::start(const Connection &connection, bool count_games)
 {
     if (running())
     {
@@ -332,7 +442,7 @@ void WebDavProbe::start(const Connection &connection, bool count_games)
     pthread_attr_init(&attributes);
     pthread_attr_setstacksize(&attributes, 1024 * 1024);
     pthread_t thread{};
-    const int created = pthread_create(&thread, &attributes, &WebDavProbe::thread_main, this);
+    const int created = pthread_create(&thread, &attributes, &NasProbe::thread_main, this);
     pthread_attr_destroy(&attributes);
     if (created != 0)
     {
@@ -344,7 +454,7 @@ void WebDavProbe::start(const Connection &connection, bool count_games)
     have_thread_ = true;
 }
 
-void WebDavProbe::poll()
+void NasProbe::poll()
 {
     if (has_pending_ && !running())
     {
@@ -353,7 +463,7 @@ void WebDavProbe::poll()
     }
 }
 
-void WebDavProbe::reset()
+void NasProbe::reset()
 {
     generation_.fetch_add(1);
     stop_.store(true); // a count of the old settings is no use
@@ -361,7 +471,7 @@ void WebDavProbe::reset()
         state_.store(static_cast<int>(State::idle));
 }
 
-ProbeResult WebDavProbe::result() const
+ProbeResult NasProbe::result() const
 {
     const State state = static_cast<State>(state_.load());
     if (has_pending_)
@@ -379,13 +489,13 @@ ProbeResult WebDavProbe::result() const
     return result;
 }
 
-void *WebDavProbe::thread_main(void *self)
+void *NasProbe::thread_main(void *self)
 {
-    static_cast<WebDavProbe *>(self)->run();
+    static_cast<NasProbe *>(self)->run();
     return nullptr;
 }
 
-void WebDavProbe::run()
+void NasProbe::run()
 {
     ProbeResult result = probe(
         connection_, count_, [this]() { return stop_.load(); },

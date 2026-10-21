@@ -22,7 +22,16 @@ constexpr std::uint16_t kVersion = 1;
 
 const char *type_key(ConnectionType type)
 {
-    return type == ConnectionType::ftp ? "ftp" : "webdav";
+    switch (type)
+    {
+    case ConnectionType::ftp:
+        return "ftp";
+    case ConnectionType::smb:
+        return "smb";
+    case ConnectionType::webdav:
+        break;
+    }
+    return "webdav";
 }
 
 bool starts_with(std::string_view text, std::string_view prefix)
@@ -70,7 +79,9 @@ bool is_ipv4(const std::string &text)
 
 std::string Connection::display_url() const
 {
-    std::string url = type == ConnectionType::ftp ? "ftp://" : "http://";
+    std::string url = type == ConnectionType::ftp   ? "ftp://"
+                      : type == ConnectionType::smb ? "smb://"
+                                                    : "http://";
     if (!username.empty())
         url += username + "@";
     url += host.empty() ? "your-nas" : host;
@@ -103,7 +114,9 @@ bool Connection::load()
         const std::string_view key = line.substr(0, equals);
         const std::string value(line.substr(equals + 1));
         if (key == "type")
-            type = value == "ftp" ? ConnectionType::ftp : ConnectionType::webdav;
+            type = value == "ftp"   ? ConnectionType::ftp
+                   : value == "smb" ? ConnectionType::smb
+                                    : ConnectionType::webdav;
         else if (key == "host")
             host = value;
         else if (key == "port")
@@ -139,8 +152,11 @@ std::string normalise_host(std::string *text)
     std::string host = *text;
     if (starts_with(host, "https://"))
         return "HTTPS isn't supported yet: use the http address";
-    if (starts_with(host, "http://"))
-        host.erase(0, 7);
+    if (starts_with(host, "http://") || starts_with(host, "smb://"))
+        host.erase(0, host.find("//") + 2);
+    // "\\192.168.1.20", as Windows writes a NAS's address.
+    while (!host.empty() && host.front() == '\\')
+        host.erase(0, 1);
     while (!host.empty() && host.back() == '/')
         host.pop_back();
     if (host.find('/') != std::string::npos)

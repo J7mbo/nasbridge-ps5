@@ -10,9 +10,10 @@
 // cover, and the key art, all saved for next time). Folder sizes come last.
 //
 // Game folders have sce_sys in them (up to four folders down). .exfat images,
-// on their own or alone in a folder, are looked inside with HTTP Range
-// requests (exfat.cpp) without copying them. Folders with no game inside
-// (backports, patches, empty folders) are left out.
+// on their own or alone in a folder, are looked inside by reading parts of
+// them (exfat.cpp) without copying them. Folders with no game inside
+// (backports, patches, empty folders) are left out. The NAS is read over
+// WebDAV or SMB, as the connection says (nas.hpp).
 //
 // Results arrive as events the library takes on the UI thread, which is the
 // only thread that touches OpenGL. A load can be abandoned at any time (the

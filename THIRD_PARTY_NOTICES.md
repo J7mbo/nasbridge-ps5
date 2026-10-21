@@ -88,6 +88,25 @@ GPL-3.0-or-later), by way of the kit, whose source includes this code:
 - **Home-screen artwork** (`app/sce_sys/icon0.png`, `pic0.dds`, `pic1.dds`) is
   NASBridge's own. The backgrounds are rendered by `tools/make_background.py`.
 
+## libsmb2 (SMB)
+
+The app's SMB support is built on
+[libsmb2](https://github.com/sahlberg/libsmb2), Copyright (C) Ronnie
+Sahlberg and contributors, licensed under LGPL-2.1-or-later, which combines
+with NASBridge's GPL-3.0-or-later.
+
+- **Version:** tag `libsmb2-6.2`, commit
+  `d67e213a5c4e7e4969fd81f0b95e4ca5831fbba1`, pinned in the `Dockerfile`.
+- **How it's used:** its `lib/` and `include/` sources are compiled, unchanged,
+  into the app and into the copy helper payload (`copier.elf`), with
+  NASBridge's own `config.h`, a small IPv4 address lookup and AES-128
+  (`app/third_party/libsmb2/`). The AES (`aes_fast.c`, which uses the CPU's
+  AES instructions) is built in place of libsmb2's `lib/aes.c`, which isn't
+  used. Its `COPYING` and LGPL text are copied into the app with it.
+- **MD4:** sign-in uses libsmb2's `lib/md4c.c`, the RSA Data Security, Inc.
+  MD4 Message-Digest Algorithm (from RFC 1320), Copyright (C) 1990-2, RSA Data
+  Security, Inc. Its licence notice is kept in that file.
+
 ## PS5 payload SDK
 
 The app, the installer and the copy and delete helper payloads are built with
@@ -100,7 +119,11 @@ their Apache-2.0 WITH LLVM-exception licence.
 The toolchain container builds LLVM's compiler-rt, the payload SDK and the
 kit from source, and the kit's build tools use [zlib](https://zlib.net/) 1.3.2
 (zlib licence). None of these are part of what is installed on the PS5. The
-tests' fake NAS and fake PS5 loader (`tests/`) are NASBridge's own.
+tests' fake NAS and fake PS5 loader (`tests/`) are NASBridge's own. The SMB
+tests also build libsmb2 for the computer they run on, and run
+[Samba](https://www.samba.org/)'s `smbd` (GPL-3.0-or-later) with
+[nss_wrapper](https://cwrap.org/nss_wrapper.html) (BSD-3-Clause) from the
+toolchain image as their test NAS.
 
 ## Disclaimer
 

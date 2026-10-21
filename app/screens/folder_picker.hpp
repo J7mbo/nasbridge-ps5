@@ -8,8 +8,9 @@
 // direction of travel, and every folder remembering where its focus was. It
 // only lists folders and only chooses one: Cross opens the focused folder,
 // Square chooses the folder being shown, Circle goes up (and closes at the
-// top). Listings come from the NAS on a worker thread (PROPFIND, Depth 1),
-// with the connection as it is being edited.
+// top). Listings come from the NAS on a worker thread (WebDAV: PROPFIND,
+// Depth 1; SMB: the NAS's shares at the top, then the folders in them), with
+// the connection as it is being edited.
 
 #pragma once
 

@@ -140,10 +140,38 @@ RUN git init -q "$STB" && cd "$STB" \
  && rm -rf .git \
  && chmod -R a+rX "$STB"
 
+# libsmb2 (Ronnie Sahlberg's SMB 2/3 client; the library is LGPL-2.1-or-later,
+# GPL-compatible) at its 6.2 release. NASBridge talks to SMB NAS units with
+# it; the build copies its library sources into the app and compiles them with
+# app/third_party/libsmb2/config.h (no Kerberos: user name and password only).
+ARG LIBSMB2_REPO=https://github.com/sahlberg/libsmb2.git
+ARG LIBSMB2_TAG=libsmb2-6.2
+ARG LIBSMB2_COMMIT=d67e213a5c4e7e4969fd81f0b95e4ca5831fbba1
+ENV LIBSMB2=/opt/libsmb2
+
+RUN git init -q "$LIBSMB2" && cd "$LIBSMB2" \
+ && git fetch -q --depth 1 "$LIBSMB2_REPO" "$LIBSMB2_COMMIT" \
+ && git checkout -q FETCH_HEAD \
+ && test "$(git rev-parse HEAD)" = "$LIBSMB2_COMMIT" \
+      || { echo "libsmb2 commit $LIBSMB2_COMMIT ($LIBSMB2_TAG) not found" >&2; exit 1; } \
+ && test -f lib/libsmb2.c && test -f include/smb2/libsmb2.h && test -f LICENCE-LGPL-2.1.txt \
+ && echo "$LIBSMB2_COMMIT" > .nasbridge-commit \
+ && rm -rf .git \
+ && chmod -R a+rX "$LIBSMB2"
+
+# For the SMB tests only (none of it is in what's installed): Samba's smbd as
+# the test NAS, and nss_wrapper, which gives the user the container runs as
+# an account name for smbd (tests/smb_server.py).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends samba libnss-wrapper \
+ && rm -rf /var/lib/apt/lists/*
+
 # Record exact tool versions inside the image (shown by `make toolchain-info`).
 RUN { echo "ps5-payload-sdk $PS5_SDK_TAG ($PS5_SDK_COMMIT)"; \
       echo "ps5-homebrew-ui $UI_KIT_COMMIT"; \
       echo "stb $STB_COMMIT"; \
+      echo "libsmb2 $LIBSMB2_TAG ($LIBSMB2_COMMIT)"; \
+      echo "samba $(smbd --version) (tests only)"; \
       echo "compiler-rt builtins $LLVM_VERSION (x86-64, from source)"; \
       clang-18 --version | head -1; \
       ld.lld-18 --version; \

@@ -1,4 +1,4 @@
-// NASBridge - The connection test's game count (webdav_probe.cpp) agrees with
+// NASBridge - The connection test's game count (nas_probe.cpp) agrees with
 // what the library finds (nas_library.cpp), on one tree of every layout, run
 // on a computer against tests/fake_nas.py.
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -6,7 +6,7 @@
 #include "wait_port.hpp"
 #include "concepts/library_cache.hpp"
 #include "concepts/nas_library.hpp"
-#include "concepts/webdav_probe.hpp"
+#include "concepts/nas_probe.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -144,8 +144,8 @@ int main(int argc, char **argv)
           "the library finds the same games",
           std::to_string(folders) + " folder, " + std::to_string(images) + " image");
 
-    // The whole test through WebDavProbe: quick (at launch) and counting.
-    WebDavProbe probe;
+    // The whole test through NasProbe: quick (at launch) and counting.
+    NasProbe probe;
     probe.start(connection);
     for (int i = 0; i < 200 && probe.running(); ++i)
         sleep_ms(25);
