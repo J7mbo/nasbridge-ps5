@@ -15,11 +15,16 @@ servers' behaviour while they run:
      "delete_refused": the delete job fails with this result_error_reason ("game_active"),
                        as ShadowMountPlus does while NASBridge counts as a running game,
      "scan_deferred": the scan reply's scan_deferred_reason ("game_active"),
-     "capabilities": what /api/v1/version lists (default: no requester support),
+     "capabilities": what /api/v1/version lists,
      "delete_request_refused": refuse /api/v1/games/delete at once with this
                                error_reason ("game_active"),
      "uninstall_refused": refuse /api/v1/games/uninstall with this error_reason,
-     "uninstall_busy": refuse the first this-many uninstalls as scanner_busy}
+     "uninstall_busy": refuse the first this-many uninstalls as scanner_busy,
+     "homebrew_allowed": deletes and uninstalls go ahead while NASBridge is open,
+                         as from ShadowMountPlus 1.7beta6 for a LAPY/FAKE app.
+                         Without it, both are refused with "game_active", as an older
+                         ShadowMountPlus does while NASBridge counts as a
+                         running game}
 Every ShadowMountPlus call is appended to <control-file>.log.
 """
 
@@ -237,6 +242,11 @@ class Smp(BaseHTTPRequestHandler):
             return self.answer(200, {"status": 0, "scan_queued": True,
                                      "scan_deferred": bool(deferred),
                                      "scan_deferred_reason": deferred})
+        # An older ShadowMountPlus, with NASBridge open: no changes to games.
+        open_app_blocks = not c.get("homebrew_allowed")
+        if route in ("/api/v1/games/delete", "/api/v1/games/uninstall") and open_app_blocks:
+            return self.answer(409, {"status": 16, "error": "Device busy",
+                                     "error_reason": "game_active"})
         if route == "/api/v1/games/delete":
             if c.get("delete_request_refused"):
                 return self.answer(409, {"status": 16, "error": "refused",

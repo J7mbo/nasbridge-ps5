@@ -7,10 +7,8 @@
 #include "concepts/connection.hpp"
 #include "concepts/http.hpp"
 #include "concepts/json_scan.hpp"
-#include "core/save_file.hpp"
 
 #include <cstdio>
-#include <mutex>
 
 namespace hui::concepts
 {
@@ -20,16 +18,10 @@ namespace
 
 int g_smp_port = 10101;
 
-// NASBridge's own title ID, read once from its package ("" when it can't be).
-std::mutex g_self_lock;
-bool g_self_read = false;
-std::string g_self;
-
-// NASBridge itself: ShadowMountPlus counts any open app with a game's title ID
+// NASBridge itself: a ShadowMountPlus older than 1.7beta6 counts any open app
 // as a running game, and refuses changes until it closes.
 const char *const kNasBridgeIsAGame =
-    "ShadowMountPlus won't do this while NASBridge is open (it counts NASBridge as a running "
-    "game)";
+    "ShadowMountPlus won't do this while NASBridge is open: update it to 1.7beta6-fix2 or newer";
 
 // One API call. On success the reply's JSON is in *json. Fails with a short
 // reason when ShadowMountPlus doesn't answer or says no ("status" non-zero).
@@ -140,51 +132,10 @@ bool smp_games(std::vector<SmpGame> *games, std::string *why)
     return true;
 }
 
-std::string smp_self_title_id()
-{
-    std::lock_guard<std::mutex> hold(g_self_lock);
-    if (!g_self_read)
-    {
-        // Read at run time, as ShadowMountPlus asks, not written in here.
-        g_self_read = true;
-        std::string param;
-        if (save::read_file("/app0/sce_sys/param.json", &param, 1u << 20))
-            g_self = json_text(param.data(), param.data() + param.size(), "titleId");
-    }
-    return g_self;
-}
-
-void set_smp_self_title_id(const std::string &title_id)
-{
-    std::lock_guard<std::mutex> hold(g_self_lock);
-    g_self_read = true;
-    g_self = title_id;
-}
-
-SmpRequester smp_requester_support()
-{
-    SmpRequester support;
-    if (smp_self_title_id().empty())
-        return support;
-    std::string json, why;
-    if (!call("/api/v1/version", "{}", &json, &why))
-        return support;
-    const auto has = [&json](const char *capability)
-    { return json.find(std::string("\"") + capability + "\"") != std::string::npos; };
-    support.scan = has("rescan_requester_title");
-    support.remove = has("delete_requester_title") && has("uninstall_requester_title");
-    return support;
-}
-
 bool smp_scan(bool reset_attempts, std::string *why, std::string *deferred)
 {
     std::string json;
-    std::string request = reset_attempts ? "{\"reset_attempts\":true" : "{";
-    // As NASBridge: then the scan runs now, not once NASBridge is closed.
-    if (smp_requester_support().scan)
-        request += std::string(reset_attempts ? "," : "") +
-                   "\"requester_title_id\":" + json_quote(smp_self_title_id());
-    request += "}";
+    const std::string request = reset_attempts ? "{\"reset_attempts\":true}" : "{}";
     if (!call("/api/v1/scan", request, &json, why))
         return false;
     if (deferred != nullptr)
@@ -193,15 +144,12 @@ bool smp_scan(bool reset_attempts, std::string *why, std::string *deferred)
 }
 
 bool smp_delete_source(const std::string &title_id, int *job_id, bool *missing, std::string *why,
-                       bool as_requester, std::string *reason)
+                       std::string *reason)
 {
     std::string json;
     *job_id = 0;
     *missing = false;
-    std::string request = "{\"title_id\":" + json_quote(title_id) + ",\"confirm\":true";
-    if (as_requester)
-        request += ",\"requester_title_id\":" + json_quote(smp_self_title_id());
-    request += "}";
+    const std::string request = "{\"title_id\":" + json_quote(title_id) + ",\"confirm\":true}";
     if (!call("/api/v1/games/delete", request, &json, why, nullptr, reason))
         return false;
     const char *begin = json.data();
@@ -230,14 +178,10 @@ bool smp_job(int job_id, SmpJob *job, std::string *why)
     return true;
 }
 
-bool smp_uninstall(const std::string &title_id, std::string *why, bool as_requester,
-                   std::string *reason)
+bool smp_uninstall(const std::string &title_id, std::string *why, std::string *reason)
 {
     std::string json;
-    std::string request = "{\"title_id\":" + json_quote(title_id);
-    if (as_requester)
-        request += ",\"requester_title_id\":" + json_quote(smp_self_title_id());
-    request += "}";
+    const std::string request = "{\"title_id\":" + json_quote(title_id) + "}";
     return call("/api/v1/games/uninstall", request, &json, why, nullptr, reason);
 }
 

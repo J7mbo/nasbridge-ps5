@@ -255,9 +255,6 @@ void set_transfer_root(const std::string &root);
 // How many connections a copy uses (clamped 1..4). Default 1, best for a single
 // spinning HDD on the NAS. Tests raise it to exercise the parallel path.
 void set_copy_streams(int streams);
-// How long a copy waits before asking ShadowMountPlus (as NASBridge) to add it,
-// between asks while it isn't listed, and how long each ask is given (ms).
-void set_smp_settle(int first_ms, int retry_ms, int check_ms);
 // How many files the delete helper deletes at once for a folder game (1..32).
 void set_delete_threads(int threads);
 // How long a deep listing may stay silent before listing folder by folder

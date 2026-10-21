@@ -732,15 +732,20 @@ int main(int argc, char **argv)
             clean("Game One");
             notes();
 
-            // A running game is refused before the helper is even sent.
+            // An attached game, and a ShadowMountPlus older than 1.7beta6 that
+            // won't change games while NASBridge is open: the helper can't
+            // release it, so it isn't sent, and NASBridge says what helps.
             install_game();
             set_control("{" + smp_list(true) + "}");
             transfers.remove_installed("PPSA01111", "Game One", "Game One", &why);
             wait_for(transfers, [&](const QueueStatus &)
                      { return transfers.removal().state != TransferState::deleting; });
             check(transfers.removal().state == TransferState::failed &&
-                      transfers.removal().message == "Close the game first" && there(game_dir),
-                  "a running game isn't deleted", transfers.removal().message);
+                      transfers.removal().message.find("older than 1.7beta6-fix2, update it") !=
+                          std::string::npos &&
+                      there(game_dir),
+                  "an attached game isn't deleted by an older ShadowMountPlus, and it says why",
+                  transfers.removal().message);
 
             // The system uninstall is refused: the files still go, but NASBridge
             // says the home-screen entry is still there.
@@ -759,14 +764,32 @@ int main(int argc, char **argv)
             set_loader("{}");
             set_control("{}");
 
-            // A ShadowMountPlus that takes NASBridge's own requests
-            // (requester_title_id): for an image game it deletes and uninstalls,
-            // no helper (a folder game is below). (This
+            // ShadowMountPlus 1.7beta6 and newer, NASBridge being a homebrew app
+            // (a LAPY title ID): it changes other games while NASBridge is open.
+            // An attached folder game (as one just added is): ShadowMountPlus
+            // takes it off the home screen and the helper deletes its files.
+            install_game();
+            std::remove((g_control + ".log").c_str());
+            std::remove((ps5root + "/uninstalled.txt").c_str());
+            set_control("{\"homebrew_allowed\": true, " + smp_list(true) + "}");
+            transfers.remove_installed("PPSA01111", "Game One", "Game One", &why);
+            wait_for(transfers, [&](const QueueStatus &)
+                     { return transfers.removal().state != TransferState::deleting; });
+            check(transfers.removal().state == TransferState::deleted && !there(game_dir) &&
+                      smp_log().find("/api/v1/games/uninstall") != std::string::npos &&
+                      read_text(ps5root + "/uninstalled.txt").find("PPSA01111") ==
+                          std::string::npos,
+                  "with ShadowMountPlus 1.7beta6, an attached folder game is deleted while "
+                  "NASBridge is open",
+                  transfers.removal().message);
+            notes();
+            set_control("{}");
+
+            // The same ShadowMountPlus, from here on: for an image game it
+            // deletes and uninstalls, no helper (a folder game is below). (This
             // stand-in deletes nothing itself, so the files still being there
             // shows the helper wasn't sent.)
-            set_smp_self_title_id("PPSA62737");
-            const std::string caps = "\"capabilities\": [\"rescan\", \"rescan_requester_title\", "
-                                     "\"delete_requester_title\", \"uninstall_requester_title\"]";
+            const std::string caps = "\"homebrew_allowed\": true";
             install_game();
             std::remove((g_control + ".log").c_str());
             set_control("{" + caps + ", " + smp_image(false) + "}");
@@ -774,11 +797,9 @@ int main(int argc, char **argv)
             wait_for(transfers, [&](const QueueStatus &)
                      { return transfers.removal().state != TransferState::deleting; });
             check(transfers.removal().state == TransferState::deleted && there(game_dir) &&
-                      smp_log().find("/api/v1/games/delete {\"confirm\": true, \"requester_title_id\": "
-                                     "\"PPSA62737\", \"title_id\": \"PPSA01111\"}") != std::string::npos &&
-                      smp_log().find("/api/v1/games/uninstall {\"requester_title_id\": \"PPSA62737\", "
-                                     "\"title_id\": \"PPSA01111\"}") != std::string::npos,
-                  "ShadowMountPlus deletes and uninstalls when it takes NASBridge's requests",
+                      smp_log().find("/api/v1/games/delete {\"confirm\": true, \"title_id\": \"PPSA01111\"}") != std::string::npos &&
+                      smp_log().find("/api/v1/games/uninstall {\"title_id\": \"PPSA01111\"}") != std::string::npos,
+                  "ShadowMountPlus 1.7beta6 deletes and uninstalls an image game itself",
                   transfers.removal().message);
             notes();
 
@@ -805,9 +826,8 @@ int main(int argc, char **argv)
                      { return transfers.removal().state != TransferState::deleting; });
             check(transfers.removal().state == TransferState::failed && there(game_dir) &&
                       read_text(ps5root + "/uninstalled.txt").empty() &&
-                      transfers.removal().message ==
-                          "ShadowMountPlus wouldn't delete the game: a game is running. Close "
-                          "that game, then try again.",
+                      transfers.removal().message.find("won't change this game while NASBridge "
+                                                       "is open") != std::string::npos,
                   "when ShadowMountPlus refuses an attached game, nothing else deletes it",
                   transfers.removal().message);
             notes();
@@ -892,8 +912,7 @@ int main(int argc, char **argv)
                      { return transfers.removal().state != TransferState::deleting; });
             check(transfers.removal().state == TransferState::deleted && !there(game_dir) &&
                       !transfers.removal().leftover &&
-                      smp_log().find("/api/v1/games/uninstall {\"requester_title_id\": \"PPSA62737\", "
-                                     "\"title_id\": \"PPSA01111\"}") != std::string::npos &&
+                      smp_log().find("/api/v1/games/uninstall {\"title_id\": \"PPSA01111\"}") != std::string::npos &&
                       smp_log().find("/api/v1/games/delete") == std::string::npos &&
                       read_text(ps5root + "/uninstalled.txt").find("PPSA01111") == std::string::npos &&
                       smp_log().find("/api/v1/scan") != std::string::npos && !there(hidden),
@@ -960,56 +979,24 @@ int main(int argc, char **argv)
             notes();
             set_delete_threads(16);
 
-            // A copy's rescan asks as NASBridge, so it runs while NASBridge is open
-            // (and NASBridge doesn't ask to be closed). It's asked once the copy has
-            // settled (ShadowMountPlus skips files changed in its last few seconds),
-            // and asked again while the game isn't listed.
-            const std::string ask = "/api/v1/scan {\"requester_title_id\": \"PPSA62737\", "
-                                    "\"reset_attempts\": true}";
-            const auto asks = [&ask]
+            // With ShadowMountPlus 1.7beta6, a copy asks for one scan, which runs
+            // while NASBridge is open, so it isn't held back for NASBridge to close.
+            std::remove((g_control + ".log").c_str());
+            set_control("{" + caps + "}");
             {
+                Transfers copying;
+                copying.set_space_check(space);
+                copying.enqueue(connection, image_game(img_size), "Img", dest, &why);
+                wait_for(copying, stopped);
                 const std::string log = smp_log();
-                int count = 0;
-                for (std::size_t at = log.find(ask); at != std::string::npos; at = log.find(ask, at + 1))
-                    ++count;
-                return count;
-            };
-            set_smp_settle(150, 200, 400); // short: the asks below are waited out
-            std::remove((g_control + ".log").c_str());
-            set_control("{" + caps + "}"); // its list never has the game
-            {
-                Transfers copying;
-                copying.set_space_check(space);
-                copying.enqueue(connection, image_game(img_size), "Img", dest, &why);
-                wait_for(copying, stopped);
-                check(copying.queue().waiting("Img.exfat") == nullptr,
-                      "a copy isn't held back for NASBridge to close");
-                int seen = 0;
-                for (int i = 0; i < 200 && (seen = asks()) < 2; ++i)
-                    sleep_ms(50);
-                check(seen >= 2, "a copy's rescan asks as NASBridge once settled, and again while "
-                                 "the game isn't listed", smp_log());
-            }
-            clean("Img.exfat");
-            sleep_ms(2500); // the asks above have run out (at most 150 + 4 x 400 + 3 x 200 ms)
-            notes();
-            // Listed after the first ask: not asked again.
-            std::remove((g_control + ".log").c_str());
-            set_control("{" + caps + ", \"games\": [{\"title_id\": \"PPSA03333\", \"path\": "
-                        "\"/data/homebrew/Img.exfat\", \"source_type\": \"image\", \"installed\": true}]}");
-            {
-                Transfers copying;
-                copying.set_space_check(space);
-                copying.enqueue(connection, image_game(img_size), "Img", dest, &why);
-                wait_for(copying, stopped);
-                sleep_ms(1500); // a second ask would come within 150 + 400 + 200 ms
-                check(asks() == 1, "once ShadowMountPlus lists it, it isn't asked again",
-                      std::to_string(asks()));
+                const std::string ask = "/api/v1/scan {\"reset_attempts\": true}";
+                const std::size_t first = log.find(ask);
+                check(copying.queue().waiting("Img.exfat") == nullptr && first != std::string::npos &&
+                          log.find(ask, first + 1) == std::string::npos,
+                      "a copy asks ShadowMountPlus for one scan, and isn't held back", log);
             }
             clean("Img.exfat");
             notes();
-            set_smp_settle(12000, 15000, 10000);
-            set_smp_self_title_id("");
             set_control("{}");
         }
     }

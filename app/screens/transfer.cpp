@@ -137,16 +137,6 @@ void sleep_ms(int ms)
     nanosleep(&step, nullptr);
 }
 
-// ShadowMountPlus skips a game whose files changed in the last
-// stability_wait_s (10 s by default; its API doesn't say) in case they're
-// still being written, and while NASBridge is open it only looks again when
-// asked. So a scan asked for as NASBridge waits for the copy to settle, then
-// checks the game is listed and asks again a few times (for a longer setting).
-// It runs on its own thread: the next game in the queue doesn't wait for it.
-int g_settle_ms = 12000;       // the first ask, after the copy's last write
-int g_settle_retry_ms = 15000; // between asks while it isn't listed
-int g_settle_check_ms = 10000; // how long each ask is given to add it
-constexpr int kSettleTries = 4;
 
 // How many files the delete helper deletes at once for a folder game: on the
 // PS5's internal storage each delete waits milliseconds on the drive, and
@@ -174,56 +164,6 @@ void remember_shallow_nas(const std::string &nas)
     std::lock_guard<std::mutex> hold(g_shallow_lock);
     if (std::find(g_shallow.begin(), g_shallow.end(), nas) == g_shallow.end())
         g_shallow.push_back(nas);
-}
-
-struct SettleScan
-{
-    std::string title_id;
-};
-
-void *settle_scan_main(void *argument)
-{
-    std::unique_ptr<SettleScan> job(static_cast<SettleScan *>(argument));
-    sleep_ms(g_settle_ms);
-    for (int attempt = 0; attempt < kSettleTries; ++attempt)
-    {
-        if (attempt > 0)
-            sleep_ms(g_settle_retry_ms);
-        std::string why, deferred;
-        const bool scanned = smp_scan(true, &why, &deferred);
-        if (!scanned)
-            continue;
-        if (job->title_id.empty())
-            return nullptr; // nothing to look for: one ask
-        for (int waited = 0; waited < g_settle_check_ms; waited += 500)
-        {
-            sleep_ms(500);
-            std::vector<SmpGame> games;
-            if (!smp_games(&games, &why))
-                continue;
-            for (const SmpGame &game : games)
-                if (game.title_id == job->title_id && game.installed)
-                    return nullptr;
-        }
-    }
-    return nullptr;
-}
-
-bool start_settle_scan(const std::string &title_id)
-{
-    SettleScan *job = new SettleScan{title_id};
-    pthread_attr_t attributes;
-    pthread_attr_init(&attributes);
-    // Like every other thread here: the stack also holds http.cpp's 512 KiB
-    // thread_local buffer where TLS comes out of it (glibc refuses smaller).
-    pthread_attr_setstacksize(&attributes, 1024 * 1024);
-    pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
-    pthread_t thread;
-    const bool started = pthread_create(&thread, &attributes, settle_scan_main, job) == 0;
-    pthread_attr_destroy(&attributes);
-    if (!started)
-        delete job;
-    return started;
 }
 
 std::string errno_text(const char *what, int error)
@@ -403,12 +343,6 @@ void set_deep_listing_wait(int seconds)
     g_shallow.clear();
 }
 
-void set_smp_settle(int first_ms, int retry_ms, int check_ms)
-{
-    g_settle_ms = first_ms;
-    g_settle_retry_ms = retry_ms;
-    g_settle_check_ms = check_ms;
-}
 
 void set_copy_streams(int streams)
 {
@@ -1072,12 +1006,12 @@ class Copier
     Outcome finish(const CopyPlan &plan, const std::string &incoming, std::string *why)
     {
         ::rmdir(incoming.c_str()); // only when nothing else is in it
-        // A ShadowMountPlus that takes NASBridge's own scans adds it while
-        // NASBridge is open: asked once the copy has settled (see
-        // settle_scan_main). An older one is asked now, and adds it once
-        // NASBridge closes.
-        if (smp_requester_support().scan && start_settle_scan(plan.title_id))
-            return Outcome::done;
+        // From 1.7beta6, ShadowMountPlus scans while a homebrew app (a LAPY
+        // title ID, as NASBridge has) is open: this adds the game, or, if
+        // its files are too fresh for this scan (it waits stability_wait_s,
+        // 10 s by default, in case they're still being written), its own
+        // next scan does. An older one takes the scan but waits for NASBridge
+        // to close ("game_active").
         std::string scan_why;
         std::string deferred;
         if (!smp_scan(true, &scan_why, &deferred))
@@ -2446,7 +2380,7 @@ bool uninstall_when_idle(const std::string &title_id, std::string *why, std::str
 {
     for (int waited = 0;; waited += 1000)
     {
-        if (smp_uninstall(title_id, why, true, reason))
+        if (smp_uninstall(title_id, why, reason))
             return true;
         if (*reason != "scanner_busy" && *reason != "runtime_busy")
             break;
@@ -2465,7 +2399,7 @@ bool uninstall_when_idle(const std::string &title_id, std::string *why, std::str
 }
 
 // False when ShadowMountPlus refused before changing anything; *refused says
-// why, plainly, and *hint what to do about it.
+// why, plainly, *hint what to do about it, and *reason_code its error_reason.
 // The folder a game's folder is in ("/data/homebrew" for "/data/homebrew/X").
 std::string parent_folder(const std::string &path)
 {
@@ -2562,7 +2496,7 @@ void finish_unfinished(const SharedPtr &shared)
 }
 
 bool remove_with_smp(const SharedPtr &shared, const SmpGame &game, std::string *refused,
-                     std::string *hint)
+                     std::string *hint, std::string *reason_code)
 {
     // A folder game: ShadowMountPlus removes it from the home screen (and
     // releases its files if they're attached), then the helper deletes the
@@ -2577,6 +2511,7 @@ bool remove_with_smp(const SharedPtr &shared, const SmpGame &game, std::string *
             const std::string text = smp_reason_text(reason);
             *refused = text.empty() ? why : text; // nothing changed yet
             *hint = smp_reason_hint(reason);
+            *reason_code = reason;
             return false;
         }
         delete_folder_files(shared, game.title_id, game.path);
@@ -2596,10 +2531,11 @@ bool remove_with_smp(const SharedPtr &shared, const SmpGame &game, std::string *
         shared->set_removal(TransferState::deleting, "Removing game files");
         int job_id = 0;
         bool missing = false;
-        if (!smp_delete_source(game.title_id, &job_id, &missing, &why, true, &reason))
+        if (!smp_delete_source(game.title_id, &job_id, &missing, &why, &reason))
         {
             *refused = said(); // before anything was deleted
             *hint = smp_reason_hint(reason);
+            *reason_code = reason;
             return false;
         }
         if (!missing)
@@ -2639,6 +2575,7 @@ bool remove_with_smp(const SharedPtr &shared, const SmpGame &game, std::string *
                     why = job.error;
                     *refused = said();
                     *hint = smp_reason_hint(reason);
+                    *reason_code = reason;
                     return false;
                 }
                 shared->set_removal(TransferState::failed,
@@ -2655,6 +2592,7 @@ bool remove_with_smp(const SharedPtr &shared, const SmpGame &game, std::string *
         {
             *refused = said(); // nothing changed yet
             *hint = smp_reason_hint(reason);
+            *reason_code = reason;
             return false;
         }
         shared->set_removal(TransferState::failed,
@@ -2670,9 +2608,10 @@ void remove_game(const SharedPtr &shared, const std::string &title_id)
 {
     // ShadowMountPlus's list is still readable while NASBridge is open. From
     // it we get the game's files and whether it's running. The delete goes to
-    // ShadowMountPlus itself when it takes requests from NASBridge while it's
-    // open (requester_title_id); an older one refuses changes while NASBridge
-    // counts as a running game, so the helper payload does it then.
+    // ShadowMountPlus first: from 1.7beta6 it changes other games while a
+    // homebrew app (a LAPY title ID, as NASBridge has) is open. An older one
+    // refuses while NASBridge counts as a running game, so the helper payload
+    // does it then.
     std::string why;
     std::vector<SmpGame> games;
     if (!smp_games(&games, &why))
@@ -2696,23 +2635,29 @@ void remove_game(const SharedPtr &shared, const std::string &title_id)
         return shared->set_removal(TransferState::failed, "ShadowMountPlus doesn't know this game");
     }
 
-    // A ShadowMountPlus that takes NASBridge's own requests does it all: it
-    // releases a game whose files are attached ("mounted": any image game
-    // that has been played, not only a running one) and refuses a running one.
-    // Otherwise (or when it says no) the helper payload does, but only for a
-    // game that isn't attached: it can't release one.
-    std::string refused, hint;
-    if (smp_requester_support().remove)
+    // ShadowMountPlus does it all when it can: it releases a game whose files
+    // are attached ("mounted": a game just added, or an image game that has
+    // been played) and refuses a running one. When it says no, the helper
+    // payload does, but only for a game that isn't attached: it can't release
+    // one.
+    std::string refused, hint, reason_code;
+    if (remove_with_smp(shared, *game, &refused, &hint, &reason_code))
+        return;
+    if (game->mounted)
     {
-        if (remove_with_smp(shared, *game, &refused, &hint))
-            return;
-        if (game->mounted)
-            return shared->set_removal(TransferState::failed,
-                                       "ShadowMountPlus wouldn't delete the game: " + refused +
-                                           ". " + hint);
+        // "A game is running": NASBridge itself, to a ShadowMountPlus older
+        // than 1.7beta6 (which changes no game while an app is open); to a
+        // newer one, this game shares files with NASBridge. Its API doesn't
+        // say which version it is, so the message covers both.
+        if (reason_code == "game_active")
+            return shared->set_removal(
+                TransferState::failed,
+                "ShadowMountPlus won't change this game while NASBridge is open. If it's older "
+                "than 1.7beta6-fix2, update it; otherwise restart the PS5, then delete the game.");
+        return shared->set_removal(TransferState::failed,
+                                   "ShadowMountPlus wouldn't delete the game: " + refused + ". " +
+                                       hint);
     }
-    else if (game->mounted)
-        return shared->set_removal(TransferState::failed, "Close the game first");
 
     // An installed PKG has no source files of its own: the helper only
     // uninstalls it ("" path). Otherwise the helper deletes its folder or

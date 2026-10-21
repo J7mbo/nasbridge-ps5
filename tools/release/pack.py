@@ -6,7 +6,7 @@ the network ("NBI1", every file with its size and SHA-256, "END1"; see
 tools/installer/installer.c), zlib-compressed. tools/release/blob.S links it
 into the installer, which then installs the app from itself.
 
-    python3 tools/release/pack.py out/app/PPSA62737 build/ps5/release/app.nbz
+    python3 tools/release/pack.py out/app/LAPY62737 build/ps5/release/app.nbz
 
 Files go in sorted order and zlib's output is deterministic, so the same
 folder always packs to the same bytes.

@@ -37,10 +37,9 @@ A native PS5 homebrew app to browse and install games from your NAS.
   helpers.
 - ShadowMountPlus which puts games in `/data/homebrew` on the home screen.
   - For the full experience (copied games appear while NASBridge is open, and
-    games can be deleted while it's open), use [this build](https://github.com/J7mbo/shadowmountplus/releases/tag/v1.7beta5-nasbridge.1) 
-    that supports that.
-  - Without it, copied games appear only once you close NASBridge, and to delete
-    you need to delete in NASBridge, and then the title from the PS5 home screen.
+    games can be deleted while it's open), use version 1.7beta6-fix2 or newer.
+  - With older versions, copied games appear only once you close NASBridge, and
+    a game you've just copied can only be deleted after restarting the PS5.
 - A NAS (or any computer) sharing your games over **WebDAV**. On a Synology,
   that's the WebDAV Server package (port 5005). On Unraid, that's likely a WebDav
   docker container.
@@ -51,20 +50,15 @@ Tested on a PS5 on firmware 13.60.
 
 ## Install
 
-1. Install ShadowMountPlus with NASBridge support:
-   download `ShadowMountPlus_v1.7beta5-nasbridge.1.zip` from
-   [this release](https://github.com/J7mbo/shadowmountplus/releases/tag/v1.7beta5-nasbridge.1),
-   unzip it, and send `shadowmountplus.elf` to your PS5's ELF loader
-   (port 9021). It takes over from any ShadowMountPlus already running. To keep
-   it after a restart, put it wherever your setup loads ShadowMountPlus from at
-   boot.
+1. Make sure you have ShadowMountPlus 1.7beta6-fix2 or newer, from its
+   [releases](https://github.com/drakmor/ShadowMountPlus/releases).
 2. Download `NASBridge-<version>.elf` from the
    [latest release](https://github.com/J7mbo/nasbridge-ps5/releases/latest).
 3. Send it to the ELF loader the same way, with any payload sender, such as
    [ps5upload](https://github.com/phantomptr/ps5upload). From a Mac or Linux
    terminal, this works too:
    ```sh
-   nc -w 5 192.168.1.123 9021 < NASBridge-0.3.0.elf   # your PS5's IP address
+   nc -w 5 192.168.1.123 9021 < NASBridge-0.4.0.elf   # your PS5's IP address
    ```
 4. A notification says when it's installed. NASBridge then appears on the home
    screen within a few seconds.
@@ -73,9 +67,22 @@ Tested on a PS5 on firmware 13.60.
 It replaces the app and refreshes the home screen's icon, backgrounds and
 music, and your settings are kept. It refuses while NASBridge is open.
 
-**To remove it**, delete the `/data/homebrew/PPSA62737` folder (for example
+**To remove it**, delete the `/data/homebrew/LAPY62737` folder (for example
 over FTP), then delete NASBridge's tile from the home screen. Do it in that
 order: ShadowMountPlus adds back any tile whose folder is still there.
+
+### Upgrading from 0.3.0
+
+NASBridge 0.4.0 has a new title ID (`LAPY62737`), so it installs as a new app
+instead of replacing 0.3.0, and it needs ShadowMountPlus 1.7beta6-fix2 or
+newer.
+
+1. Update ShadowMountPlus to 1.7beta6-fix2 or newer, from its
+   [releases](https://github.com/drakmor/ShadowMountPlus/releases).
+2. Remove NASBridge 0.3.0: delete the `/data/homebrew/PPSA62737` folder (using for example PS5Upload), 
+   then delete the old NASBridge tile from the home screen.
+3. Install 0.4.0 as above, then set up your NAS connection again (settings are
+   kept per title ID, so 0.4.0 starts fresh).
 
 ### Installing from source
 
