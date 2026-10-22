@@ -39,6 +39,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -129,6 +130,7 @@ struct QueueEntry
     std::uint64_t size = 0; // bytes it copies (estimated until its files are listed)
     std::uint64_t done = 0; // bytes already on the drive
     bool started = false;   // has files on the drive (removing it deletes them)
+    bool image = false;     // an image (one file), not a folder game
 };
 
 struct QueueStatus
@@ -146,6 +148,7 @@ struct QueueStatus
     int files_total = 0;
     // Games whose files are being deleted after leaving the queue.
     std::vector<std::string> discarding;
+    std::map<std::string, float> discarded; // how far each of those is, 0..1
     // The last game copied (it stays "Copied" until ShadowMountPlus lists it).
     std::string finished_entry;
     std::string finished_destination;

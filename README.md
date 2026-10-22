@@ -12,10 +12,10 @@ A native PS5 homebrew app to browse and install games from your NAS.
 
 ## What it does
 
-- **Browses your NAS over WebDAV.** Your games show up as a library with
-  their names, covers and sizes, read from each game's `sce_sys` folder.
-  Game folders are found up to four folders down, and `.exfat` images are
-  read without downloading them.
+- **Browses your NAS over WebDAV or SMB**. Your games show up as a library with 
+  their names, covers and
+  sizes, read from each game's `sce_sys` folder. Game folders are found up to
+  four folders down, and `.exfat` images are read without downloading them.
 - **Copies games to the PS5.** Queue as many as you like. The queue can be
   reordered, paused and resumed, and it picks up where it left off if
   NASBridge or the PS5 restarts. Free space is checked before each game.
@@ -40,9 +40,17 @@ A native PS5 homebrew app to browse and install games from your NAS.
     games can be deleted while it's open), use version 1.7beta6-fix2 or newer.
   - With older versions, copied games appear only once you close NASBridge, and
     a game you've just copied can only be deleted after restarting the PS5.
-- A NAS (or any computer) sharing your games over **WebDAV**. On a Synology,
-  that's the WebDAV Server package (port 5005). On Unraid, that's likely a WebDav
-  docker container.
+- A NAS (or any computer) sharing your games over **WebDAV** or **SMB**.
+  - WebDAV: on a Synology, that's the WebDAV Server package (port 5005). On
+    Unraid, that's likely a WebDAV docker container.
+  - SMB is built into most NAS systems: turn it on, and give a user read 
+    access to the games share. In NASBridge, enter the NAS's IP address, 
+    that username and password, then pick your games folder with the folder 
+    button; its first part is the share (`/Games/PS5`). SMB 2 or newer is needed.
+  - Sign in with a username and password: guest access doesn't work. On
+    Unraid, a share set to Public (guest) is refused. Set the games share to
+    Private, add a user for NASBridge under Users, and give it Read-only
+    access to the share.
 - Only to build it yourself: a Mac or Linux machine with Docker (Docker
   Desktop or OrbStack) and `make`.
 
@@ -58,7 +66,7 @@ Tested on a PS5 on firmware 13.60.
    [ps5upload](https://github.com/phantomptr/ps5upload). From a Mac or Linux
    terminal, this works too:
    ```sh
-   nc -w 5 192.168.1.123 9021 < NASBridge-0.4.0.elf   # your PS5's IP address
+   nc -w 5 192.168.1.123 9021 < NASBridge-0.5.0.elf   # your PS5's IP address
    ```
 4. A notification says when it's installed. NASBridge then appears on the home
    screen within a few seconds.
@@ -73,16 +81,16 @@ order: ShadowMountPlus adds back any tile whose folder is still there.
 
 ### Upgrading from 0.3.0
 
-NASBridge 0.4.0 has a new title ID (`LAPY62737`), so it installs as a new app
-instead of replacing 0.3.0, and it needs ShadowMountPlus 1.7beta6-fix2 or
-newer.
+NASBridge 0.4.0 and later has a new title ID (`LAPY62737`), so it installs as
+a new app instead of replacing 0.3.0, and it needs ShadowMountPlus
+1.7beta6-fix2 or newer.
 
 1. Update ShadowMountPlus to 1.7beta6-fix2 or newer, from its
    [releases](https://github.com/drakmor/ShadowMountPlus/releases).
 2. Remove NASBridge 0.3.0: delete the `/data/homebrew/PPSA62737` folder (using for example PS5Upload), 
    then delete the old NASBridge tile from the home screen.
-3. Install 0.4.0 as above, then set up your NAS connection again (settings are
-   kept per title ID, so 0.4.0 starts fresh).
+3. Install the latest version as above, then set up your NAS connection again
+   (settings are kept per title ID, so it starts fresh).
 
 ### Installing from source
 
@@ -125,6 +133,11 @@ NASBridge only reads from your NAS. It never changes or deletes anything there.
 - **Patches and backports aren't copied.** For a game folder, NASBridge copies
   the folder holding `sce_sys`, and leaves out patch folders, archives and
   hidden files beside it.
+- **Measuring huge game folders takes a while.** A folder game's size is
+  added up from every file in it, after the library has appeared. A folder
+  of tens of thousands of files can take minutes on its own. Its size shows
+  as soon as it's measured, and is kept for next time unless the folder
+  changes.
 
 ## Building from source
 
@@ -137,7 +150,7 @@ need.
 | `make install PS5_HOST=<ip>` | Build, then install to the PS5's home screen |
 | `make uninstall PS5_HOST=<ip>` | Remove NASBridge from the PS5 |
 | `make release` | Build `out/NASBridge-<version>.elf`, the single-file installer |
-| `make test` | Run the test suites (on your computer, against a fake NAS and PS5) |
+| `make test` | Run the test suites (on your computer, against a fake WebDAV NAS, a Samba server and a fake PS5) |
 | `make snapshots` | Render every screen to `out/snapshots/` |
 | `make shell` | Open a shell inside the toolchain container |
 | `make clean` | Delete build output |
@@ -149,7 +162,8 @@ exact commits, so two builds of the same commit produce the same files.
 ```
 app/      the app: screens, artwork and home-screen metadata (sce_sys)
 tools/    the installer, copy helper and delete helper payloads
-tests/    test suites, with a fake WebDAV NAS and a fake PS5 loader
+tests/    test suites, with a fake WebDAV NAS, a real Samba server for SMB,
+          and a fake PS5 loader
 Dockerfile, Makefile, ps5.mk   the toolchain and build
 ```
 
@@ -162,6 +176,8 @@ Dockerfile, Makefile, ps5.mk   the toolchain and build
 - Selection music: an excerpt of "First Light" from the ps5-homebrew-ui kit,
   Copyright (C) 2026 BlackBearReloaded (GPL-3.0-or-later).
 - Built on the [PS5 payload SDK](https://github.com/ps5-payload-dev/sdk).
+- SMB support uses [libsmb2](https://github.com/sahlberg/libsmb2) by Ronnie
+  Sahlberg (LGPL-2.1-or-later).
 - Games are added to the home screen by
   [ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus).
 

@@ -37,6 +37,8 @@ int g_helper_streams = 2;
 
 constexpr const char *kProto = "NBC1";
 constexpr const char *kBatchProto = "NBB1";
+constexpr const char *kSmbProto = "NBS1";      // one file over SMB
+constexpr const char *kSmbBatchProto = "NBT1"; // small files over SMB
 constexpr int kStartMs = 20000;   // the loader can take a while to run it
 constexpr int kSilentMs = 90000;  // longer than the helper ever goes quiet
 
@@ -163,12 +165,22 @@ int open_helper(std::string *buffer)
     return -1;
 }
 
-} // namespace
+// The sign-in as the helper takes it: its fields, each ended by a NUL.
+std::string sign_in_bytes(const SmbSignIn &sign_in, const std::string *path)
+{
+    std::string bytes = sign_in.share + '\0';
+    if (path != nullptr)
+        bytes += *path + '\0';
+    bytes += sign_in.user + '\0' + sign_in.domain + '\0' + sign_in.password + '\0';
+    return bytes;
+}
 
-HelperCopy copy_with_helper(const std::string &ip, int port, std::uint64_t size,
-                            const std::string &local, const std::string &request, int streams,
-                            const std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, int)> &progress,
-                            const std::function<bool()> &stopping)
+using Progress = std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, int)>;
+
+// One file: sends the job line and what follows it, then follows the helper
+// to the end.
+HelperCopy run_copy(const std::string &job, const std::string &payload, const Progress &progress,
+                    const std::function<bool()> &stopping)
 {
     HelperCopy result;
     std::string buffer;
@@ -179,10 +191,7 @@ HelperCopy copy_with_helper(const std::string &ip, int port, std::uint64_t size,
         result.why = "the copy helper didn't start";
         return result;
     }
-    const std::string job = std::string(kProto) + "\t" + ip + "\t" + std::to_string(port) + "\t" +
-                            std::to_string(size) + "\t" + local + "\t" +
-                            std::to_string(request.size()) + "\t" + std::to_string(streams) + "\n";
-    if (!send_all(fd, job.data(), job.size()) || !send_all(fd, request.data(), request.size()))
+    if (!send_all(fd, job.data(), job.size()) || !send_all(fd, payload.data(), payload.size()))
     {
         ::close(fd);
         result.end = HelperCopy::End::lost;
@@ -257,6 +266,8 @@ HelperCopy copy_with_helper(const std::string &ip, int port, std::uint64_t size,
                 result.end = End::refused;
                 result.status = std::atoi(result.why.c_str());
             }
+            else if (kind == "smb")
+                result.end = End::refused; // the NAS said no: `why` says what
             else if (kind == "chunked")
                 result.end = End::unsupported;
             else if (kind == "changed")
@@ -273,12 +284,12 @@ HelperCopy copy_with_helper(const std::string &ip, int port, std::uint64_t size,
     return result;
 }
 
-HelperBatch copy_batch_with_helper(const std::string &ip, int port, int workers,
-                                   const std::vector<BatchFile> &files,
-                                   const std::function<void(std::size_t)> &done,
-                                   const std::function<void()> &synced,
-                                   const BatchProgress &progress,
-                                   const std::function<bool()> &stopping)
+// Many files: sends `opening` (the batch line and what follows it), then the
+// list as the helper takes it, following the helper to the end.
+HelperBatch run_batch(const std::string &opening, const std::vector<BatchFile> &files,
+                      const std::function<void(std::size_t)> &done,
+                      const std::function<void()> &synced, const BatchProgress &progress,
+                      const std::function<bool()> &stopping)
 {
     using End = HelperCopy::End;
     HelperBatch result;
@@ -294,8 +305,7 @@ HelperBatch copy_batch_with_helper(const std::string &ip, int port, int workers,
     // the list, and neither side may wait on the other.
     const int flags = ::fcntl(fd, F_GETFL, 0);
     ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    std::string out = std::string(kBatchProto) + "\t" + ip + "\t" + std::to_string(port) + "\t" +
-                      std::to_string(workers) + "\n";
+    std::string out = opening;
     std::size_t sent = 0;     // of `out`
     std::size_t next = 0;     // the next file to put in `out`
     bool ended = false;       // "E" is in `out`
@@ -423,6 +433,8 @@ HelperBatch copy_batch_with_helper(const std::string &ip, int port, int workers,
                     result.status = std::atoi(result.why.c_str());
                     return finish(End::refused);
                 }
+                if (kind == "smb")
+                    return finish(End::refused);
                 if (kind == "changed")
                     return finish(End::changed);
                 if (kind == "chunked")
@@ -438,6 +450,56 @@ HelperBatch copy_batch_with_helper(const std::string &ip, int port, int workers,
     }
     result.why = "the copy helper stopped answering";
     return finish(End::lost);
+}
+
+} // namespace
+
+HelperCopy copy_with_helper(const std::string &ip, int port, std::uint64_t size,
+                            const std::string &local, const std::string &request, int streams,
+                            const Progress &progress, const std::function<bool()> &stopping)
+{
+    const std::string job = std::string(kProto) + "\t" + ip + "\t" + std::to_string(port) + "\t" +
+                            std::to_string(size) + "\t" + local + "\t" +
+                            std::to_string(request.size()) + "\t" + std::to_string(streams) + "\n";
+    return run_copy(job, request, progress, stopping);
+}
+
+HelperCopy copy_smb_with_helper(const std::string &ip, int port, std::uint64_t size,
+                                const std::string &local, const SmbSignIn &sign_in,
+                                const std::string &path, int streams, const Progress &progress,
+                                const std::function<bool()> &stopping)
+{
+    const std::string bytes = sign_in_bytes(sign_in, &path);
+    const std::string job = std::string(kSmbProto) + "\t" + ip + "\t" + std::to_string(port) +
+                            "\t" + std::to_string(size) + "\t" + local + "\t" +
+                            std::to_string(bytes.size()) + "\t" + std::to_string(streams) + "\n";
+    return run_copy(job, bytes, progress, stopping);
+}
+
+HelperBatch copy_batch_with_helper(const std::string &ip, int port, int workers,
+                                   const std::vector<BatchFile> &files,
+                                   const std::function<void(std::size_t)> &done,
+                                   const std::function<void()> &synced,
+                                   const BatchProgress &progress,
+                                   const std::function<bool()> &stopping)
+{
+    return run_batch(std::string(kBatchProto) + "\t" + ip + "\t" + std::to_string(port) + "\t" +
+                         std::to_string(workers) + "\n",
+                     files, done, synced, progress, stopping);
+}
+
+HelperBatch copy_smb_batch_with_helper(const std::string &ip, int port, int workers,
+                                       const SmbSignIn &sign_in, const std::vector<BatchFile> &files,
+                                       const std::function<void(std::size_t)> &done,
+                                       const std::function<void()> &synced,
+                                       const BatchProgress &progress,
+                                       const std::function<bool()> &stopping)
+{
+    const std::string bytes = sign_in_bytes(sign_in, nullptr);
+    return run_batch(std::string(kSmbBatchProto) + "\t" + ip + "\t" + std::to_string(port) +
+                         "\t" + std::to_string(workers) + "\t" + std::to_string(bytes.size()) +
+                         "\n" + bytes,
+                     files, done, synced, progress, stopping);
 }
 
 bool copy_helper_enabled()

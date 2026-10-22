@@ -397,6 +397,9 @@ class Library final : public app::Concept
             awake_age_ = kAwakeSeconds;
         }
         queue_panel_.update(dt, queue_);
+        const std::string removed = queue_panel_.take_removed();
+        if (!removed.empty())
+            open_page_of(removed, feedback);
         queue_hint_ = queue_.entries.empty()
                           ? "Queue"
                           : "Queue (" + std::to_string(queue_.entries.size()) + ")";
@@ -1077,6 +1080,26 @@ class Library final : public app::Concept
         const float lift = ui::card_lift(grid_.style, grid_.style.card, focused);
         return {cell.cx() + (art.x - cell.cx()) * scale,
                 cell.cy() + (art.y - cell.cy()) * scale - lift, art.w * scale, art.h * scale};
+    }
+
+    // A game's page, from the queue: the game gets the focus (on the All
+    // tab, when the one shown leaves it out) and its page opens.
+    void open_page_of(const std::string &entry, app::Feedback &feedback)
+    {
+        const int index = index_of(entry);
+        if (index < 0)
+            return;
+        auto slot = std::find(shown_.begin(), shown_.end(), index);
+        if (slot == shown_.end())
+        {
+            tabs_.set_active(kAll, true);
+            show(kAll);
+            slot = std::find(shown_.begin(), shown_.end(), index);
+            if (slot == shown_.end())
+                return;
+        }
+        grid_.set_focus(static_cast<int>(slot - shown_.begin()), true);
+        open_page(feedback);
     }
 
     void open_page(app::Feedback &feedback)
@@ -1975,6 +1998,8 @@ class Library final : public app::Concept
             label = "Removed from the queue";
             heading = game.title;
             text = "Deleting the files copied so far";
+            const auto done = queue_.discarded.find(game.source.entry);
+            progress = done != queue_.discarded.end() ? done->second : 0.0f;
         }
         else if (removing &&
                  (removal_.state == TransferState::deleting ||

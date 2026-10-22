@@ -237,7 +237,17 @@ void QueuePanel::handle(const InputFrame &input, app::Feedback &feedback,
             if (at < 0 || !transfers_.remove(at, &why))
                 refuse(feedback, why.empty() ? "That game left the queue already" : why);
             else
+            {
+                // A folder game's copied files can take a while to delete:
+                // over to its page, which shows that going. (An image is one
+                // file, gone at once.)
                 queue_ = transfers_.queue();
+                if (!confirm_image_)
+                {
+                    removed_ = confirm_entry_;
+                    open_ = false;
+                }
+            }
         }
         return;
     }
@@ -347,6 +357,7 @@ void QueuePanel::handle(const InputFrame &input, app::Feedback &feedback,
             return;
         }
         confirm_entry_ = item.entry;
+        confirm_image_ = item.image;
         ui::DialogContent content;
         content.icon = ui::StatusKind::danger;
         content.title = "Remove " + item.title + " from the queue?";

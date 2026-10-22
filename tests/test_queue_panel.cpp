@@ -231,6 +231,10 @@ int main(int argc, char **argv)
     rig.idle(400);
     check(order(transfers.queue()) == "B;C;" && !there(dest + "/.nasbridge-incoming/A"),
           "Remove takes it out and deletes its copied files", order(transfers.queue()));
+    const std::string removed = panel.take_removed();
+    check(!panel.is_open() && removed == "A" && panel.take_removed().empty(),
+          "the panel closes for the removed game's page, which shows the deleting", removed);
+    panel.open(feedback);
 
     // A game with nothing copied leaves at once.
     rig.send(nav(Direction::down)); // C

@@ -9,7 +9,8 @@
  *   1. listens on 127.0.0.1:COPIER_PORT (only NASBridge, on this PS5),
  *   2. raises itself out of the sandbox as ps5upload's payload does,
  *   3. copies one file per connection: NASBridge sends the NAS's address and
- *      the GET request (sign-in and all); this payload works out where the
+ *      the GET request (sign-in and all; over SMB, the sign-in and the file:
+ *      see below); this payload works out where the
  *      file got to and fetches the rest, either
  *        - over one connection, received and written on two threads, or
  *        - over two (NASBridge asks), each fetching the next CHUNK of the file
@@ -32,7 +33,16 @@
  *              "OK" | "STOPPED" | "ERR <kind> <why>"   the end
  *   NASBridge -> "STOP\n" (or closing the connection)  stop now
  * ERR kinds: request, file, write (the drive), connect, drop, timeout (the
- * network: NASBridge tries again), http <status>, chunked, changed.
+ * network: NASBridge tries again), http <status>, chunked, changed, and smb
+ * <why> (the NAS refused over SMB: sign-in, no share, not found, denied).
+ *
+ * Over SMB (through libsmb2) the helper signs in itself:
+ *   NASBridge -> "NBS1\t<ip>\t<port>\t<size>\t<file>\t<sign-in length>[\t<streams>]\n"
+ *                then the share, the path in it, the user, the domain and the
+ *                password, each ended by a NUL
+ * and the replies are as above (no "S" line). The file comes over <streams>
+ * sign-ins (1 when left out), each fetching the next CHUNK in turn as over
+ * HTTP, with several reads in flight (SMB_IN_FLIGHT) for each chunk.
  */
 
 #include <arpa/inet.h>
@@ -54,6 +64,10 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <smb2/smb2.h>
+#include <smb2/libsmb2.h>
+#include <smb2/smb2-errors.h>
 
 #ifndef COPIER_HOST_TEST
 #include <ps5/kernel.h>
@@ -81,6 +95,14 @@
 #define MAX_HEADER (64 * 1024)
 #define MAX_REQUEST (64 * 1024)
 #define MAX_FILE 2048
+#define MAX_SIGN_IN 4096
+/* Game files are open to every user, as an FTP copy or the installer leaves
+ * them: a game whose files lack the execute bit shows "Can't Start Game"
+ * (issue #4), and NASBridge, as another user, moves and deletes them later. */
+#define FILE_MODE 0777
+#define PROTO_SMB "NBS1"
+#define SMB_READ (1u << 20) /* one SMB read (the NAS may allow less) */
+#define SMB_IN_FLIGHT 8     /* SMB reads asked for before the first answers */
 #define UNKNOWN_LEN UINT64_MAX
 /* ps5upload's identity for its payload (the debugger authid). */
 #define AUTHID_SYSTEM 0x4800000000000006ull
@@ -504,6 +526,53 @@ static int single_done(void *arg) {
   return s->reader_done && s->writer_done;
 }
 
+/* The buffers between the network and the drive, all free. 0, or -1 having
+ * said so. */
+static int single_buffers(job_t *j, single_t *s) {
+  int i;
+  for (i = 0; i < NBUF; ++i) {
+    s->buf[i] = malloc(BUF_SIZE);
+    if (!s->buf[i]) {
+      send_line(j->ctl, "ERR request out of memory");
+      return -1;
+    }
+    push(s->free_, &s->free_head, &s->free_n, i);
+  }
+  return 0;
+}
+
+/* Runs `reader` (the network) and the writer (the drive) until the file is
+ * in or it stops, then sends the last line. */
+static void single_pump(job_t *j, single_t *s, void *(*reader_main)(void *)) {
+  pthread_t reader, writer;
+  j->active = 1;
+  if (start_thread(&reader, reader_main, s) != 0) {
+    send_line(j->ctl, "ERR request couldn't start a thread");
+    return;
+  }
+  if (start_thread(&writer, single_writer, s) != 0) {
+    stop_all(j);
+    pthread_join(reader, NULL);
+    send_line(j->ctl, "ERR request couldn't start a thread");
+    return;
+  }
+  watch(j, single_done, s);
+  pthread_join(reader, NULL);
+  pthread_join(writer, NULL);
+  (void)fsync(j->fd);
+  if (j->write_err)
+    send_line(j->ctl, "ERR write %s", strerror(j->write_err));
+  else if (j->abort)
+    send_line(j->ctl, "STOPPED");
+  else if (s->read_err)
+    send_line(j->ctl, "ERR %s %s", s->read_err == 2 ? "timeout" : "drop", s->read_why);
+  else if (j->start + j->written == j->size)
+    send_line(j->ctl, "OK");
+  else
+    send_line(j->ctl, "ERR drop the NAS sent %llu of %llu bytes",
+              (unsigned long long)(j->start + j->written), (unsigned long long)j->size);
+}
+
 /* The rest of the file from j->start over one connection. Sends the last line. */
 static void single_pass(job_t *j) {
   char *head = malloc(MAX_HEADER + 1), value[64];
@@ -511,7 +580,6 @@ static void single_pass(job_t *j) {
   char *request;
   int status, rc, i;
   single_t s;
-  pthread_t reader, writer;
 
   memset(&s, 0, sizeof s);
   s.j = j;
@@ -565,14 +633,7 @@ static void single_pass(job_t *j) {
     }
   }
 
-  for (i = 0; i < NBUF; ++i) {
-    s.buf[i] = malloc(BUF_SIZE);
-    if (!s.buf[i]) {
-      send_line(j->ctl, "ERR request out of memory");
-      goto out;
-    }
-    push(s.free_, &s.free_head, &s.free_n, i);
-  }
+  if (single_buffers(j, &s) != 0) goto out;
   if (hlen > body_at) { /* what came with the header is the body's start */
     size_t extra = hlen - body_at;
     int idx = pop(s.free_, &s.free_head, &s.free_n);
@@ -581,32 +642,7 @@ static void single_pass(job_t *j) {
     s.received = extra;
     push(s.full, &s.full_head, &s.full_n, idx);
   }
-  j->active = 1;
-  if (start_thread(&reader, single_reader, &s) != 0) {
-    send_line(j->ctl, "ERR request couldn't start a thread");
-    goto out;
-  }
-  if (start_thread(&writer, single_writer, &s) != 0) {
-    stop_all(j);
-    pthread_join(reader, NULL);
-    send_line(j->ctl, "ERR request couldn't start a thread");
-    goto out;
-  }
-  watch(j, single_done, &s);
-  pthread_join(reader, NULL);
-  pthread_join(writer, NULL);
-  (void)fsync(j->fd);
-  if (j->write_err)
-    send_line(j->ctl, "ERR write %s", strerror(j->write_err));
-  else if (j->abort)
-    send_line(j->ctl, "STOPPED");
-  else if (s.read_err)
-    send_line(j->ctl, "ERR %s %s", s.read_err == 2 ? "timeout" : "drop", s.read_why);
-  else if (j->start + j->written == j->size)
-    send_line(j->ctl, "OK");
-  else
-    send_line(j->ctl, "ERR drop the NAS sent %llu of %llu bytes",
-              (unsigned long long)(j->start + j->written), (unsigned long long)j->size);
+  single_pump(j, &s, single_reader);
 
 out:
   for (i = 0; i < NBUF; ++i) free(s.buf[i]);
@@ -635,7 +671,8 @@ typedef struct multi {
   int nready;
   int fetchers_left, writer_done;
   int no_ranges;  /* the NAS answered a range with the whole file */
-  int net_err;    /* 1 drop, 2 timeout, 3 http, 4 changed */
+  int net_err;    /* 1 drop, 2 timeout, 3 http, 4 changed, 7 smb (refused) */
+  const struct smb_sign_in *smb; /* over SMB: each connection signs in with this */
   int http_status;
   char why[160];
 } multi_t;
@@ -741,7 +778,13 @@ done:
 typedef struct fetcher {
   multi_t *m;
   int slot;
+  struct smb2_context *smb2; /* over SMB: this connection's sign-in, kept chunk to chunk */
+  struct smb2fh *fh;
 } fetcher_t;
+
+static int smb_fetch_chunk(fetcher_t *f, uint64_t chunk, char *buf, size_t *got, char *why,
+                           size_t why_size);
+static void smb_fetcher_end(fetcher_t *f);
 
 static void *fetcher_main(void *arg) {
   fetcher_t *f = arg;
@@ -767,7 +810,8 @@ static void *fetcher_main(void *arg) {
     ++j->active;
     pthread_mutex_unlock(&j->mu);
     for (tries = 0; tries < CHUNK_TRIES; ++tries) {
-      rc = fetch_chunk(m, f->slot, chunk, buf, &got, &status, why, sizeof why);
+      rc = m->smb ? smb_fetch_chunk(f, chunk, buf, &got, why, sizeof why)
+                  : fetch_chunk(m, f->slot, chunk, buf, &got, &status, why, sizeof why);
       if (rc != 1 && rc != 2) break; /* only the network's hiccups are retried */
       sleep_ms(500u * (unsigned)(tries + 1));
     }
@@ -797,6 +841,7 @@ static void *fetcher_main(void *arg) {
       break;
     }
   }
+  if (m->smb) smb_fetcher_end(f);
   pthread_mutex_lock(&j->mu);
   --m->fetchers_left;
   pthread_cond_broadcast(&j->cv);
@@ -853,8 +898,12 @@ static void *multi_writer(void *arg) {
 
 /* The rest of the file from j->start over `streams` connections. Sends the
  * last line and returns 0, or returns 1 (nothing sent) when the NAS turned
- * out not to take ranges: the caller carries on over one connection. */
-static int multi_pass(job_t *j, int streams) {
+ * out not to take ranges: the caller carries on over one connection. Over
+ * SMB (`smb` set) each connection is a sign-in of its own, reading its chunks
+ * with several reads in flight; a NAS can serve each sign-in slowly but
+ * several side by side (an Unraid NAS: about 17 MB/s over one, 40 over four
+ * by WebDAV). */
+static int multi_pass(job_t *j, int streams, const struct smb_sign_in *smb) {
   multi_t m;
   fetcher_t f[MAX_STREAMS];
   pthread_t ft[MAX_STREAMS], writer;
@@ -863,6 +912,7 @@ static int multi_pass(job_t *j, int streams) {
   memset(&m, 0, sizeof m);
   m.j = j;
   m.streams = streams;
+  m.smb = smb;
   m.chunks = (j->size - j->start + CHUNK - 1) / CHUNK;
   for (i = 0; i < WINDOW; ++i) {
     m.pool[i] = malloc(CHUNK);
@@ -872,7 +922,8 @@ static int multi_pass(job_t *j, int streams) {
     }
     m.pool_free[m.nfree++] = i;
   }
-  send_line(j->ctl, "S 206");
+  if (!smb) send_line(j->ctl, "S 206");
+  memset(f, 0, sizeof f);
   for (i = 0; i < streams; ++i) {
     f[i].m = &m;
     f[i].slot = i;
@@ -905,6 +956,8 @@ static int multi_pass(job_t *j, int streams) {
     send_line(j->ctl, "ERR http %d", m.http_status);
   } else if (m.net_err == 4) {
     send_line(j->ctl, "ERR changed %s", m.why);
+  } else if (m.net_err == 7) {
+    send_line(j->ctl, "ERR smb %s", m.why);
   } else if (m.net_err) {
     send_line(j->ctl, "ERR %s %s", m.net_err == 2 ? "timeout" : "drop", m.why);
   } else if (j->abort) {
@@ -970,6 +1023,301 @@ static int resume_point(job_t *j) {
   return 0;
 }
 
+/* ------------------------------------------------------------ over SMB */
+
+/* The sign-in NASBridge sends: NUL-ended fields. */
+typedef struct smb_sign_in {
+  char *share, *path, *user, *domain, *password;
+} smb_sign_in_t;
+
+/* Splits `len` bytes into `n` NUL-ended fields. 0, or -1 when they aren't. */
+static int smb_fields(char *bytes, size_t len, char **field, int n) {
+  size_t at = 0;
+  int k;
+  for (k = 0; k < n; ++k) {
+    char *end;
+    if (at >= len) return -1;
+    end = memchr(bytes + at, '\0', len - at);
+    if (!end) return -1;
+    field[k] = bytes + at;
+    at = (size_t)(end - bytes) + 1;
+  }
+  return at == len ? 0 : -1;
+}
+
+/* What an SMB failure was, as an ERR kind and a few words. */
+static const char *smb_failure(struct smb2_context *smb2, char *why, size_t size) {
+  const char *text = smb2 ? smb2_get_error(smb2) : NULL;
+  switch (smb2 ? smb2_get_nterror(smb2) : 0) {
+  case SMB2_STATUS_LOGON_FAILURE:
+  case SMB2_STATUS_WRONG_PASSWORD:
+  case SMB2_STATUS_NO_SUCH_USER:
+  case SMB2_STATUS_ACCOUNT_RESTRICTION:
+  case SMB2_STATUS_ACCOUNT_DISABLED:
+  case SMB2_STATUS_ACCOUNT_LOCKED_OUT:
+  case SMB2_STATUS_PASSWORD_EXPIRED:
+    snprintf(why, size, "sign-in refused");
+    return "smb";
+  case SMB2_STATUS_BAD_NETWORK_NAME:
+    snprintf(why, size, "no such share");
+    return "smb";
+  case SMB2_STATUS_OBJECT_NAME_NOT_FOUND:
+  case SMB2_STATUS_OBJECT_PATH_NOT_FOUND:
+  case SMB2_STATUS_NO_SUCH_FILE:
+    snprintf(why, size, "not found");
+    return "smb";
+  case SMB2_STATUS_ACCESS_DENIED:
+  case SMB2_STATUS_NETWORK_ACCESS_DENIED:
+    snprintf(why, size, "access denied");
+    return "smb";
+  default:
+    break;
+  }
+  snprintf(why, size, "%s", text && *text ? text : "the NAS stopped answering");
+  if (text && strstr(text, "onnect failed")) return "connect";
+  if (text && strstr(text, "imeout")) return "timeout";
+  return "drop";
+}
+
+/* A sign-in to the share, or NULL with *kind and why set. */
+static struct smb2_context *smb_connect(const char *ip, int port, const smb_sign_in_t *in,
+                                        const char **kind, char *why, size_t size) {
+  struct smb2_context *smb2 = smb2_init_context();
+  char server[96];
+  if (!smb2) {
+    *kind = "request";
+    snprintf(why, size, "out of memory");
+    return NULL;
+  }
+  smb2_set_timeout(smb2, NAS_REPLY_S);
+  smb2_set_security_mode(smb2, SMB2_NEGOTIATE_SIGNING_ENABLED);
+  if (in->domain[0]) smb2_set_domain(smb2, in->domain);
+  smb2_set_password(smb2, in->password);
+  snprintf(server, sizeof server, "%s:%d", ip, port);
+  if (smb2_connect_share(smb2, server, in->share, in->user) < 0) {
+    *kind = smb_failure(smb2, why, size);
+    smb2_destroy_context(smb2);
+    return NULL;
+  }
+  return smb2;
+}
+
+/* Reads [from, from + want) of an open file into buf, up to SMB_IN_FLIGHT
+ * reads in flight. 0, or -1 with the sign-in's error. */
+typedef struct smb_span {
+  int in_flight;
+  int failed;
+  size_t short_at[SMB_IN_FLIGHT * 64]; /* where short answers ended, and how much is missing */
+  uint32_t short_len[SMB_IN_FLIGHT * 64];
+  int shorts;
+} smb_span_t;
+
+typedef struct smb_span_read {
+  smb_span_t *span;
+  size_t at;
+  uint32_t want;
+} smb_span_read_t;
+
+static void smb_span_answer(struct smb2_context *smb2, int status, void *data, void *cb_data) {
+  smb_span_read_t *r = cb_data;
+  smb_span_t *span = r->span;
+  (void)smb2;
+  (void)data;
+  --span->in_flight;
+  if (status <= 0) {
+    if (!span->failed) span->failed = status < 0 ? -status : EIO;
+  } else if ((uint32_t)status < r->want) {
+    if (span->shorts < (int)(sizeof span->short_at / sizeof span->short_at[0])) {
+      span->short_at[span->shorts] = r->at + (size_t)status;
+      span->short_len[span->shorts++] = r->want - (uint32_t)status;
+    } else if (!span->failed) {
+      span->failed = EIO;
+    }
+  }
+  free(r);
+}
+
+static int smb_read_span(struct smb2_context *smb2, struct smb2fh *fh, uint64_t from, size_t want,
+                         char *buf) {
+  smb_span_t span;
+  uint32_t most = smb2_get_max_read_size(smb2);
+  size_t asked = 0;
+  uint64_t heard = now_ms();
+  int i;
+  memset(&span, 0, sizeof span);
+  if (most == 0 || most > SMB_READ) most = SMB_READ;
+  while (!span.failed && (asked < want || span.in_flight > 0)) {
+    struct pollfd p;
+    int before = span.in_flight;
+    while (!span.failed && span.in_flight < SMB_IN_FLIGHT && asked < want) {
+      smb_span_read_t *r = malloc(sizeof *r);
+      uint32_t n = want - asked > most ? most : (uint32_t)(want - asked);
+      if (!r) {
+        span.failed = ENOMEM;
+        break;
+      }
+      r->span = &span;
+      r->at = asked;
+      r->want = n;
+      if (smb2_pread_async(smb2, fh, (uint8_t *)buf + asked, n, from + asked, smb_span_answer, r) <
+          0) {
+        free(r);
+        span.failed = EIO;
+        break;
+      }
+      ++span.in_flight;
+      asked += n;
+    }
+    if (span.failed || span.in_flight == 0) break;
+    p.fd = smb2_get_fd(smb2);
+    p.events = (short)smb2_which_events(smb2);
+    p.revents = 0;
+    if (poll(&p, 1, 250) < 0 && errno != EINTR) {
+      span.failed = errno;
+      break;
+    }
+    if (p.revents != 0 && smb2_service(smb2, p.revents) < 0) {
+      if (!span.failed) span.failed = EIO;
+      break;
+    }
+    if (span.in_flight < before) heard = now_ms();
+    if (now_ms() - heard > NAS_REPLY_S * 1000u) {
+      span.failed = ETIMEDOUT;
+      break;
+    }
+  }
+  if (span.failed || span.in_flight > 0) return -1; /* the caller drops the sign-in */
+  /* Short answers (the NAS's credits ran low): the rest, one read at a time. */
+  for (i = 0; i < span.shorts; ++i) {
+    size_t at = span.short_at[i];
+    uint32_t left = span.short_len[i];
+    while (left > 0) {
+      int n = smb2_pread(smb2, fh, (uint8_t *)buf + at, left, from + at);
+      if (n <= 0) return -1;
+      at += (size_t)n;
+      left -= (uint32_t)n;
+    }
+  }
+  return 0;
+}
+
+/* One chunk of the file over this connection's own sign-in (made on its
+ * first chunk, and again after a failure). 0, or multi's codes: 1 drop and 2
+ * timeout (tried again), 4 changed, 6 stopped, 7 refused (sign-in, share,
+ * not found, denied). */
+static int smb_fetch_chunk(fetcher_t *f, uint64_t chunk, char *buf, size_t *got, char *why,
+                           size_t why_size) {
+  multi_t *m = f->m;
+  job_t *j = m->j;
+  uint64_t from = j->start + chunk * CHUNK, to = from + CHUNK;
+  const char *kind = "drop";
+  int rc = 0;
+  *got = 0;
+  if (to > j->size) to = j->size;
+  if (!f->smb2) {
+    struct smb2_stat_64 st;
+    f->smb2 = smb_connect(j->ip, j->port, m->smb, &kind, why, why_size);
+    if (!f->smb2) return strcmp(kind, "smb") == 0 ? 7 : strcmp(kind, "timeout") == 0 ? 2 : 1;
+    f->fh = smb2_open(f->smb2, m->smb->path, O_RDONLY);
+    if (!f->fh || smb2_fstat(f->smb2, f->fh, &st) < 0) {
+      kind = smb_failure(f->smb2, why, why_size);
+      smb_fetcher_end(f);
+      return strcmp(kind, "smb") == 0 ? 7 : strcmp(kind, "timeout") == 0 ? 2 : 1;
+    }
+    if (st.smb2_size != j->size) {
+      snprintf(why, why_size, "the file on the NAS is a different size now");
+      smb_fetcher_end(f);
+      return 4;
+    }
+    pthread_mutex_lock(&j->mu);
+    j->nas[f->slot] = smb2_get_fd(f->smb2); /* a stop cuts it off */
+    rc = j->abort;
+    pthread_mutex_unlock(&j->mu);
+    if (rc) return 6;
+  }
+  if (smb_read_span(f->smb2, f->fh, from, (size_t)(to - from), buf) != 0) {
+    pthread_mutex_lock(&j->mu);
+    rc = j->abort;
+    pthread_mutex_unlock(&j->mu);
+    if (rc) return 6;
+    kind = smb_failure(f->smb2, why, why_size);
+    smb_fetcher_end(f); /* the next try signs in again */
+    return strcmp(kind, "smb") == 0 ? 7 : strcmp(kind, "timeout") == 0 ? 2 : 1;
+  }
+  *got = (size_t)(to - from);
+  return 0;
+}
+
+/* Signs this connection out (reads still out answer as shut down). */
+static void smb_fetcher_end(fetcher_t *f) {
+  job_t *j = f->m->j;
+  if (!f->smb2) return;
+  pthread_mutex_lock(&j->mu);
+  j->nas[f->slot] = -1;
+  pthread_mutex_unlock(&j->mu);
+  smb2_destroy_context(f->smb2); /* closes the file too */
+  f->smb2 = NULL;
+  f->fh = NULL;
+}
+
+/* Copies one file over SMB (the NBS1 line, then the sign-in). Every path out
+ * sends its final line. */
+static void run_smb_job(job_t *j, char *line) {
+  char *field[7], *save = NULL, *bytes = NULL, *sign[5], ip[64], path[MAX_FILE];
+  smb_sign_in_t in;
+  size_t len;
+  int k, err, streams;
+  field[0] = strtok_r(line, "\t", &save);
+  for (k = 1; k < 7; ++k) field[k] = strtok_r(NULL, "\t", &save);
+  if (!field[5]) {
+    send_line(j->ctl, "ERR request not a NASBridge copy request");
+    return;
+  }
+  snprintf(ip, sizeof ip, "%s", field[1]);
+  j->ip = ip;
+  j->port = atoi(field[2]);
+  j->size = strtoull(field[3], NULL, 10);
+  snprintf(path, sizeof path, "%s", field[4]);
+  len = (size_t)strtoull(field[5], NULL, 10);
+  streams = field[6] ? atoi(field[6]) : 1;
+  if (streams < 1) streams = 1;
+  if (streams > MAX_STREAMS) streams = MAX_STREAMS;
+  if (len < 5 || len > MAX_SIGN_IN || path[0] != '/') {
+    send_line(j->ctl, "ERR request bad request");
+    return;
+  }
+  bytes = malloc(len);
+  if (!bytes || recv_exact(j->ctl, bytes, len) != 0 || smb_fields(bytes, len, sign, 5) != 0) {
+    send_line(j->ctl, "ERR request bad sign-in");
+    free(bytes);
+    return;
+  }
+  in.share = sign[0];
+  in.path = sign[1];
+  in.user = sign[2];
+  in.domain = sign[3];
+  in.password = sign[4];
+  j->fd = open(path, O_RDWR | O_CREAT, FILE_MODE);
+  if (j->fd < 0) {
+    send_line(j->ctl, "ERR file %s", strerror(errno));
+    free(bytes);
+    return;
+  }
+  (void)fchmod(j->fd, FILE_MODE); /* open's mode is reduced by the umask */
+  if ((err = resume_point(j)) != 0) {
+    send_line(j->ctl, "ERR file %s", strerror(err));
+  } else {
+    send_line(j->ctl, "P %llu 0 0 0", (unsigned long long)j->start);
+    j->last_sync = now_ms();
+    if (j->start == j->size)
+      send_line(j->ctl, "OK");
+    else
+      multi_pass(j, streams, &in);
+  }
+  memset(bytes, 0, len); /* the password */
+  free(bytes);
+}
+
 /* ------------------------------------------------- many small files at once */
 
 /* A folder game can be tens of thousands of small files. One connection per
@@ -988,8 +1336,14 @@ static int resume_point(job_t *j) {
  *              "OK" | "STOPPED" | "ERR <index> <kind> <why>"   the end
  * BATCH_WORKERS workers each keep a connection to the NAS open and take the
  * next file; a file is always written from its start (O_TRUNC), so one that
- * was cut off is simply done again. */
+ * was cut off is simply done again.
+ *
+ * Over SMB the same, with "NBT1\t<ip>\t<port>\t<workers>\t<sign-in length>\n"
+ * and the sign-in (share, user, domain, password, each ended by a NUL) first,
+ * and each file's path in the share where the GET request would be. Each
+ * worker signs in once and keeps that connection. */
 #define BATCH_PROTO "NBB1"
+#define BATCH_PROTO_SMB "NBT1"
 #define BATCH_WORKERS 16 /* the Settings screen: 1..16 (a NAS with one disk answered fastest at 16) */
 #define BATCH_QUEUE 64
 #define BATCH_BUF (512u << 10) /* per worker: 16 of them stay within the payload's few MB */
@@ -1023,6 +1377,9 @@ typedef struct batch {
   uint64_t bytes;
   uint64_t files;
   int nas[BATCH_WORKERS];
+  int smb;                                /* NBT1: over SMB */
+  smb_sign_in_t sign_in;                  /* ... with this (path unused) */
+  struct smb2_context *smb2[BATCH_WORKERS]; /* ... each worker's sign-in */
 } batch_t;
 
 typedef struct bworker {
@@ -1098,9 +1455,9 @@ static int write_all(int fd, const char *p, size_t len) {
 static int batch_one(batch_t *b, int w, const bfile_t *f, char *buf, char *head) {
   char value[64], why[200];
   int fd, tries;
-  fd = open(f->path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  fd = open(f->path, O_WRONLY | O_CREAT | O_TRUNC, FILE_MODE);
   if (fd < 0) return batch_fail(b, f->index, "file", strerror(errno));
-  (void)fchmod(fd, 0666); /* NASBridge moves and deletes it later */
+  (void)fchmod(fd, FILE_MODE); /* open's mode is reduced by the umask */
   if (f->size == 0) goto done;
   for (tries = 0;; ++tries) {
     size_t hlen, body_at;
@@ -1217,6 +1574,125 @@ stopped:
   return -1;
 }
 
+/* Lets go of worker w's SMB sign-in (its socket is libsmb2's to close). */
+static void smb_drop(batch_t *b, int w) {
+  struct smb2_context *smb2;
+  pthread_mutex_lock(&b->mu);
+  b->nas[w] = -1;
+  smb2 = b->smb2[w];
+  b->smb2[w] = NULL;
+  pthread_mutex_unlock(&b->mu);
+  if (smb2) {
+    smb2_disconnect_share(smb2);
+    smb2_destroy_context(smb2);
+  }
+}
+
+/* One file over SMB, as batch_one. */
+static int batch_one_smb(batch_t *b, int w, const bfile_t *f, char *buf) {
+  char why[200];
+  int fd, tries;
+  fd = open(f->path, O_WRONLY | O_CREAT | O_TRUNC, FILE_MODE);
+  if (fd < 0) return batch_fail(b, f->index, "file", strerror(errno));
+  (void)fchmod(fd, FILE_MODE); /* open's mode is reduced by the umask */
+  if (f->size == 0) goto done;
+  for (tries = 0;; ++tries) {
+    struct smb2_context *smb2 = b->smb2[w];
+    struct smb2fh *fh;
+    struct smb2_stat_64 st;
+    const char *kind = "drop";
+    uint64_t got = 0;
+    uint32_t most;
+    int err = 0, net = 0;
+    if (batch_aborted(b)) goto stopped;
+    if (tries > 0) {
+      smb_drop(b, w);
+      smb2 = NULL;
+      if (ftruncate(fd, 0) != 0 || lseek(fd, 0, SEEK_SET) != 0) {
+        close(fd);
+        return batch_fail(b, f->index, "file", strerror(errno));
+      }
+      sleep_ms(500u * (unsigned)tries);
+    }
+    if (!smb2) {
+      smb2 = smb_connect(b->ip, b->port, &b->sign_in, &kind, why, sizeof why);
+      if (!smb2) {
+        if (strcmp(kind, "smb") != 0 && tries + 1 < BATCH_TRIES) continue;
+        close(fd);
+        return batch_fail(b, f->index, kind, why);
+      }
+      pthread_mutex_lock(&b->mu);
+      b->smb2[w] = smb2;
+      b->nas[w] = smb2_get_fd(smb2);
+      if (b->abort) shutdown(b->nas[w], SHUT_RDWR);
+      pthread_mutex_unlock(&b->mu);
+    }
+    fh = smb2_open(smb2, f->request, O_RDONLY);
+    if (!fh || smb2_fstat(smb2, fh, &st) < 0) {
+      kind = smb_failure(smb2, why, sizeof why);
+      if (fh) smb2_close(smb2, fh);
+      if (strcmp(kind, "smb") == 0) {
+        close(fd);
+        return batch_fail(b, f->index, kind, why);
+      }
+      if (batch_aborted(b)) goto stopped;
+      if (tries + 1 < BATCH_TRIES) continue;
+      close(fd);
+      return batch_fail(b, f->index, kind, why);
+    }
+    if (st.smb2_size != f->size) {
+      smb2_close(smb2, fh);
+      close(fd);
+      return batch_fail(b, f->index, "changed", "the file on the NAS is a different size now");
+    }
+    most = smb2_get_max_read_size(smb2);
+    if (most == 0 || most > BATCH_BUF) most = BATCH_BUF;
+    while (!err && got < f->size) {
+      uint64_t want = f->size - got;
+      int n;
+      if (want > most) want = most;
+      n = smb2_pread(smb2, fh, (uint8_t *)buf, (uint32_t)want, got);
+      if (n <= 0) {
+        if (n == 0) {
+          snprintf(why, sizeof why, "the file ended early");
+          kind = "drop";
+        } else {
+          kind = smb_failure(smb2, why, sizeof why);
+        }
+        net = 1;
+        break;
+      }
+      err = write_all(fd, buf, (size_t)n);
+      got += (uint64_t)n;
+      pthread_mutex_lock(&b->mu);
+      b->bytes += (uint64_t)n;
+      pthread_mutex_unlock(&b->mu);
+    }
+    smb2_close(smb2, fh);
+    if (err) {
+      close(fd);
+      return batch_fail(b, f->index, "write", strerror(err));
+    }
+    if (net) {
+      if (batch_aborted(b)) goto stopped;
+      if (strcmp(kind, "smb") != 0 && tries + 1 < BATCH_TRIES) continue;
+      close(fd);
+      return batch_fail(b, f->index, kind, why);
+    }
+    break;
+  }
+done:
+  if (close(fd) != 0) return batch_fail(b, f->index, "write", strerror(errno));
+  pthread_mutex_lock(&b->mu);
+  b->files++;
+  pthread_mutex_unlock(&b->mu);
+  bsend(b, "D %lld", f->index);
+  return 0;
+stopped:
+  close(fd);
+  return -1;
+}
+
 static void free_bfile(bfile_t *f) {
   free(f->path);
   free(f->request);
@@ -1246,7 +1722,7 @@ static void *batch_worker(void *arg) {
     b->busy++;
     pthread_cond_broadcast(&b->cv);
     pthread_mutex_unlock(&b->mu);
-    rc = batch_one(b, me->w, &f, buf, head);
+    rc = b->smb ? batch_one_smb(b, me->w, &f, buf) : batch_one(b, me->w, &f, buf, head);
     free_bfile(&f);
     pthread_mutex_lock(&b->mu);
     b->busy--;
@@ -1257,7 +1733,10 @@ static void *batch_worker(void *arg) {
 out:
   free(buf);
   free(head);
-  set_nas(b, me->w, -1);
+  if (b->smb)
+    smb_drop(b, me->w);
+  else
+    set_nas(b, me->w, -1);
   return NULL;
 }
 
@@ -1346,7 +1825,8 @@ static void *batch_reader(void *arg) {
     f.size = strtoull(field[2], NULL, 10);
     f.reqlen = (size_t)strtoull(field[4], NULL, 10);
     f.path = strdup(field[3]);
-    f.request = f.reqlen >= 4 && f.reqlen <= MAX_REQUEST ? malloc(f.reqlen + 1) : NULL;
+    f.request = f.reqlen >= (b->smb ? 1u : 4u) && f.reqlen <= MAX_REQUEST ? malloc(f.reqlen + 1)
+                                                                          : NULL;
     if (!f.path || !f.request) {
       free_bfile(&f);
       batch_fail(b, f.index, "request", "bad request");
@@ -1379,10 +1859,11 @@ static void *batch_reader(void *arg) {
 /* Copies the files NASBridge lists until it says that's all. Every path out
  * sends its final line. */
 static void run_batch(int ctl, char *line) {
-  char *field[4], *save = NULL, ip[64];
+  char *field[5], *save = NULL, ip[64], *bytes = NULL, *sign[4];
   bworker_t me[BATCH_WORKERS];
   pthread_t workers[BATCH_WORKERS], reader;
   int k, started = 0, reader_started = 0;
+  size_t sign_len = 0;
   uint64_t last_sync, started_ms;
   batch_t *b = calloc(1, sizeof *b);
   if (!b) {
@@ -1390,11 +1871,28 @@ static void run_batch(int ctl, char *line) {
     return;
   }
   field[0] = strtok_r(line, "\t", &save);
-  for (k = 1; k < 4; ++k) field[k] = strtok_r(NULL, "\t", &save);
-  if (!field[3]) {
+  for (k = 1; k < 5; ++k) field[k] = strtok_r(NULL, "\t", &save);
+  b->smb = strcmp(field[0], BATCH_PROTO_SMB) == 0;
+  if (!field[3] || (b->smb && !field[4])) {
     send_line(ctl, "ERR -1 request not a NASBridge batch request");
     free(b);
     return;
+  }
+  if (b->smb) {
+    /* The sign-in comes before the list. */
+    sign_len = (size_t)strtoull(field[4], NULL, 10);
+    bytes = sign_len >= 4 && sign_len <= MAX_SIGN_IN ? malloc(sign_len) : NULL;
+    if (!bytes || recv_exact(ctl, bytes, sign_len) != 0 || smb_fields(bytes, sign_len, sign, 4) != 0) {
+      send_line(ctl, "ERR -1 request bad sign-in");
+      free(bytes);
+      free(b);
+      return;
+    }
+    b->sign_in.share = sign[0];
+    b->sign_in.path = NULL;
+    b->sign_in.user = sign[1];
+    b->sign_in.domain = sign[2];
+    b->sign_in.password = sign[3];
   }
   snprintf(ip, sizeof ip, "%s", field[1]);
   b->ctl = ctl;
@@ -1474,6 +1972,10 @@ out:
   pthread_mutex_destroy(&b->mu);
   pthread_cond_destroy(&b->cv);
   pthread_mutex_destroy(&b->out);
+  if (bytes) {
+    memset(bytes, 0, sign_len); /* the password */
+    free(bytes);
+  }
   free(b);
 }
 
@@ -1505,8 +2007,13 @@ static void run_job(int ctl) {
     }
   }
 #endif
-  if (strncmp(line, BATCH_PROTO "\t", sizeof BATCH_PROTO) == 0) {
+  if (strncmp(line, BATCH_PROTO "\t", sizeof BATCH_PROTO) == 0 ||
+      strncmp(line, BATCH_PROTO_SMB "\t", sizeof BATCH_PROTO_SMB) == 0) {
     run_batch(ctl, line);
+    goto out;
+  }
+  if (strncmp(line, PROTO_SMB "\t", sizeof PROTO_SMB) == 0) {
+    run_smb_job(&j, line);
     goto out;
   }
   field[0] = strtok_r(line, "\t", &save);
@@ -1538,12 +2045,12 @@ static void run_job(int ctl) {
   j.request = request;
   j.reqlen = reqlen;
 
-  j.fd = open(path, O_RDWR | O_CREAT, 0666);
+  j.fd = open(path, O_RDWR | O_CREAT, FILE_MODE);
   if (j.fd < 0) {
     send_line(ctl, "ERR file %s", strerror(errno));
     goto out;
   }
-  (void)fchmod(j.fd, 0666); /* NASBridge moves and deletes it later */
+  (void)fchmod(j.fd, FILE_MODE); /* open's mode is reduced by the umask */
   if ((err = resume_point(&j)) != 0) {
     send_line(ctl, "ERR file %s", strerror(err));
     goto out;
@@ -1567,7 +2074,7 @@ static void run_job(int ctl) {
 #endif
   /* Two connections pay off on a big rest; a small one goes in one. */
   if (streams > 1 && j.size - j.start >= 2 * CHUNK) {
-    if (multi_pass(&j, streams) == 0) goto out;
+    if (multi_pass(&j, streams, NULL) == 0) goto out;
     /* The NAS doesn't take ranges: over one connection, from where it got. */
     j.abort = 0;
     if ((err = resume_point(&j)) != 0) {

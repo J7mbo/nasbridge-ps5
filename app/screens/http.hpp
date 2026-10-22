@@ -64,7 +64,7 @@ std::string build_request(const Connection &connection, const std::string &metho
                           const std::string &path, const std::string &extra_headers,
                           const std::string &body);
 
-// One entry of a WebDAV folder listing.
+// One entry of a folder listing (WebDAV's; SMB listings are turned into these too, nas.hpp).
 struct DavEntry
 {
     std::string name; // decoded, without slashes

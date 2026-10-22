@@ -4,14 +4,13 @@
 
 #include "concepts/nas_library.hpp"
 
-#include "concepts/http.hpp"
 #include "concepts/library_cache.hpp"
-#include "concepts/webdav_probe.hpp"
+#include "concepts/nas.hpp"
+#include "concepts/nas_probe.hpp"
 
 #include <algorithm>
 #include <cstring>
 #include <atomic>
-#include <cerrno>
 #include <deque>
 #include <map>
 #include <pthread.h>
@@ -331,7 +330,6 @@ constexpr int kMaxQueuedPictures = 3; // decoded pictures waiting for the UI, at
 constexpr int kDepth = 4;             // folders searched below a game folder for sce_sys
 constexpr int kListings = 16;         // ... in at most this many listings
 constexpr int kSizeFolders = 4000;    // folders walked to add up a game folder's size
-const char *const kDepthOne = "Depth: 1\r\nContent-Type: application/xml; charset=utf-8\r\n";
 
 // What the NAS says about a file or folder, to notice when it changes.
 std::string stamp_of(const DavEntry &entry)
@@ -369,27 +367,6 @@ bool is_cover_name(const std::string &name)
     return low.compare(0, 5, "icon0") == 0 && ends_with_nocase(low, ".png");
 }
 
-// A failed reply in a few words: "not found (HTTP 404)".
-std::string describe(const HttpReply &reply)
-{
-    if (!reply.connected)
-        return "couldn't connect (error " + std::to_string(reply.error) + ")";
-    switch (reply.status)
-    {
-    case 0:
-        return reply.error != 0 ? "no answer (error " + std::to_string(reply.error) + ")"
-                                : "no answer";
-    case 401:
-        return "sign-in refused (HTTP 401)";
-    case 403:
-        return "access denied (HTTP 403)";
-    case 404:
-        return "not found (HTTP 404)";
-    default:
-        return "HTTP " + std::to_string(reply.status);
-    }
-}
-
 const NasGame *find_saved(const std::vector<NasGame> &saved, const std::string &entry)
 {
     for (const NasGame &game : saved)
@@ -403,6 +380,7 @@ const NasGame *find_saved(const std::vector<NasGame> &saved, const std::string &
 struct LibraryLoader::Job
 {
     Connection connection;
+    NasReader *nas = nullptr;   // the thread's way to the NAS (WebDAV or SMB)
     std::vector<NasGame> saved; // what the cache held
     bool key_art_only = false;  // a start_key_art() request
     NasGame target;             // ... for this game
@@ -475,13 +453,9 @@ struct LibraryLoader::Job
 
     // A folder's entries (Depth 1); false when it can't be listed.
     bool list_folder(const std::string &url, std::vector<DavEntry> *entries,
-                     HttpReply *reply_out = nullptr)
+                     NasProblem *problem = nullptr)
     {
-        HttpReply reply = http_request(connection, "PROPFIND", url, kDepthOne, propfind_body());
-        const bool ok = reply.status == 207 && parse_listing(reply.body, url, entries);
-        if (reply_out != nullptr)
-            *reply_out = std::move(reply);
-        return ok;
+        return nas->list(url, entries, problem);
     }
 
     // Reads parts of an image file on the NAS (for ExfatReader).
@@ -492,7 +466,7 @@ struct LibraryLoader::Job
             if (cancelled)
                 return false;
             std::string why;
-            return http_read_range(connection, path, offset, length, out, &why);
+            return nas->read_range(path, offset, length, out, &why);
         };
     }
 
@@ -532,12 +506,12 @@ struct LibraryLoader::Job
         }
         else
         {
-            const HttpReply param = http_request(connection, "GET", root + game->base + "/" + param_name,
-                                                 "", "", kMaxParam);
-            if (param.status == 200 && !param.too_big)
-                read_param_json(param.body, game);
+            std::string json;
+            NasProblem problem;
+            if (nas->read_file(root + game->base + "/" + param_name, kMaxParam, &json, &problem))
+                read_param_json(json, game);
             else
-                game->note = "param.json: " + describe(param);
+                game->note = "param.json: " + problem.brief;
         }
         if (game->cover_file.name.empty())
             game->cover_file.name = game->art_file.name; // the key art stands in
@@ -570,13 +544,13 @@ struct LibraryLoader::Job
                 return false;
             const Folder folder = queue[next];
             std::vector<DavEntry> inside;
-            HttpReply reply;
+            NasProblem problem;
             ++listings;
-            if (!list_folder(root + folder.path + "/", &inside, &reply))
+            if (!list_folder(root + folder.path + "/", &inside, &problem))
             {
                 if (folder.depth == 0)
                 {
-                    game->note = "the game's folder couldn't be listed: " + describe(reply);
+                    game->note = "the game's folder couldn't be listed: " + problem.brief;
                     return true; // can't tell: list it, with the reason
                 }
                 continue;
@@ -597,7 +571,7 @@ struct LibraryLoader::Job
                     const std::string base = folder.path + "/" + entry.name;
                     std::vector<DavEntry> sce_sys;
                     ++listings;
-                    if (!list_folder(root + base + "/", &sce_sys, &reply))
+                    if (!list_folder(root + base + "/", &sce_sys))
                     {
                         if (fallback_base.empty())
                         {
@@ -712,14 +686,12 @@ struct LibraryLoader::Job
         }
         if (game.base.empty())
             return false;
-        HttpReply reply =
-            http_request(connection, "GET", root + game.base + "/" + file.name, "", "", kMaxIcon);
-        if (reply.status != 200 || reply.too_big)
+        NasProblem problem;
+        if (!nas->read_file(root + game.base + "/" + file.name, kMaxIcon, data, &problem))
         {
-            *why = file.name + (reply.too_big ? " is too big" : ": " + describe(reply));
+            *why = file.name + (problem.brief == "too big" ? " is too big" : ": " + problem.brief);
             return false;
         }
-        *data = std::move(reply.body);
         return true;
     }
 
@@ -777,9 +749,26 @@ struct LibraryLoader::Job
     // as it streams in (deep_size). A big game's listing is tens of megabytes
     // of XML: holding it whole ran the app out of memory, so only the entry
     // being read is kept. When the NAS refuses deep listings, the folder is
-    // listed one folder at a time instead, which is much slower.
+    // listed one folder at a time instead, which is much slower. (SMB has no
+    // deep listing: several folders are listed at once instead, over the one
+    // sign-in.)
     bool measure(const std::string &url, std::uint64_t *total)
     {
+        *total = 0;
+        if (nas->smb())
+        {
+            int folders = 0;
+            return nas->walk_smb(url,
+                                 [&](const std::string &, const std::vector<DavEntry> &inside)
+                                 {
+                                     if (cancelled || ++folders > kSizeFolders)
+                                         return false;
+                                     for (const DavEntry &entry : inside)
+                                         if (!entry.folder && !is_archive(entry.name))
+                                             *total += entry.size;
+                                     return true;
+                                 });
+        }
         if (deep_size(url, total))
             return true;
         *total = 0;
@@ -884,20 +873,14 @@ struct LibraryLoader::Job
 
         // 2. What's on the NAS now.
         progress(0, 0, "Checking your NAS");
-        HttpReply listing;
+        NasProblem listing;
         std::vector<DavEntry> entries;
         const bool listed = list_folder(root, &entries, &listing);
         if (cancelled)
             return;
         if (!listed)
         {
-            if (!listing.connected)
-                fail(interpret_socket_error(connection, listing.error, true));
-            else if (listing.header.empty() && listing.body.empty())
-                fail(interpret_socket_error(connection,
-                                            listing.error != 0 ? listing.error : ECONNRESET, false));
-            else
-                fail(interpret_response(connection, listing.status, listing.header, listing.body));
+            fail(explain_nas_failure(connection, listing));
             return;
         }
         std::vector<const DavEntry *> candidates;
@@ -1105,10 +1088,15 @@ struct LibraryLoader::Job
     {
         Job *job = static_cast<Job *>(self);
         keep_off_cpu(job->ui_cpu);
-        if (job->key_art_only)
-            job->run_key_art();
-        else
-            job->run();
+        {
+            NasReader nas(job->connection);
+            job->nas = &nas;
+            if (job->key_art_only)
+                job->run_key_art();
+            else
+                job->run();
+            job->nas = nullptr;
+        }
         LibraryEvent done;
         done.kind = LibraryEvent::Kind::finished;
         job->post(std::move(done));

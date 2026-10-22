@@ -2,19 +2,20 @@
 // Copyright (C) 2026 NASBridge contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Where the NAS is and how to sign in: connection type (a dropdown, WebDAV
-// for now), server address, port, folder, user name and password. Each text
+// Where the NAS is and how to sign in: connection type (a dropdown: WebDAV,
+// or SMB while it's being built), server address, port, folder, user name
+// and password. Each text
 // opens the kit's on-screen keyboard (InputPrompt); the folder can also be
 // picked by browsing the NAS (the button beside it, folder_picker.cpp).
 // Every change is saved at once. "Test connection" asks the NAS for the folder's contents in the
-// background (webdav_probe.cpp). The right-hand panel shows the address
+// background (nas_probe.cpp). The right-hand panel shows the address
 // NASBridge will use and the test's result.
 
 #pragma once
 
 #include "concepts/connection.hpp"
 #include "concepts/folder_picker.hpp"
-#include "concepts/webdav_probe.hpp"
+#include "concepts/nas_probe.hpp"
 
 #include "app/concept.hpp"
 #include "core/tween.hpp"
@@ -110,7 +111,7 @@ class ConnectionPage
     tween::Spring browse_focus_;
     FolderPicker picker_;
     ui::Pulse press_;
-    WebDavProbe probe_;
+    NasProbe probe_;
     ProbeResult local_result_; // a refusal decided here (no address yet)
     ProbeResult::State heard_ = ProbeResult::State::idle; // for the result's sound
     int revision_ = 0;

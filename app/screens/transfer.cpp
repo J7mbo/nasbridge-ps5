@@ -9,6 +9,7 @@
 #include "concepts/file_calls.hpp"
 #include "concepts/http.hpp"
 #include "concepts/library_cache.hpp"
+#include "concepts/nas.hpp"
 #include "concepts/notify.hpp"
 #include "concepts/smp.hpp"
 #include "concepts/storage.hpp"
@@ -22,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <memory>
 #include <mutex>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -302,8 +304,10 @@ int current_cpu()
 
 std::string nas_identity(const Connection &connection)
 {
-    return connection.host + ":" + std::to_string(connection.effective_port()) +
-           folder_path(connection);
+    // WebDAV keeps its old form, so copies saved by earlier versions still match.
+    const std::string where = connection.host + ":" +
+                              std::to_string(connection.effective_port()) + folder_path(connection);
+    return connection.type == ConnectionType::smb ? "smb:" + where : where;
 }
 
 std::string copy_source(const Connection &connection, const NasGame &game)
@@ -533,6 +537,7 @@ struct Transfers::Shared
     int files_done = 0;
     int files_total = 0;
     std::vector<std::string> discarding;
+    std::map<std::string, float> discarded;
     std::string finished_entry;
     std::string finished_destination;
     std::vector<QueueStatus::Waiting> waiting_for_close;
@@ -634,7 +639,7 @@ class Lister
 {
   public:
     Lister(const Connection &connection, const SharedPtr &shared)
-        : connection_(connection), shared_(shared)
+        : connection_(connection), shared_(shared), nas_(connection, kReplySeconds)
     {
     }
 
@@ -649,9 +654,9 @@ class Lister
         plan->folders.clear();
         plan->files.clear();
         // A NAS that didn't list deeply once isn't asked again (it can cost
-        // the whole wait each time).
+        // the whole wait each time). SMB has no deep listing.
         const std::string nas = nas_identity(connection_);
-        const bool try_deep = !shallow_nas(nas);
+        const bool try_deep = !nas_.smb() && !shallow_nas(nas);
         if (!try_deep || !deep(plan))
         {
             if (try_deep && !stopping())
@@ -780,9 +785,12 @@ class Lister
         return true;
     }
 
-    // One folder at a time, when the NAS won't list deeply.
+    // One folder at a time, when the NAS won't list deeply. Over SMB, several
+    // folders at once.
     bool walk(CopyPlan *plan, std::string *why)
     {
+        if (nas_.smb())
+            return walk_smb(plan, why);
         std::vector<std::string> queue{root_ + "/"};
         for (std::size_t next = 0; next < queue.size(); ++next)
         {
@@ -796,14 +804,12 @@ class Lister
                 *why = "The game has too many folders to list";
                 return false;
             }
-            HttpReply reply = http_request(connection_, "PROPFIND", queue[next],
-                                           "Depth: 1\r\nContent-Type: application/xml; "
-                                           "charset=utf-8\r\n",
-                                           propfind_body());
             std::vector<DavEntry> entries;
-            if (reply.status != 207 || !parse_listing(reply.body, queue[next], &entries))
+            NasProblem problem;
+            if (!nas_.list(queue[next], &entries, &problem))
             {
-                *why = reply.connected ? "The NAS wouldn't list " + queue[next]
+                *why = problem.reached ? "The NAS wouldn't list " + queue[next] + " (" +
+                                             problem.brief + ")"
                                        : "Lost the connection to the NAS while listing";
                 return false;
             }
@@ -815,18 +821,49 @@ class Lister
         return true;
     }
 
+    bool walk_smb(CopyPlan *plan, std::string *why)
+    {
+        int folders = 0;
+        bool too_many = false;
+        NasProblem problem;
+        const bool ok = nas_.walk_smb(
+            root_ + "/",
+            [&](const std::string &, const std::vector<DavEntry> &entries)
+            {
+                if (stopping())
+                    return false;
+                if (++folders > kListFolders)
+                {
+                    too_many = true;
+                    return false;
+                }
+                for (const DavEntry &entry : entries)
+                    add(entry, plan);
+                report(*plan);
+                return true;
+            },
+            &problem);
+        if (ok)
+            return true;
+        if (too_many)
+            *why = "The game has too many folders to list";
+        else if (problem.brief.empty())
+            *why = "Stopped";
+        else
+            *why = problem.reached ? "The NAS wouldn't list the game's folders (" + problem.brief + ")"
+                                   : "Lost the connection to the NAS while listing";
+        return false;
+    }
+
     // An image: one file; its size from its folder's listing.
     bool list_image(CopyPlan *plan, std::string *why)
     {
         const std::string folder = parent_of(plan->source) + "/";
-        HttpReply reply = http_request(connection_, "PROPFIND", folder,
-                                       "Depth: 1\r\nContent-Type: application/xml; "
-                                       "charset=utf-8\r\n",
-                                       propfind_body());
         std::vector<DavEntry> entries;
-        if (reply.status != 207 || !parse_listing(reply.body, folder, &entries))
+        NasProblem problem;
+        if (!nas_.list(folder, &entries, &problem))
         {
-            *why = reply.connected ? "The NAS wouldn't list the image's folder"
+            *why = problem.reached ? "The NAS wouldn't list the image's folder (" + problem.brief + ")"
                                    : "Couldn't reach the NAS";
             return false;
         }
@@ -847,6 +884,7 @@ class Lister
 
     Connection connection_;
     SharedPtr shared_;
+    NasReader nas_;
     std::string root_; // the game's folder, decoded, without the trailing slash
     std::uint64_t reported_ = 0;
 };
@@ -908,7 +946,7 @@ class Copier
         if (exists(plan.destination + "/" + plan.name))
         {
             if (plan.moving && !exists(staging_))
-                return finish(plan, incoming, why);
+                return finish(incoming, why);
             *why = "There's already a \"" + plan.name + "\" on this drive";
             return stopped_or(Outcome::failed);
         }
@@ -990,7 +1028,7 @@ class Copier
         }
         if (::rename(staging_.c_str(), final_path.c_str()) != 0)
             return fail(errno_text("Couldn't move the game into place", errno), why);
-        return finish(plan, incoming, why);
+        return finish(incoming, why);
     }
 
   private:
@@ -1003,7 +1041,7 @@ class Copier
     };
 
     // The game is in place: tidy up and have ShadowMountPlus look for it.
-    Outcome finish(const CopyPlan &plan, const std::string &incoming, std::string *why)
+    Outcome finish(const std::string &incoming, std::string *why)
     {
         ::rmdir(incoming.c_str()); // only when nothing else is in it
         // From 1.7beta6, ShadowMountPlus scans while a homebrew app (a LAPY
@@ -1096,19 +1134,21 @@ class Copier
             if (result != Result::fallback)
                 return result;
         }
-        if (size >= kParallelMin)
+        if (size >= kParallelMin && !smb())
         {
             const Result result = copy_pieces(remote, local, size, before, path, why);
             if (result != Result::fallback)
                 return result;
         }
-        const int fd = ::open(local.c_str(), O_RDWR | O_CREAT, 0666);
+        // With the execute bit: a game whose files lack it won't start (issue #4).
+        const int fd = ::open(local.c_str(), O_RDWR | O_CREAT, 0777);
         if (fd < 0)
         {
             *why = errno_text("Couldn't create a file on the drive", errno);
             return Result::failed;
         }
-        const Result result = fill(fd, remote, size, before, why);
+        const Result result = smb() ? fill_smb(fd, remote, size, before, why)
+                                    : fill(fd, remote, size, before, why);
         if (result == Result::ok && ::fsync(fd) != 0)
         {
             *why = errno_text("Couldn't finish writing a file", errno);
@@ -1171,10 +1211,17 @@ class Copier
                     ::unlink((item.local + kPartSuffix).c_str());
                     forget_part(entry_);
                 }
-                item.request = build_request(connection_, "GET", plan.source + file.path, "", "");
-                const std::size_t close_at = item.request.find("Connection: close\r\n");
-                if (close_at != std::string::npos)
-                    item.request.replace(close_at, 17, "Connection: keep-alive");
+                if (smb())
+                {
+                    item.request = smb_location(plan.source + file.path).path;
+                }
+                else
+                {
+                    item.request = build_request(connection_, "GET", plan.source + file.path, "", "");
+                    const std::size_t close_at = item.request.find("Connection: close\r\n");
+                    if (close_at != std::string::npos)
+                        item.request.replace(close_at, 17, "Connection: keep-alive");
+                }
                 files.push_back(std::move(item));
             }
             std::vector<char> got(todo.size(), 0);
@@ -1182,9 +1229,7 @@ class Copier
             std::uint64_t last_bytes = 0;
             window_start_ = now_ms();
             window_bytes_ = 0;
-            const HelperBatch batch = copy_batch_with_helper(
-                connection_.host, connection_.effective_port(), batch_workers(), files,
-                [&](std::size_t k)
+            const auto file_done = [&](std::size_t k)
                 {
                     if (got[k])
                         return;
@@ -1193,10 +1238,9 @@ class Copier
                     *done += files[k].size;
                     ++*files_done;
                     publish(*done, *files_done);
-                },
-                nullptr,
-                [&](std::uint64_t bytes, std::uint64_t count, int busy, std::uint64_t saving_ms,
-                    std::uint64_t elapsed_ms)
+                };
+            const auto batch_progress = [&](std::uint64_t bytes, std::uint64_t count, int busy,
+                                            std::uint64_t saving_ms, std::uint64_t elapsed_ms)
                 {
                     measure(*done, bytes > last_bytes ? static_cast<std::size_t>(bytes - last_bytes) : 0);
                     last_bytes = bytes;
@@ -1213,8 +1257,15 @@ class Copier
                     std::lock_guard<std::mutex> hold(shared_->lock);
                     shared_->connections = busy > 0 ? busy : 1;
                     shared_->conn_report = report;
-                },
-                [this] { return stopping(); });
+                };
+            const auto batch_stopping = [this] { return stopping(); };
+            const HelperBatch batch =
+                smb() ? copy_smb_batch_with_helper(connection_.host, connection_.effective_port(),
+                                                   batch_workers(), sign_in(), files, file_done,
+                                                   nullptr, batch_progress, batch_stopping)
+                      : copy_batch_with_helper(connection_.host, connection_.effective_port(),
+                                               batch_workers(), files, file_done, nullptr,
+                                               batch_progress, batch_stopping);
             {
                 std::lock_guard<std::mutex> hold(shared_->lock);
                 shared_->connections = 0;
@@ -1253,7 +1304,8 @@ class Copier
             {
                 char text[64];
                 std::snprintf(text, sizeof(text), " (HTTP %d)", batch.status);
-                *why = "The NAS refused " + failed_path + text;
+                *why = "The NAS refused " + failed_path +
+                       (batch.status != 0 ? std::string(text) : " (" + batch.why + ")");
                 return Result::failed;
             }
             case End::file:
@@ -1310,7 +1362,7 @@ class Copier
             ::unlink(part.c_str());
             forget_part(entry_);
         }
-        const std::string request = build_request(connection_, "GET", remote, "", "");
+        const std::string request = smb() ? "" : build_request(connection_, "GET", remote, "", "");
         int failures = 0;
         while (true)
         {
@@ -1321,9 +1373,7 @@ class Copier
             window_bytes_ = 0;
             if (helper_streams_ == 0)
                 helper_streams_ = helper_streams();
-            const HelperCopy copy = copy_with_helper(
-                connection_.host, connection_.effective_port(), size, local, request,
-                helper_streams_,
+            const auto copy_progress =
                 [&](std::uint64_t at, std::uint64_t write_ms, std::uint64_t elapsed_ms, int connections)
                 {
                     if (first == ~0ull)
@@ -1342,8 +1392,15 @@ class Copier
                     std::lock_guard<std::mutex> hold(shared_->lock);
                     shared_->connections = connections > 0 ? connections : 1;
                     shared_->conn_report = report;
-                },
-                [this] { return stopping(); });
+                };
+            const auto copy_stopping = [this] { return stopping(); };
+            const HelperCopy copy =
+                smb() ? copy_smb_with_helper(connection_.host, connection_.effective_port(), size,
+                                             local, sign_in(), smb_location(remote).path,
+                                             helper_streams_, copy_progress, copy_stopping)
+                      : copy_with_helper(connection_.host, connection_.effective_port(), size,
+                                         local, request, helper_streams_, copy_progress,
+                                         copy_stopping);
             {
                 std::lock_guard<std::mutex> hold(shared_->lock);
                 shared_->connections = 0;
@@ -1371,7 +1428,7 @@ class Copier
             {
                 char text[96];
                 std::snprintf(text, sizeof(text), "The NAS refused a file (HTTP %d)", copy.status);
-                *why = text;
+                *why = copy.status != 0 ? std::string(text) : "The NAS refused a file (" + copy.why + ")";
                 return Result::failed;
             }
             case End::file:
@@ -1864,7 +1921,7 @@ class Copier
         pieces.before = before;
         pieces.done.assign(static_cast<std::size_t>((size + kPiece - 1) / kPiece), 0);
         pieces.claimed.assign(pieces.done.size(), 0);
-        pieces.fd = ::open(part.c_str(), O_RDWR | O_CREAT, 0666);
+        pieces.fd = ::open(part.c_str(), O_RDWR | O_CREAT, 0777);
         if (pieces.fd < 0)
         {
             *why = errno_text("Couldn't create a file on the drive", errno);
@@ -2032,41 +2089,81 @@ class Copier
         return Result::ok;
     }
 
+    // Where a file carries on from, with fd there: how far it got (on the
+    // first pass, an earlier run's work), less its last part, which may not
+    // have reached the disk before a crash or power cut. *whole: it's all in.
+    bool resume_at(int fd, std::uint64_t size, std::uint64_t *offset, bool *whole, std::string *why)
+    {
+        *whole = false;
+        const off_t end = ::lseek(fd, 0, SEEK_END);
+        if (end < 0)
+        {
+            *why = errno_text("Couldn't read a file on the drive", errno);
+            return false;
+        }
+        std::uint64_t have = static_cast<std::uint64_t>(end);
+        if (have == size)
+        {
+            *whole = true;
+            return true;
+        }
+        if (have > size)
+        {
+            // Bigger than on the NAS (it changed): start the file again.
+            if (::ftruncate(fd, 0) != 0)
+            {
+                *why = errno_text("Couldn't restart a file", errno);
+                return false;
+            }
+            have = 0;
+        }
+        *offset = have > kRefetch ? have - kRefetch : 0;
+        *offset -= *offset % (1024 * 1024);
+        if (::lseek(fd, static_cast<off_t>(*offset), SEEK_SET) < 0)
+        {
+            *why = errno_text("Couldn't seek in a file", errno);
+            return false;
+        }
+        return true;
+    }
+
+    // A connection was lost mid-file: waits a little longer each time, and
+    // says so. False when it has happened too often.
+    bool retry_after(int *failures, bool progressed, const std::string &gave_up, std::string *why)
+    {
+        if (progressed)
+            *failures = 0;
+        if (++*failures > kRetries)
+        {
+            *why = gave_up;
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> hold(shared_->lock);
+            shared_->detail = "Connection lost, trying again";
+            shared_->rate = 0.0;
+        }
+        for (int waited = 0; waited < *failures * 2000 && !stopping(); waited += 100)
+            sleep_ms(100);
+        {
+            std::lock_guard<std::mutex> hold(shared_->lock);
+            shared_->detail.clear();
+        }
+        return true;
+    }
+
     Result fill(int fd, const std::string &remote, std::uint64_t size, std::uint64_t before,
                 std::string *why)
     {
         int failures = 0;
         while (true)
         {
-            // How far this file got (on the first pass: an earlier run's work).
-            const off_t end = ::lseek(fd, 0, SEEK_END);
-            if (end < 0)
-            {
-                *why = errno_text("Couldn't read a file on the drive", errno);
+            std::uint64_t offset = 0;
+            bool whole = false;
+            if (!resume_at(fd, size, &offset, &whole, why))
                 return Result::failed;
-            }
-            std::uint64_t have = static_cast<std::uint64_t>(end);
-            if (have == size)
+            if (whole)
                 return Result::ok;
-            if (have > size)
-            {
-                // Bigger than on the NAS (it changed): start the file again.
-                if (::ftruncate(fd, 0) != 0)
-                {
-                    *why = errno_text("Couldn't restart a file", errno);
-                    return Result::failed;
-                }
-                have = 0;
-            }
-            // The end of what was written may not have reached the disk
-            // before a crash or power cut: fetch the last part again.
-            std::uint64_t offset = have > kRefetch ? have - kRefetch : 0;
-            offset -= offset % (1024 * 1024);
-            if (::lseek(fd, static_cast<off_t>(offset), SEEK_SET) < 0)
-            {
-                *why = errno_text("Couldn't seek in a file", errno);
-                return Result::failed;
-            }
             if (stopping())
                 return Result::stopped;
 
@@ -2156,25 +2253,110 @@ class Copier
                 return Result::failed;
             }
             // Cut off: try again, from where it got to. Progress resets the count.
-            if (position > offset + kRefetch)
-                failures = 0;
-            if (++failures > kRetries)
+            if (!retry_after(&failures, position > offset + kRefetch,
+                             reply.connected ? "The NAS keeps dropping the connection"
+                                             : "Lost the connection to the NAS",
+                             why))
+                return Result::failed;
+        }
+    }
+
+    // fill() over SMB: the rest of the file, over the copy's one sign-in.
+    Result fill_smb(int fd, const std::string &remote, std::uint64_t size, std::uint64_t before,
+                    std::string *why)
+    {
+        if (!smb_)
+            smb_ = std::make_unique<SmbSession>(connection_, kReplySeconds);
+        int failures = 0;
+        while (true)
+        {
+            std::uint64_t offset = 0;
+            bool whole = false;
+            if (!resume_at(fd, size, &offset, &whole, why))
+                return Result::failed;
+            if (whole)
+                return Result::ok;
+            if (stopping())
+                return Result::stopped;
+
+            std::uint64_t position = offset;
+            std::uint64_t actual = size;
+            bool write_failed = false;
+            int write_error = 0;
+            buffer_.clear();
+            window_start_ = now_ms();
+            window_bytes_ = 0;
+            bool counted = false;
+            SmbFailure failure;
+            const bool complete = smb_->stream(
+                remote, offset, &actual,
+                [&](const char *data, std::size_t length)
+                {
+                    if (stopping() || actual != size)
+                        return false;
+                    buffer_.insert(buffer_.end(), data, data + length);
+                    position += length;
+                    if (buffer_.size() >= kWriteBlock && !flush(fd))
+                    {
+                        write_failed = true;
+                        write_error = errno;
+                        return false;
+                    }
+                    if (!counted)
+                    {
+                        // One connection, for the speed tile.
+                        std::lock_guard<std::mutex> hold(shared_->lock);
+                        shared_->connections = 1;
+                        counted = true;
+                    }
+                    measure(before + position, length);
+                    return true;
+                },
+                &failure);
+            if (counted)
             {
-                *why = reply.connected ? "The NAS keeps dropping the connection"
-                                       : "Lost the connection to the NAS";
+                std::lock_guard<std::mutex> hold(shared_->lock);
+                shared_->connections = 0;
+            }
+            if (!write_failed && !buffer_.empty() && !flush(fd))
+            {
+                write_failed = true;
+                write_error = errno;
+            }
+            if (write_failed)
+            {
+                *why = errno_text("Couldn't write to the drive", write_error);
                 return Result::failed;
             }
+            if (actual != size)
             {
-                std::lock_guard<std::mutex> hold(shared_->lock);
-                shared_->detail = "Connection lost, trying again";
-                shared_->rate = 0.0;
+                *why = "A file changed on the NAS since the library was read: refresh it and try again";
+                return Result::failed;
             }
-            for (int waited = 0; waited < failures * 2000 && !stopping(); waited += 100)
-                sleep_ms(100);
+            if (complete && position == size)
             {
-                std::lock_guard<std::mutex> hold(shared_->lock);
-                shared_->detail.clear();
+                if (::ftruncate(fd, static_cast<off_t>(size)) != 0)
+                {
+                    *why = errno_text("Couldn't finish a file", errno);
+                    return Result::failed;
+                }
+                return Result::ok;
             }
+            if (stopping())
+                return Result::stopped;
+            using Kind = SmbFailure::Kind;
+            if (failure.kind == Kind::sign_in || failure.kind == Kind::no_share ||
+                failure.kind == Kind::not_found || failure.kind == Kind::denied ||
+                failure.kind == Kind::protocol || failure.kind == Kind::address)
+            {
+                *why = "The NAS refused a file (" + smb_failure_brief(failure) + ")";
+                return Result::failed;
+            }
+            if (!retry_after(&failures, position > offset + kRefetch,
+                             failure.kind == Kind::timeout ? "The NAS keeps going quiet"
+                                                           : "Lost the connection to the NAS",
+                             why))
+                return Result::failed;
         }
     }
 
@@ -2197,10 +2379,29 @@ class Copier
         }
     }
 
+    bool smb() const
+    {
+        return connection_.type == ConnectionType::smb;
+    }
+
+    // The helper's SMB sign-in: the share from the games folder, "guest"
+    // without a user name.
+    SmbSignIn sign_in() const
+    {
+        SmbSignIn result;
+        result.share = smb_location(folder_path(connection_)).share;
+        split_smb_user(connection_.username, &result.domain, &result.user);
+        if (result.user.empty())
+            result.user = "guest";
+        result.password = connection_.password;
+        return result;
+    }
+
     Connection connection_;
     SharedPtr shared_;
     std::string entry_;
     std::string staging_;
+    std::unique_ptr<SmbSession> smb_; // in-app copies over SMB: one sign-in for the game
     std::vector<char> buffer_;
     bool helper_unavailable_ = false; // the copy helper couldn't start: in-app
     bool batch_ok_ = true;            // the copy helper takes batches of small files
@@ -2318,14 +2519,23 @@ void run_queue(const SharedPtr &shared)
 
 // ---- deleting what a game had copied (it left the queue) ----
 
-// Returns "" or why something couldn't be deleted.
-std::string discard_files(const CopyPlan &plan)
+// Returns "" or why something couldn't be deleted. `progress` hears how far
+// it is (0..1) every so often: a big game is tens of thousands of files.
+std::string discard_files(const CopyPlan &plan, const std::function<void(float)> &progress)
 {
     const std::string incoming = plan.destination + "/" + kIncoming;
     const std::string staging = incoming + "/" + plan.name;
     std::string problem;
+    const std::size_t total = plan.files.size() + plan.folders.size();
+    std::size_t done = 0;
+    const auto step = [&]
+    {
+        if (++done % 64 == 0 && progress)
+            progress(static_cast<float>(static_cast<double>(done) / static_cast<double>(total)));
+    };
     for (const CopyFile &file : plan.files)
     {
+        step();
         const std::string local = plan.image ? staging : staging + "/" + file.path;
         ::unlink((local + kPartSuffix).c_str()); // a big file still coming in
         if (::unlink(local.c_str()) != 0 && errno != ENOENT && problem.empty())
@@ -2343,8 +2553,11 @@ std::string discard_files(const CopyPlan &plan)
                   return depth(a) != depth(b) ? depth(a) > depth(b) : a > b;
               });
     for (const std::string &folder : folders)
+    {
+        step();
         if (::rmdir((staging + "/" + folder).c_str()) != 0 && errno != ENOENT && problem.empty())
             problem = errno_text(("Couldn't delete the folder " + folder).c_str(), errno);
+    }
     if (!plan.image && ::rmdir(staging.c_str()) != 0 && errno != ENOENT && problem.empty())
         problem = errno_text("Couldn't delete the game's folder", errno);
     ::rmdir(incoming.c_str()); // only when nothing else is in it
@@ -2354,11 +2567,17 @@ std::string discard_files(const CopyPlan &plan)
 
 void run_discard(const SharedPtr &shared, const CopyPlan &plan)
 {
-    const std::string problem = discard_files(plan);
+    const std::string problem = discard_files(plan,
+                                              [&](float done)
+                                              {
+                                                  std::lock_guard<std::mutex> hold(shared->lock);
+                                                  shared->discarded[plan.entry] = done;
+                                              });
     {
         std::lock_guard<std::mutex> hold(shared->lock);
         auto &list = shared->discarding;
         list.erase(std::remove(list.begin(), list.end(), plan.entry), list.end());
+        shared->discarded.erase(plan.entry);
     }
     if (!problem.empty())
         ps5_notify("Couldn't delete the copied files of " + plan.title + ": " + problem);
@@ -3101,6 +3320,7 @@ QueueStatus Transfers::queue() const
         entry.size = item.size();
         entry.done = std::min(item.done, item.size());
         entry.started = item.started;
+        entry.image = item.plan.image;
         status.entries.push_back(entry);
     }
     status.phase = shared_->phase;
@@ -3111,6 +3331,7 @@ QueueStatus Transfers::queue() const
     status.files_done = shared_->files_done;
     status.files_total = shared_->files_total;
     status.discarding = shared_->discarding;
+    status.discarded = shared_->discarded;
     status.finished_entry = shared_->finished_entry;
     status.finished_destination = shared_->finished_destination;
     status.waiting_for_close = shared_->waiting_for_close;

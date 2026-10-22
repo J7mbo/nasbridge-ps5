@@ -75,9 +75,9 @@ INSTALL_RUN = $(DOCKER) run --rm -v "$(CURDIR)":/src $(IMAGE) \
 install-selftest: check-host build
 	$(INSTALL_RUN) --root selftest build/ps5/selftest/NASBSELFTEST
 
-# The app folder is out/app/<title ID>; expanded after `build` has made it.
+# The app folder is out/app/<title ID> (from app/sce_sys/param.json).
 install: check-host build
-	$(INSTALL_RUN) --root homebrew $(wildcard out/app/PPSA*)
+	$(INSTALL_RUN) --root homebrew out/app/$(TITLE_ID)
 
 # Removes NASBridge from the PS5: its folder in /data/homebrew (ShadowMountPlus
 # adds every folder there to the home screen, so deleting only the tile brings
