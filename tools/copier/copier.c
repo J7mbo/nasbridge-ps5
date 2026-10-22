@@ -43,6 +43,15 @@
  * and the replies are as above (no "S" line). The file comes over <streams>
  * sign-ins (1 when left out), each fetching the next CHUNK in turn as over
  * HTTP, with several reads in flight (SMB_IN_FLIGHT) for each chunk.
+ *
+ * Over NFS (NFSv3, through libnfs) the helper connects itself the same way:
+ *   NASBridge -> "NBN1\t<ip>\t<port>\t<size>\t<file>\t<target length>[\t<streams>]\n"
+ *                then the export, the path in it, the MOUNT port (0: ask the
+ *                portmapper), the user ID and the group ID, each ended by a NUL
+ *   helper  -> "N <local port>"  the port its connection came from (below
+ *                                1024: a privileged one), once it's connected
+ * ERR kind nfs <why>: the NAS refused (this PS5, not in an export, not
+ * found, denied), in the words of NASBridge's nfs_failure_brief.
  */
 
 #include <arpa/inet.h>
@@ -68,6 +77,8 @@
 #include <smb2/smb2.h>
 #include <smb2/libsmb2.h>
 #include <smb2/smb2-errors.h>
+
+#include <nfsc/libnfs.h>
 
 #ifndef COPIER_HOST_TEST
 #include <ps5/kernel.h>
@@ -103,6 +114,8 @@
 #define PROTO_SMB "NBS1"
 #define SMB_READ (1u << 20) /* one SMB read (the NAS may allow less) */
 #define SMB_IN_FLIGHT 8     /* SMB reads asked for before the first answers */
+#define PROTO_NFS "NBN1"
+#define NFS_IN_FLIGHT 8     /* NFS reads asked for before the first answers */
 #define UNKNOWN_LEN UINT64_MAX
 /* ps5upload's identity for its payload (the debugger authid). */
 #define AUTHID_SYSTEM 0x4800000000000006ull
@@ -326,6 +339,8 @@ typedef struct job {
   uint64_t unsynced;
   int active;         /* connections bringing data in now */
   int nas[MAX_STREAMS]; /* their sockets, to cut them off on a stop (-1: none) */
+  int nfs_port;       /* over NFS: the local port a connection came from */
+  int nfs_port_sent;
 } job_t;
 
 /* Writes len bytes at the file's next position, flushing every SYNC_MS or
@@ -389,6 +404,10 @@ static void watch(job_t *j, int (*done)(void *), void *arg) {
     write_ns = j->write_ns;
     active = j->active;
     finished = done(arg);
+    if (j->nfs_port != j->nfs_port_sent) {
+      j->nfs_port_sent = j->nfs_port;
+      send_line(j->ctl, "N %d", j->nfs_port);
+    }
     pthread_mutex_unlock(&j->mu);
     send_line(j->ctl, "P %llu %llu %llu %d", (unsigned long long)(j->start + written),
               (unsigned long long)(write_ns / 1000000u), (unsigned long long)(now_ms() - started),
@@ -671,8 +690,9 @@ typedef struct multi {
   int nready;
   int fetchers_left, writer_done;
   int no_ranges;  /* the NAS answered a range with the whole file */
-  int net_err;    /* 1 drop, 2 timeout, 3 http, 4 changed, 7 smb (refused) */
+  int net_err;    /* 1 drop, 2 timeout, 3 http, 4 changed, 7 smb or nfs (refused) */
   const struct smb_sign_in *smb; /* over SMB: each connection signs in with this */
+  const struct nfs_target *nfs;  /* over NFS: each connection mounts this */
   int http_status;
   char why[160];
 } multi_t;
@@ -780,11 +800,16 @@ typedef struct fetcher {
   int slot;
   struct smb2_context *smb2; /* over SMB: this connection's sign-in, kept chunk to chunk */
   struct smb2fh *fh;
+  struct nfs_context *nfs; /* over NFS: this connection's mount, kept chunk to chunk */
+  struct nfsfh *nfh;
 } fetcher_t;
 
 static int smb_fetch_chunk(fetcher_t *f, uint64_t chunk, char *buf, size_t *got, char *why,
                            size_t why_size);
 static void smb_fetcher_end(fetcher_t *f);
+static int nfs_fetch_chunk(fetcher_t *f, uint64_t chunk, char *buf, size_t *got, char *why,
+                           size_t why_size);
+static void nfs_fetcher_end(fetcher_t *f);
 
 static void *fetcher_main(void *arg) {
   fetcher_t *f = arg;
@@ -810,8 +835,9 @@ static void *fetcher_main(void *arg) {
     ++j->active;
     pthread_mutex_unlock(&j->mu);
     for (tries = 0; tries < CHUNK_TRIES; ++tries) {
-      rc = m->smb ? smb_fetch_chunk(f, chunk, buf, &got, why, sizeof why)
-                  : fetch_chunk(m, f->slot, chunk, buf, &got, &status, why, sizeof why);
+      rc = m->nfs   ? nfs_fetch_chunk(f, chunk, buf, &got, why, sizeof why)
+           : m->smb ? smb_fetch_chunk(f, chunk, buf, &got, why, sizeof why)
+                    : fetch_chunk(m, f->slot, chunk, buf, &got, &status, why, sizeof why);
       if (rc != 1 && rc != 2) break; /* only the network's hiccups are retried */
       sleep_ms(500u * (unsigned)(tries + 1));
     }
@@ -842,6 +868,7 @@ static void *fetcher_main(void *arg) {
     }
   }
   if (m->smb) smb_fetcher_end(f);
+  if (m->nfs) nfs_fetcher_end(f);
   pthread_mutex_lock(&j->mu);
   --m->fetchers_left;
   pthread_cond_broadcast(&j->cv);
@@ -902,8 +929,10 @@ static void *multi_writer(void *arg) {
  * SMB (`smb` set) each connection is a sign-in of its own, reading its chunks
  * with several reads in flight; a NAS can serve each sign-in slowly but
  * several side by side (an Unraid NAS: about 17 MB/s over one, 40 over four
- * by WebDAV). */
-static int multi_pass(job_t *j, int streams, const struct smb_sign_in *smb) {
+ * by WebDAV). Over NFS (`nfs` set) likewise, each connection a mount of
+ * its own. */
+static int multi_pass(job_t *j, int streams, const struct smb_sign_in *smb,
+                      const struct nfs_target *nfs) {
   multi_t m;
   fetcher_t f[MAX_STREAMS];
   pthread_t ft[MAX_STREAMS], writer;
@@ -913,6 +942,7 @@ static int multi_pass(job_t *j, int streams, const struct smb_sign_in *smb) {
   m.j = j;
   m.streams = streams;
   m.smb = smb;
+  m.nfs = nfs;
   m.chunks = (j->size - j->start + CHUNK - 1) / CHUNK;
   for (i = 0; i < WINDOW; ++i) {
     m.pool[i] = malloc(CHUNK);
@@ -922,7 +952,7 @@ static int multi_pass(job_t *j, int streams, const struct smb_sign_in *smb) {
     }
     m.pool_free[m.nfree++] = i;
   }
-  if (!smb) send_line(j->ctl, "S 206");
+  if (!smb && !nfs) send_line(j->ctl, "S 206");
   memset(f, 0, sizeof f);
   for (i = 0; i < streams; ++i) {
     f[i].m = &m;
@@ -957,7 +987,7 @@ static int multi_pass(job_t *j, int streams, const struct smb_sign_in *smb) {
   } else if (m.net_err == 4) {
     send_line(j->ctl, "ERR changed %s", m.why);
   } else if (m.net_err == 7) {
-    send_line(j->ctl, "ERR smb %s", m.why);
+    send_line(j->ctl, "ERR %s %s", nfs ? "nfs" : "smb", m.why);
   } else if (m.net_err) {
     send_line(j->ctl, "ERR %s %s", m.net_err == 2 ? "timeout" : "drop", m.why);
   } else if (j->abort) {
@@ -1312,9 +1342,310 @@ static void run_smb_job(job_t *j, char *line) {
     if (j->start == j->size)
       send_line(j->ctl, "OK");
     else
-      multi_pass(j, streams, &in);
+      multi_pass(j, streams, &in, NULL);
   }
   memset(bytes, 0, len); /* the password */
+  free(bytes);
+}
+
+/* ------------------------------------------------------------ over NFS */
+
+/* The export NASBridge sends, and who to read as. */
+typedef struct nfs_target {
+  char *exported, *path;
+  int mount_port, uid, gid;
+} nfs_target_t;
+
+/* The fields after the path (or after the export, with no path). */
+static void nfs_numbers(nfs_target_t *t, char **field) {
+  t->mount_port = atoi(field[0]);
+  t->uid = atoi(field[1]);
+  t->gid = atoi(field[2]);
+}
+
+/* What an NFS failure was, as an ERR kind and a few words: libnfs gives a
+ * negative errno and its own words (a refused connection only shows in
+ * those). `mounting`: a failure to mount the export. */
+static const char *nfs_failure(struct nfs_context *nfs, int rc, int mounting, char *why,
+                               size_t size) {
+  const char *text = nfs ? nfs_get_error(nfs) : NULL;
+  int err = rc < 0 ? -rc : rc;
+  if (text && (strstr(text, "AUTH") || strstr(text, "auth error"))) {
+    snprintf(why, size, "the NAS refused this PS5");
+    return "nfs";
+  }
+  if (text && (strstr(text, "imeout") || strstr(text, "timed out"))) err = ETIMEDOUT;
+  else if (text && (strstr(text, "refused") || strstr(text, "unreachable"))) err = ECONNREFUSED;
+  else if (text && mounting && strstr(text, "POLLHUP")) err = ECONNREFUSED; /* how a refusal shows */
+  switch (err) {
+  case ENOENT:
+  case ENOTDIR:
+    snprintf(why, size, mounting ? "not in an NFS export" : "not found");
+    return "nfs";
+  case EACCES:
+  case EPERM:
+    snprintf(why, size, mounting ? "the NAS refused this PS5" : "access denied");
+    return "nfs";
+  default:
+    break;
+  }
+  snprintf(why, size, "%s", text && *text ? text : "the NAS stopped answering");
+  if (err == ETIMEDOUT) return "timeout";
+  if (err == ECONNREFUSED || err == EHOSTUNREACH || err == ENETUNREACH) return "connect";
+  return "drop";
+}
+
+/* The local port of the context's connection (0 when unknown). */
+static int nfs_local_port(struct nfs_context *nfs) {
+  struct sockaddr_in a;
+  socklen_t len = sizeof a;
+  memset(&a, 0, sizeof a);
+  if (getsockname(nfs_get_fd(nfs), (struct sockaddr *)&a, &len) != 0) return 0;
+  return ntohs(a.sin_port);
+}
+
+/* A mount of the export, or NULL with *kind and why set. */
+static struct nfs_context *nfs_connect(const char *ip, int port, const nfs_target_t *t,
+                                       const char **kind, char *why, size_t size) {
+  struct nfs_context *nfs = nfs_init_context();
+  int rc;
+  if (!nfs) {
+    *kind = "request";
+    snprintf(why, size, "out of memory");
+    return NULL;
+  }
+  nfs_set_timeout(nfs, NAS_REPLY_S * 1000);
+  nfs_set_uid(nfs, t->uid);
+  nfs_set_gid(nfs, t->gid);
+  nfs_set_version(nfs, 3); /* NFSv3 (NFS_V3 is in a header the helper leaves out) */
+  nfs_set_autoreconnect(nfs, 0); /* a lost connection fails the read: tried again here */
+  nfs_set_nfsport(nfs, port);
+  if (t->mount_port > 0) nfs_set_mountport(nfs, t->mount_port);
+  rc = nfs_mount(nfs, ip, t->exported);
+  if (rc < 0) {
+    *kind = nfs_failure(nfs, rc, 1, why, size);
+    nfs_destroy_context(nfs);
+    return NULL;
+  }
+  return nfs;
+}
+
+/* Reads [from, from + want) of an open file into buf, up to NFS_IN_FLIGHT
+ * reads in flight. 0, or -1 (the caller drops the mount). */
+typedef struct nfs_span {
+  int in_flight;
+  int failed; /* errno */
+  size_t short_at[NFS_IN_FLIGHT * 64]; /* where short answers ended, and how much is missing */
+  uint32_t short_len[NFS_IN_FLIGHT * 64];
+  int shorts;
+} nfs_span_t;
+
+typedef struct nfs_span_read {
+  nfs_span_t *span;
+  size_t at;
+  uint32_t want;
+} nfs_span_read_t;
+
+static void nfs_span_answer(int status, struct nfs_context *nfs, void *data, void *cb_data) {
+  nfs_span_read_t *r = cb_data;
+  nfs_span_t *span = r->span;
+  (void)nfs;
+  (void)data;
+  --span->in_flight;
+  if (status <= 0) {
+    if (!span->failed) span->failed = status < 0 ? -status : EIO;
+  } else if ((uint32_t)status < r->want) {
+    if (span->shorts < (int)(sizeof span->short_at / sizeof span->short_at[0])) {
+      span->short_at[span->shorts] = r->at + (size_t)status;
+      span->short_len[span->shorts++] = r->want - (uint32_t)status;
+    } else if (!span->failed) {
+      span->failed = EIO;
+    }
+  }
+  free(r);
+}
+
+static int nfs_read_span(struct nfs_context *nfs, struct nfsfh *fh, uint64_t from, size_t want,
+                         char *buf) {
+  nfs_span_t span;
+  size_t most = nfs_get_readmax(nfs), asked = 0;
+  uint64_t heard = now_ms();
+  int i;
+  memset(&span, 0, sizeof span);
+  if (most == 0 || most > SMB_READ) most = SMB_READ;
+  while (!span.failed && (asked < want || span.in_flight > 0)) {
+    struct pollfd p;
+    int before = span.in_flight;
+    while (!span.failed && span.in_flight < NFS_IN_FLIGHT && asked < want) {
+      nfs_span_read_t *r = malloc(sizeof *r);
+      uint32_t n = want - asked > most ? (uint32_t)most : (uint32_t)(want - asked);
+      if (!r) {
+        span.failed = ENOMEM;
+        break;
+      }
+      r->span = &span;
+      r->at = asked;
+      r->want = n;
+      if (nfs_pread_async(nfs, fh, buf + asked, n, from + asked, nfs_span_answer, r) != 0) {
+        free(r);
+        span.failed = EIO;
+        break;
+      }
+      ++span.in_flight;
+      asked += n;
+    }
+    if (span.failed || span.in_flight == 0) break;
+    p.fd = nfs_get_fd(nfs);
+    p.events = (short)nfs_which_events(nfs);
+    p.revents = 0;
+    if (poll(&p, 1, 250) < 0 && errno != EINTR) {
+      span.failed = errno;
+      break;
+    }
+    /* Called even when nothing came in: libnfs times requests out here. */
+    if (nfs_service(nfs, p.revents) < 0) {
+      if (!span.failed) span.failed = EIO;
+      break;
+    }
+    if (span.in_flight < before) heard = now_ms();
+    if (now_ms() - heard > NAS_REPLY_S * 1000u) {
+      span.failed = ETIMEDOUT;
+      break;
+    }
+  }
+  if (span.failed || span.in_flight > 0) return -1;
+  /* Short answers (the NAS sent less than asked): the rest, one read at a time. */
+  for (i = 0; i < span.shorts; ++i) {
+    size_t at = span.short_at[i];
+    uint32_t left = span.short_len[i];
+    while (left > 0) {
+      int n = nfs_pread(nfs, fh, buf + at, left, from + at);
+      if (n <= 0) return -1;
+      at += (size_t)n;
+      left -= (uint32_t)n;
+    }
+  }
+  return 0;
+}
+
+static int nfs_code(const char *kind) {
+  return strcmp(kind, "nfs") == 0 ? 7 : strcmp(kind, "timeout") == 0 ? 2 : 1;
+}
+
+/* One chunk of the file over this connection's own mount (made on its first
+ * chunk, and again after a failure). 0, or multi's codes: 1 drop and 2
+ * timeout (tried again), 4 changed, 6 stopped, 7 refused. */
+static int nfs_fetch_chunk(fetcher_t *f, uint64_t chunk, char *buf, size_t *got, char *why,
+                           size_t why_size) {
+  multi_t *m = f->m;
+  job_t *j = m->j;
+  uint64_t from = j->start + chunk * CHUNK, to = from + CHUNK;
+  const char *kind = "drop";
+  int rc = 0;
+  *got = 0;
+  if (to > j->size) to = j->size;
+  if (!f->nfs) {
+    struct nfs_stat_64 st;
+    int port;
+    f->nfs = nfs_connect(j->ip, j->port, m->nfs, &kind, why, why_size);
+    if (!f->nfs) return nfs_code(kind);
+    port = nfs_local_port(f->nfs);
+    rc = nfs_open(f->nfs, m->nfs->path, O_RDONLY, &f->nfh);
+    if (rc == 0) rc = nfs_fstat64(f->nfs, f->nfh, &st);
+    if (rc < 0) {
+      kind = nfs_failure(f->nfs, rc, 0, why, why_size);
+      nfs_fetcher_end(f);
+      return nfs_code(kind);
+    }
+    if (st.nfs_size != j->size) {
+      snprintf(why, why_size, "the file on the NAS is a different size now");
+      nfs_fetcher_end(f);
+      return 4;
+    }
+    pthread_mutex_lock(&j->mu);
+    j->nas[f->slot] = nfs_get_fd(f->nfs); /* a stop cuts it off */
+    if (port) j->nfs_port = port;
+    rc = j->abort;
+    pthread_mutex_unlock(&j->mu);
+    if (rc) return 6;
+  }
+  if (nfs_read_span(f->nfs, f->nfh, from, (size_t)(to - from), buf) != 0) {
+    pthread_mutex_lock(&j->mu);
+    rc = j->abort;
+    pthread_mutex_unlock(&j->mu);
+    if (rc) return 6;
+    kind = nfs_failure(f->nfs, -EIO, 0, why, why_size);
+    nfs_fetcher_end(f); /* the next try mounts again */
+    return nfs_code(kind);
+  }
+  *got = (size_t)(to - from);
+  return 0;
+}
+
+/* Lets go of this connection's mount (reads still out answer as cancelled). */
+static void nfs_fetcher_end(fetcher_t *f) {
+  job_t *j = f->m->j;
+  if (!f->nfs) return;
+  pthread_mutex_lock(&j->mu);
+  j->nas[f->slot] = -1;
+  pthread_mutex_unlock(&j->mu);
+  nfs_destroy_context(f->nfs); /* closes the file too */
+  f->nfs = NULL;
+  f->nfh = NULL;
+}
+
+/* Copies one file over NFS (the NBN1 line, then the target). Every path out
+ * sends its final line. */
+static void run_nfs_job(job_t *j, char *line) {
+  char *field[7], *save = NULL, *bytes = NULL, *part[5], ip[64], path[MAX_FILE];
+  nfs_target_t t;
+  size_t len;
+  int k, err, streams;
+  field[0] = strtok_r(line, "\t", &save);
+  for (k = 1; k < 7; ++k) field[k] = strtok_r(NULL, "\t", &save);
+  if (!field[5]) {
+    send_line(j->ctl, "ERR request not a NASBridge copy request");
+    return;
+  }
+  snprintf(ip, sizeof ip, "%s", field[1]);
+  j->ip = ip;
+  j->port = atoi(field[2]);
+  j->size = strtoull(field[3], NULL, 10);
+  snprintf(path, sizeof path, "%s", field[4]);
+  len = (size_t)strtoull(field[5], NULL, 10);
+  streams = field[6] ? atoi(field[6]) : 1;
+  if (streams < 1) streams = 1;
+  if (streams > MAX_STREAMS) streams = MAX_STREAMS;
+  if (len < 5 || len > MAX_SIGN_IN || path[0] != '/') {
+    send_line(j->ctl, "ERR request bad request");
+    return;
+  }
+  bytes = malloc(len);
+  if (!bytes || recv_exact(j->ctl, bytes, len) != 0 || smb_fields(bytes, len, part, 5) != 0) {
+    send_line(j->ctl, "ERR request bad target");
+    free(bytes);
+    return;
+  }
+  t.exported = part[0];
+  t.path = part[1];
+  nfs_numbers(&t, part + 2);
+  j->fd = open(path, O_RDWR | O_CREAT, FILE_MODE);
+  if (j->fd < 0) {
+    send_line(j->ctl, "ERR file %s", strerror(errno));
+    free(bytes);
+    return;
+  }
+  (void)fchmod(j->fd, FILE_MODE); /* open's mode is reduced by the umask */
+  if ((err = resume_point(j)) != 0) {
+    send_line(j->ctl, "ERR file %s", strerror(err));
+  } else {
+    send_line(j->ctl, "P %llu 0 0 0", (unsigned long long)j->start);
+    j->last_sync = now_ms();
+    if (j->start == j->size)
+      send_line(j->ctl, "OK");
+    else
+      multi_pass(j, streams, NULL, &t);
+  }
   free(bytes);
 }
 
@@ -1341,9 +1672,15 @@ static void run_smb_job(job_t *j, char *line) {
  * Over SMB the same, with "NBT1\t<ip>\t<port>\t<workers>\t<sign-in length>\n"
  * and the sign-in (share, user, domain, password, each ended by a NUL) first,
  * and each file's path in the share where the GET request would be. Each
- * worker signs in once and keeps that connection. */
+ * worker signs in once and keeps that connection.
+ *
+ * Over NFS likewise, with "NBM1\t<ip>\t<port>\t<workers>\t<target length>\n"
+ * and the target (export, MOUNT port, user ID, group ID, each ended by a
+ * NUL) first, each file's path in the export, and an "N <local port>" line
+ * once a worker has mounted it. */
 #define BATCH_PROTO "NBB1"
 #define BATCH_PROTO_SMB "NBT1"
+#define BATCH_PROTO_NFS "NBM1"
 #define BATCH_WORKERS 16 /* the Settings screen: 1..16 (a NAS with one disk answered fastest at 16) */
 #define BATCH_QUEUE 64
 #define BATCH_BUF (512u << 10) /* per worker: 16 of them stay within the payload's few MB */
@@ -1380,6 +1717,10 @@ typedef struct batch {
   int smb;                                /* NBT1: over SMB */
   smb_sign_in_t sign_in;                  /* ... with this (path unused) */
   struct smb2_context *smb2[BATCH_WORKERS]; /* ... each worker's sign-in */
+  int nfs;                                /* NBM1: over NFS */
+  nfs_target_t target;                    /* ... this export (path unused) */
+  struct nfs_context *nfsc[BATCH_WORKERS]; /* ... each worker's mount */
+  int nfs_port, nfs_port_sent;            /* ... the local port one came from */
 } batch_t;
 
 typedef struct bworker {
@@ -1693,6 +2034,126 @@ stopped:
   return -1;
 }
 
+/* Lets go of worker w's NFS mount (its socket is libnfs's to close). */
+static void nfs_drop(batch_t *b, int w) {
+  struct nfs_context *nfs;
+  pthread_mutex_lock(&b->mu);
+  b->nas[w] = -1;
+  nfs = b->nfsc[w];
+  b->nfsc[w] = NULL;
+  pthread_mutex_unlock(&b->mu);
+  if (nfs) nfs_destroy_context(nfs);
+}
+
+/* One file over NFS, as batch_one. */
+static int batch_one_nfs(batch_t *b, int w, const bfile_t *f, char *buf) {
+  char why[200];
+  int fd, tries;
+  fd = open(f->path, O_WRONLY | O_CREAT | O_TRUNC, FILE_MODE);
+  if (fd < 0) return batch_fail(b, f->index, "file", strerror(errno));
+  (void)fchmod(fd, FILE_MODE); /* open's mode is reduced by the umask */
+  if (f->size == 0) goto done;
+  for (tries = 0;; ++tries) {
+    struct nfs_context *nfs = b->nfsc[w];
+    struct nfsfh *fh = NULL;
+    struct nfs_stat_64 st;
+    const char *kind = "drop";
+    uint64_t got = 0;
+    size_t most;
+    int err = 0, net = 0, rc;
+    if (batch_aborted(b)) goto stopped;
+    if (tries > 0) {
+      nfs_drop(b, w);
+      nfs = NULL;
+      if (ftruncate(fd, 0) != 0 || lseek(fd, 0, SEEK_SET) != 0) {
+        close(fd);
+        return batch_fail(b, f->index, "file", strerror(errno));
+      }
+      sleep_ms(500u * (unsigned)tries);
+    }
+    if (!nfs) {
+      int port;
+      nfs = nfs_connect(b->ip, b->port, &b->target, &kind, why, sizeof why);
+      if (!nfs) {
+        if (strcmp(kind, "nfs") != 0 && tries + 1 < BATCH_TRIES) continue;
+        close(fd);
+        return batch_fail(b, f->index, kind, why);
+      }
+      port = nfs_local_port(nfs);
+      pthread_mutex_lock(&b->mu);
+      b->nfsc[w] = nfs;
+      b->nas[w] = nfs_get_fd(nfs);
+      if (port) b->nfs_port = port;
+      if (b->abort) shutdown(b->nas[w], SHUT_RDWR);
+      pthread_mutex_unlock(&b->mu);
+    }
+    rc = nfs_open(nfs, f->request, O_RDONLY, &fh);
+    if (rc == 0) rc = nfs_fstat64(nfs, fh, &st);
+    if (rc < 0) {
+      kind = nfs_failure(nfs, rc, 0, why, sizeof why);
+      if (fh) nfs_close(nfs, fh);
+      if (strcmp(kind, "nfs") == 0) {
+        close(fd);
+        return batch_fail(b, f->index, kind, why);
+      }
+      if (batch_aborted(b)) goto stopped;
+      if (tries + 1 < BATCH_TRIES) continue;
+      close(fd);
+      return batch_fail(b, f->index, kind, why);
+    }
+    if (st.nfs_size != f->size) {
+      nfs_close(nfs, fh);
+      close(fd);
+      return batch_fail(b, f->index, "changed", "the file on the NAS is a different size now");
+    }
+    most = nfs_get_readmax(nfs);
+    if (most == 0 || most > BATCH_BUF) most = BATCH_BUF;
+    while (!err && got < f->size) {
+      uint64_t want = f->size - got;
+      int n;
+      if (want > most) want = most;
+      n = nfs_pread(nfs, fh, buf, (size_t)want, got);
+      if (n <= 0) {
+        if (n == 0) {
+          snprintf(why, sizeof why, "the file ended early");
+          kind = "drop";
+        } else {
+          kind = nfs_failure(nfs, n, 0, why, sizeof why);
+        }
+        net = 1;
+        break;
+      }
+      err = write_all(fd, buf, (size_t)n);
+      got += (uint64_t)n;
+      pthread_mutex_lock(&b->mu);
+      b->bytes += (uint64_t)n;
+      pthread_mutex_unlock(&b->mu);
+    }
+    nfs_close(nfs, fh);
+    if (err) {
+      close(fd);
+      return batch_fail(b, f->index, "write", strerror(err));
+    }
+    if (net) {
+      if (batch_aborted(b)) goto stopped;
+      if (strcmp(kind, "nfs") != 0 && tries + 1 < BATCH_TRIES) continue;
+      close(fd);
+      return batch_fail(b, f->index, kind, why);
+    }
+    break;
+  }
+done:
+  if (close(fd) != 0) return batch_fail(b, f->index, "write", strerror(errno));
+  pthread_mutex_lock(&b->mu);
+  b->files++;
+  pthread_mutex_unlock(&b->mu);
+  bsend(b, "D %lld", f->index);
+  return 0;
+stopped:
+  close(fd);
+  return -1;
+}
+
 static void free_bfile(bfile_t *f) {
   free(f->path);
   free(f->request);
@@ -1722,7 +2183,9 @@ static void *batch_worker(void *arg) {
     b->busy++;
     pthread_cond_broadcast(&b->cv);
     pthread_mutex_unlock(&b->mu);
-    rc = b->smb ? batch_one_smb(b, me->w, &f, buf) : batch_one(b, me->w, &f, buf, head);
+    rc = b->nfs   ? batch_one_nfs(b, me->w, &f, buf)
+         : b->smb ? batch_one_smb(b, me->w, &f, buf)
+                  : batch_one(b, me->w, &f, buf, head);
     free_bfile(&f);
     pthread_mutex_lock(&b->mu);
     b->busy--;
@@ -1735,6 +2198,8 @@ out:
   free(head);
   if (b->smb)
     smb_drop(b, me->w);
+  else if (b->nfs)
+    nfs_drop(b, me->w);
   else
     set_nas(b, me->w, -1);
   return NULL;
@@ -1825,7 +2290,7 @@ static void *batch_reader(void *arg) {
     f.size = strtoull(field[2], NULL, 10);
     f.reqlen = (size_t)strtoull(field[4], NULL, 10);
     f.path = strdup(field[3]);
-    f.request = f.reqlen >= (b->smb ? 1u : 4u) && f.reqlen <= MAX_REQUEST ? malloc(f.reqlen + 1)
+    f.request = f.reqlen >= (b->smb || b->nfs ? 1u : 4u) && f.reqlen <= MAX_REQUEST ? malloc(f.reqlen + 1)
                                                                           : NULL;
     if (!f.path || !f.request) {
       free_bfile(&f);
@@ -1873,7 +2338,8 @@ static void run_batch(int ctl, char *line) {
   field[0] = strtok_r(line, "\t", &save);
   for (k = 1; k < 5; ++k) field[k] = strtok_r(NULL, "\t", &save);
   b->smb = strcmp(field[0], BATCH_PROTO_SMB) == 0;
-  if (!field[3] || (b->smb && !field[4])) {
+  b->nfs = strcmp(field[0], BATCH_PROTO_NFS) == 0;
+  if (!field[3] || ((b->smb || b->nfs) && !field[4])) {
     send_line(ctl, "ERR -1 request not a NASBridge batch request");
     free(b);
     return;
@@ -1893,6 +2359,19 @@ static void run_batch(int ctl, char *line) {
     b->sign_in.user = sign[1];
     b->sign_in.domain = sign[2];
     b->sign_in.password = sign[3];
+  } else if (b->nfs) {
+    /* The target comes before the list. */
+    sign_len = (size_t)strtoull(field[4], NULL, 10);
+    bytes = sign_len >= 4 && sign_len <= MAX_SIGN_IN ? malloc(sign_len) : NULL;
+    if (!bytes || recv_exact(ctl, bytes, sign_len) != 0 || smb_fields(bytes, sign_len, sign, 4) != 0) {
+      send_line(ctl, "ERR -1 request bad target");
+      free(bytes);
+      free(b);
+      return;
+    }
+    b->target.exported = sign[0];
+    b->target.path = NULL;
+    nfs_numbers(&b->target, sign + 1);
   }
   snprintf(ip, sizeof ip, "%s", field[1]);
   b->ctl = ctl;
@@ -1925,7 +2404,7 @@ static void run_batch(int ctl, char *line) {
   started_ms = now_ms();
   for (;;) {
     uint64_t bytes, files, now;
-    int busy, done, aborted;
+    int busy, done, aborted, port;
     sleep_ms(250);
     pthread_mutex_lock(&b->mu);
     bytes = b->bytes;
@@ -1933,7 +2412,10 @@ static void run_batch(int ctl, char *line) {
     busy = b->busy;
     aborted = b->abort;
     done = b->ended && b->qn == 0 && b->busy == 0;
+    port = b->nfs_port != b->nfs_port_sent ? b->nfs_port : 0;
+    b->nfs_port_sent = b->nfs_port;
     pthread_mutex_unlock(&b->mu);
+    if (port) bsend(b, "N %d", port);
     if (aborted) break;
     now = now_ms();
     if (done || now - last_sync >= BATCH_SYNC_MS) {
@@ -2008,12 +2490,17 @@ static void run_job(int ctl) {
   }
 #endif
   if (strncmp(line, BATCH_PROTO "\t", sizeof BATCH_PROTO) == 0 ||
-      strncmp(line, BATCH_PROTO_SMB "\t", sizeof BATCH_PROTO_SMB) == 0) {
+      strncmp(line, BATCH_PROTO_SMB "\t", sizeof BATCH_PROTO_SMB) == 0 ||
+      strncmp(line, BATCH_PROTO_NFS "\t", sizeof BATCH_PROTO_NFS) == 0) {
     run_batch(ctl, line);
     goto out;
   }
   if (strncmp(line, PROTO_SMB "\t", sizeof PROTO_SMB) == 0) {
     run_smb_job(&j, line);
+    goto out;
+  }
+  if (strncmp(line, PROTO_NFS "\t", sizeof PROTO_NFS) == 0) {
+    run_nfs_job(&j, line);
     goto out;
   }
   field[0] = strtok_r(line, "\t", &save);
@@ -2074,7 +2561,7 @@ static void run_job(int ctl) {
 #endif
   /* Two connections pay off on a big rest; a small one goes in one. */
   if (streams > 1 && j.size - j.start >= 2 * CHUNK) {
-    if (multi_pass(&j, streams, NULL) == 0) goto out;
+    if (multi_pass(&j, streams, NULL, NULL) == 0) goto out;
     /* The NAS doesn't take ranges: over one connection, from where it got. */
     j.abort = 0;
     if ((err = resume_point(&j)) != 0) {

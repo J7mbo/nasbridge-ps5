@@ -7,6 +7,7 @@
 #include "core/save_file.hpp"
 
 #include <arpa/inet.h>
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -39,6 +40,9 @@ constexpr const char *kProto = "NBC1";
 constexpr const char *kBatchProto = "NBB1";
 constexpr const char *kSmbProto = "NBS1";      // one file over SMB
 constexpr const char *kSmbBatchProto = "NBT1"; // small files over SMB
+constexpr const char *kNfsProto = "NBN1";      // one file over NFS
+constexpr const char *kNfsBatchProto = "NBM1"; // small files over NFS
+std::atomic<int> g_helper_nfs_port{0};         // the port its last NFS connection came from
 constexpr int kStartMs = 20000;   // the loader can take a while to run it
 constexpr int kSilentMs = 90000;  // longer than the helper ever goes quiet
 
@@ -175,6 +179,17 @@ std::string sign_in_bytes(const SmbSignIn &sign_in, const std::string *path)
     return bytes;
 }
 
+// The export as the helper takes it: its fields, each ended by a NUL.
+std::string target_bytes(const NfsTarget &target, const std::string *path)
+{
+    std::string bytes = target.exported + '\0';
+    if (path != nullptr)
+        bytes += *path + '\0';
+    bytes += std::to_string(target.mount_port) + '\0' + std::to_string(target.uid) + '\0' +
+             std::to_string(target.gid) + '\0';
+    return bytes;
+}
+
 using Progress = std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, int)>;
 
 // One file: sends the job line and what follows it, then follows the helper
@@ -231,6 +246,10 @@ HelperCopy run_copy(const std::string &job, const std::string &payload, const Pr
         {
             result.status = std::atoi(line.c_str() + 2);
         }
+        else if (line.rfind("N ", 0) == 0)
+        {
+            g_helper_nfs_port = std::atoi(line.c_str() + 2);
+        }
         else if (line.rfind("P ", 0) == 0)
         {
             char *end = nullptr;
@@ -266,7 +285,7 @@ HelperCopy run_copy(const std::string &job, const std::string &payload, const Pr
                 result.end = End::refused;
                 result.status = std::atoi(result.why.c_str());
             }
-            else if (kind == "smb")
+            else if (kind == "smb" || kind == "nfs")
                 result.end = End::refused; // the NAS said no: `why` says what
             else if (kind == "chunked")
                 result.end = End::unsupported;
@@ -392,6 +411,10 @@ HelperBatch run_batch(const std::string &opening, const std::vector<BatchFile> &
                 if (synced)
                     synced();
             }
+            else if (line.rfind("N ", 0) == 0)
+            {
+                g_helper_nfs_port = std::atoi(line.c_str() + 2);
+            }
             else if (line.rfind("P ", 0) == 0)
             {
                 char *end = nullptr;
@@ -433,7 +456,7 @@ HelperBatch run_batch(const std::string &opening, const std::vector<BatchFile> &
                     result.status = std::atoi(result.why.c_str());
                     return finish(End::refused);
                 }
-                if (kind == "smb")
+                if (kind == "smb" || kind == "nfs")
                     return finish(End::refused);
                 if (kind == "changed")
                     return finish(End::changed);
@@ -500,6 +523,37 @@ HelperBatch copy_smb_batch_with_helper(const std::string &ip, int port, int work
                          "\t" + std::to_string(workers) + "\t" + std::to_string(bytes.size()) +
                          "\n" + bytes,
                      files, done, synced, progress, stopping);
+}
+
+HelperCopy copy_nfs_with_helper(const std::string &ip, int port, std::uint64_t size,
+                                const std::string &local, const NfsTarget &target,
+                                const std::string &path, int streams, const Progress &progress,
+                                const std::function<bool()> &stopping)
+{
+    const std::string bytes = target_bytes(target, &path);
+    const std::string job = std::string(kNfsProto) + "\t" + ip + "\t" + std::to_string(port) +
+                            "\t" + std::to_string(size) + "\t" + local + "\t" +
+                            std::to_string(bytes.size()) + "\t" + std::to_string(streams) + "\n";
+    return run_copy(job, bytes, progress, stopping);
+}
+
+HelperBatch copy_nfs_batch_with_helper(const std::string &ip, int port, int workers,
+                                       const NfsTarget &target, const std::vector<BatchFile> &files,
+                                       const std::function<void(std::size_t)> &done,
+                                       const std::function<void()> &synced,
+                                       const BatchProgress &progress,
+                                       const std::function<bool()> &stopping)
+{
+    const std::string bytes = target_bytes(target, nullptr);
+    return run_batch(std::string(kNfsBatchProto) + "\t" + ip + "\t" + std::to_string(port) +
+                         "\t" + std::to_string(workers) + "\t" + std::to_string(bytes.size()) +
+                         "\n" + bytes,
+                     files, done, synced, progress, stopping);
+}
+
+int helper_nfs_port()
+{
+    return g_helper_nfs_port;
 }
 
 bool copy_helper_enabled()

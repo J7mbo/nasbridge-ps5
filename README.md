@@ -12,7 +12,7 @@ A native PS5 homebrew app to browse and install games from your NAS.
 
 ## What it does
 
-- **Browses your NAS over WebDAV or SMB**. Your games show up as a library with 
+- **Browses your NAS over WebDAV, SMB or NFS**. Your games show up as a library with 
   their names, covers and
   sizes, read from each game's `sce_sys` folder. Game folders are found up to
   four folders down, and `.exfat` images are read without downloading them.
@@ -40,7 +40,7 @@ A native PS5 homebrew app to browse and install games from your NAS.
     games can be deleted while it's open), use version 1.7beta6-fix2 or newer.
   - With older versions, copied games appear only once you close NASBridge, and
     a game you've just copied can only be deleted after restarting the PS5.
-- A NAS (or any computer) sharing your games over **WebDAV** or **SMB**.
+- A NAS (or any computer) sharing your games over **WebDAV**, **SMB** or **NFS**.
   - WebDAV: on a Synology, that's the WebDAV Server package (port 5005). On
     Unraid, that's likely a WebDAV docker container.
   - SMB is built into most NAS systems: turn it on, and give a user read 
@@ -51,6 +51,20 @@ A native PS5 homebrew app to browse and install games from your NAS.
     Unraid, a share set to Public (guest) is refused. Set the games share to
     Private, add a user for NASBridge under Users, and give it Read-only
     access to the share.
+  - NFS (version 3) is built into most NAS systems too, and has no sign-in:
+    the NAS lets the PS5 in by its IP address. Export the games share over
+    NFS, enter the NAS's IP address in NASBridge, then pick your games folder
+    with the folder button. The folder is the share's full path on the NAS
+    (`/mnt/user/Games/PS5` on Unraid, `/volume1/Games/PS5` on a Synology).
+    NASBridge reads as user 99, group 100 (Unraid's nobody and users), so the
+    games must be readable by them, or by everyone.
+  - On Unraid, set the share's NFS Security Settings to Export: Yes and
+    Security: Public (or Private, with a rule for the PS5's IP address). On a
+    Synology, add an NFS permission for the PS5's IP address, read-only, and
+    tick "Allow connections from non-privileged ports". Exports that only
+    take connections from privileged ports (below 1024) need that, or the
+    `insecure` option on other NAS systems, if the PS5 can't use one:
+    Test connection says which it used.
 - Only to build it yourself: a Mac or Linux machine with Docker (Docker
   Desktop or OrbStack) and `make`.
 
@@ -150,7 +164,7 @@ need.
 | `make install PS5_HOST=<ip>` | Build, then install to the PS5's home screen |
 | `make uninstall PS5_HOST=<ip>` | Remove NASBridge from the PS5 |
 | `make release` | Build `out/NASBridge-<version>.elf`, the single-file installer |
-| `make test` | Run the test suites (on your computer, against a fake WebDAV NAS, a Samba server and a fake PS5) |
+| `make test` | Run the test suites (on your computer, against a fake WebDAV NAS, a Samba server, an NFS server and a fake PS5) |
 | `make snapshots` | Render every screen to `out/snapshots/` |
 | `make shell` | Open a shell inside the toolchain container |
 | `make clean` | Delete build output |
@@ -163,7 +177,7 @@ exact commits, so two builds of the same commit produce the same files.
 app/      the app: screens, artwork and home-screen metadata (sce_sys)
 tools/    the installer, copy helper and delete helper payloads
 tests/    test suites, with a fake WebDAV NAS, a real Samba server for SMB,
-          and a fake PS5 loader
+          a real NFS server (UNFS3) for NFS, and a fake PS5 loader
 Dockerfile, Makefile, ps5.mk   the toolchain and build
 ```
 
@@ -177,6 +191,8 @@ Dockerfile, Makefile, ps5.mk   the toolchain and build
   Copyright (C) 2026 BlackBearReloaded (GPL-3.0-or-later).
 - Built on the [PS5 payload SDK](https://github.com/ps5-payload-dev/sdk).
 - SMB support uses [libsmb2](https://github.com/sahlberg/libsmb2) by Ronnie
+  Sahlberg (LGPL-2.1-or-later).
+- NFS support uses [libnfs](https://github.com/sahlberg/libnfs) by Ronnie
   Sahlberg (LGPL-2.1-or-later).
 - Games are added to the home screen by
   [ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus).

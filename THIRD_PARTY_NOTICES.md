@@ -107,6 +107,22 @@ with NASBridge's GPL-3.0-or-later.
   MD4 Message-Digest Algorithm (from RFC 1320), Copyright (C) 1990-2, RSA Data
   Security, Inc. Its licence notice is kept in that file.
 
+## libnfs (NFS)
+
+The app's NFS support is built on
+[libnfs](https://github.com/sahlberg/libnfs), Copyright (C) Ronnie Sahlberg
+and contributors, licensed under LGPL-2.1-or-later, which combines with
+NASBridge's GPL-3.0-or-later.
+
+- **Version:** tag `libnfs-6.0.2`, commit
+  `18c5c73ee88bb7dc8da0d55dc95164bb77e49dc6`, pinned in the `Dockerfile`.
+- **How it's used:** its `lib/`, `include/` and protocol (`mount/`, `nfs/`,
+  `nfs4/`, `nlm/`, `nsm/`, `portmap/`, `rquota/`) sources are compiled,
+  unchanged, into the app and into the copy helper payload (`copier.elf`),
+  with NASBridge's own `config.h` and two small stand-ins for C library calls
+  the PS5 lacks (`app/third_party/libnfs/`). Its `COPYING` and LGPL text are
+  copied into the app with it.
+
 ## PS5 payload SDK
 
 The app, the installer and the copy and delete helper payloads are built with
@@ -123,7 +139,10 @@ tests' fake NAS and fake PS5 loader (`tests/`) are NASBridge's own. The SMB
 tests also build libsmb2 for the computer they run on, and run
 [Samba](https://www.samba.org/)'s `smbd` (GPL-3.0-or-later) with
 [nss_wrapper](https://cwrap.org/nss_wrapper.html) (BSD-3-Clause) from the
-toolchain image as their test NAS.
+toolchain image as their test NAS. The NFS tests build libnfs for the
+computer they run on, and run [UNFS3](https://github.com/unfs3/unfs3)'s
+`unfsd` (BSD-3-Clause), built in the toolchain image with its largest read
+lowered (see the `Dockerfile`), as their test NAS.
 
 ## Disclaimer
 

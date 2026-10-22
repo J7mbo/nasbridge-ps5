@@ -159,6 +159,25 @@ RUN git init -q "$LIBSMB2" && cd "$LIBSMB2" \
  && rm -rf .git \
  && chmod -R a+rX "$LIBSMB2"
 
+# libnfs (Ronnie Sahlberg's NFS client, the sibling of libsmb2; the library is
+# LGPL-2.1-or-later, GPL-compatible) at its 6.0.2 release. NASBridge reads NFS
+# exports with it (NFSv3); the build copies its library sources into the app
+# and the copy helper and compiles them with app/third_party/libnfs/config.h.
+ARG LIBNFS_REPO=https://github.com/sahlberg/libnfs.git
+ARG LIBNFS_TAG=libnfs-6.0.2
+ARG LIBNFS_COMMIT=18c5c73ee88bb7dc8da0d55dc95164bb77e49dc6
+ENV LIBNFS=/opt/libnfs
+
+RUN git init -q "$LIBNFS" && cd "$LIBNFS" \
+ && git fetch -q --depth 1 "$LIBNFS_REPO" "$LIBNFS_COMMIT" \
+ && git checkout -q FETCH_HEAD \
+ && test "$(git rev-parse HEAD)" = "$LIBNFS_COMMIT" \
+      || { echo "libnfs commit $LIBNFS_COMMIT ($LIBNFS_TAG) not found" >&2; exit 1; } \
+ && test -f lib/libnfs.c && test -f include/nfsc/libnfs.h && test -f LICENCE-LGPL-2.1.txt \
+ && echo "$LIBNFS_COMMIT" > .nasbridge-commit \
+ && rm -rf .git \
+ && chmod -R a+rX "$LIBNFS"
+
 # For the SMB tests only (none of it is in what's installed): Samba's smbd as
 # the test NAS, and nss_wrapper, which gives the user the container runs as
 # an account name for smbd (tests/smb_server.py).
@@ -166,12 +185,35 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends samba libnss-wrapper \
  && rm -rf /var/lib/apt/lists/*
 
+# For the NFS tests only: UNFS3, a user-space NFSv3 server that runs as the
+# container's user on ports of its own, without a portmapper
+# (tests/nfs_server.py). Built from its pinned 0.11.0 release, with one
+# change: libtirpc splits a reply bigger than its 64 KiB send buffer (it
+# allows no bigger) into several RPC record fragments, which libnfs can't
+# read (a NAS's kernel NFS server sends each reply whole), so reads are
+# capped at 32 KiB to fit in one.
+ARG UNFS3_REPO=https://github.com/unfs3/unfs3.git
+ARG UNFS3_TAG=unfs3-0.11.0
+ARG UNFS3_COMMIT=ec1660ba33c80d5c67131e163e68834c1a10e243
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends autoconf automake bison flex gcc libtirpc-dev pkg-config \
+ && git clone -q --depth 1 --branch "$UNFS3_TAG" "$UNFS3_REPO" /tmp/unfs3 \
+ && test "$(git -C /tmp/unfs3 rev-parse HEAD)" = "$UNFS3_COMMIT" \
+      || { echo "unfs3 tag $UNFS3_TAG is not commit $UNFS3_COMMIT" >&2; exit 1; } \
+ && cd /tmp/unfs3 \
+ && sed -i 's/#define NFS_MAXDATA_TCP 524288/#define NFS_MAXDATA_TCP 32768/' nfs.h \
+ && grep -q 'NFS_MAXDATA_TCP 32768' nfs.h \
+ && ./bootstrap && ./configure -q && make -s && install -m 755 unfsd /usr/local/sbin/unfsd \
+ && cd / && rm -rf /tmp/unfs3 /var/lib/apt/lists/*
+
 # Record exact tool versions inside the image (shown by `make toolchain-info`).
 RUN { echo "ps5-payload-sdk $PS5_SDK_TAG ($PS5_SDK_COMMIT)"; \
       echo "ps5-homebrew-ui $UI_KIT_COMMIT"; \
       echo "stb $STB_COMMIT"; \
       echo "libsmb2 $LIBSMB2_TAG ($LIBSMB2_COMMIT)"; \
+      echo "libnfs $LIBNFS_TAG ($LIBNFS_COMMIT)"; \
       echo "samba $(smbd --version) (tests only)"; \
+      echo "unfs3 $UNFS3_TAG ($UNFS3_COMMIT, tests only)"; \
       echo "compiler-rt builtins $LLVM_VERSION (x86-64, from source)"; \
       clang-18 --version | head -1; \
       ld.lld-18 --version; \

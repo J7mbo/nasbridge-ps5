@@ -28,6 +28,8 @@ const char *type_key(ConnectionType type)
         return "ftp";
     case ConnectionType::smb:
         return "smb";
+    case ConnectionType::nfs:
+        return "nfs";
     case ConnectionType::webdav:
         break;
     }
@@ -81,8 +83,9 @@ std::string Connection::display_url() const
 {
     std::string url = type == ConnectionType::ftp   ? "ftp://"
                       : type == ConnectionType::smb ? "smb://"
+                      : type == ConnectionType::nfs ? "nfs://"
                                                     : "http://";
-    if (!username.empty())
+    if (!username.empty() && type != ConnectionType::nfs)
         url += username + "@";
     url += host.empty() ? "your-nas" : host;
     if (port > 0 && port != default_port())
@@ -116,6 +119,7 @@ bool Connection::load()
         if (key == "type")
             type = value == "ftp"   ? ConnectionType::ftp
                    : value == "smb" ? ConnectionType::smb
+                   : value == "nfs" ? ConnectionType::nfs
                                     : ConnectionType::webdav;
         else if (key == "host")
             host = value;
@@ -152,7 +156,7 @@ std::string normalise_host(std::string *text)
     std::string host = *text;
     if (starts_with(host, "https://"))
         return "HTTPS isn't supported yet: use the http address";
-    if (starts_with(host, "http://") || starts_with(host, "smb://"))
+    if (starts_with(host, "http://") || starts_with(host, "smb://") || starts_with(host, "nfs://"))
         host.erase(0, host.find("//") + 2);
     // "\\192.168.1.20", as Windows writes a NAS's address.
     while (!host.empty() && host.front() == '\\')

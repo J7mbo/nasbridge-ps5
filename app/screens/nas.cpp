@@ -1,4 +1,4 @@
-// NASBridge - Reading the NAS over WebDAV or SMB, whichever the connection uses.
+// NASBridge - Reading the NAS over WebDAV, SMB or NFS, whichever the connection uses.
 // Copyright (C) 2026 NASBridge contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -20,6 +20,9 @@ const char *const kDepthOne = "Depth: 1\r\nContent-Type: application/xml; charse
 // a few listings in flight on each hide the network's delay as well.
 constexpr int kSmbWalkSignIns = 4;
 constexpr int kSmbWalkAtOnce = 4;
+// The same over NFS: connections, and listings in flight on each.
+constexpr int kNfsWalkLanes = 4;
+constexpr int kNfsWalkAtOnce = 4;
 
 // A failed reply in a few words: "not found (HTTP 404)".
 std::string describe(const HttpReply &reply)
@@ -50,16 +53,22 @@ bool answered(const SmbFailure &failure)
            failure.kind != Kind::refused && failure.kind != Kind::timeout;
 }
 
-} // namespace
+bool answered(const NfsFailure &failure)
+{
+    using Kind = NfsFailure::Kind;
+    return failure.kind != Kind::address && failure.kind != Kind::connect &&
+           failure.kind != Kind::refused && failure.kind != Kind::timeout;
+}
 
-std::vector<DavEntry> smb_as_listing(const std::string &folder, const std::vector<SmbEntry> &entries)
+template <typename Entry>
+std::vector<DavEntry> as_listing(const std::string &folder, const std::vector<Entry> &entries)
 {
     std::string base = folder;
     if (base.empty() || base.back() != '/')
         base += '/';
     std::vector<DavEntry> listing;
     listing.reserve(entries.size());
-    for (const SmbEntry &entry : entries)
+    for (const Entry &entry : entries)
     {
         DavEntry item;
         item.name = entry.name;
@@ -70,6 +79,18 @@ std::vector<DavEntry> smb_as_listing(const std::string &folder, const std::vecto
         listing.push_back(std::move(item));
     }
     return listing;
+}
+
+} // namespace
+
+std::vector<DavEntry> smb_as_listing(const std::string &folder, const std::vector<SmbEntry> &entries)
+{
+    return as_listing(folder, entries);
+}
+
+std::vector<DavEntry> nfs_as_listing(const std::string &folder, const std::vector<NfsEntry> &entries)
+{
+    return as_listing(folder, entries);
 }
 
 NasReader::NasReader(const Connection &connection, int seconds)
@@ -84,6 +105,13 @@ SmbSession &NasReader::session()
     if (!session_)
         session_ = std::make_unique<SmbSession>(connection_, seconds_);
     return *session_;
+}
+
+NfsSession &NasReader::nfs_session()
+{
+    if (!nfs_session_)
+        nfs_session_ = std::make_unique<NfsSession>(connection_, seconds_);
+    return *nfs_session_;
 }
 
 bool NasReader::list(const std::string &folder, std::vector<DavEntry> *entries, NasProblem *problem)
@@ -104,6 +132,18 @@ bool NasReader::list(const std::string &folder, std::vector<DavEntry> *entries, 
         *entries = smb_as_listing(folder, inside);
         return true;
     }
+    if (nfs())
+    {
+        std::vector<NfsEntry> inside;
+        if (!nfs_session().list(folder, &inside, &why.nfs))
+        {
+            why.brief = nfs_failure_brief(why.nfs);
+            why.reached = answered(why.nfs);
+            return false;
+        }
+        *entries = nfs_as_listing(folder, inside);
+        return true;
+    }
     why.reply = http_request(connection_, "PROPFIND", folder, kDepthOne, propfind_body());
     if (why.reply.status == 207 && parse_listing(why.reply.body, folder, entries))
         return true;
@@ -112,7 +152,7 @@ bool NasReader::list(const std::string &folder, std::vector<DavEntry> *entries, 
     return false;
 }
 
-bool NasReader::walk_smb(
+bool NasReader::walk(
     const std::string &folder,
     const std::function<bool(const std::string &folder, const std::vector<DavEntry> &entries)> &found,
     NasProblem *problem)
@@ -121,6 +161,23 @@ bool NasReader::walk_smb(
     NasProblem &why = problem != nullptr ? *problem : scratch;
     why = NasProblem{};
     const std::string top = folder.empty() || folder.back() != '/' ? folder + "/" : folder;
+    if (nfs())
+    {
+        const bool ok = nfs_session().walk(
+            folder, kNfsWalkLanes, kNfsWalkAtOnce,
+            [&](const std::string &inside, const std::vector<NfsEntry> &entries)
+            {
+                const std::string path = top + inside;
+                return found(path, nfs_as_listing(path, entries));
+            },
+            &why.nfs);
+        if (!ok && why.nfs.kind != NfsFailure::Kind::none)
+        {
+            why.brief = nfs_failure_brief(why.nfs);
+            why.reached = answered(why.nfs);
+        }
+        return ok;
+    }
     const bool ok = session().walk(
         folder, kSmbWalkSignIns, kSmbWalkAtOnce,
         [&](const std::string &inside, const std::vector<SmbEntry> &entries)
@@ -153,6 +210,15 @@ bool NasReader::read_file(const std::string &path, std::size_t max, std::string 
         why.reached = too_big || answered(why.smb);
         return false;
     }
+    if (nfs())
+    {
+        bool too_big = false;
+        if (nfs_session().read_file(path, max, out, &too_big, &why.nfs))
+            return true;
+        why.brief = too_big ? "too big" : nfs_failure_brief(why.nfs);
+        why.reached = too_big || answered(why.nfs);
+        return false;
+    }
     why.reply = http_request(connection_, "GET", path, "", "", max);
     if (why.reply.status == 200 && !why.reply.too_big)
     {
@@ -167,6 +233,14 @@ bool NasReader::read_file(const std::string &path, std::size_t max, std::string 
 bool NasReader::read_range(const std::string &path, std::uint64_t offset, std::size_t length,
                            std::string *out, std::string *why)
 {
+    if (nfs())
+    {
+        NfsFailure failure;
+        if (nfs_session().read_range(path, offset, length, out, &failure))
+            return true;
+        *why = nfs_failure_brief(failure);
+        return false;
+    }
     if (!smb())
         return http_read_range(connection_, path, offset, length, out, why);
     SmbFailure failure;
@@ -183,6 +257,13 @@ ProbeResult explain_nas_failure(const Connection &connection, const NasProblem &
         ProbeResult result;
         result.state = ProbeResult::State::failed;
         describe_smb_failure(connection, problem.smb, &result.headline, &result.detail);
+        return result;
+    }
+    if (connection.type == ConnectionType::nfs)
+    {
+        ProbeResult result;
+        result.state = ProbeResult::State::failed;
+        describe_nfs_failure(connection, problem.nfs, &result.headline, &result.detail);
         return result;
     }
     const HttpReply &reply = problem.reply;

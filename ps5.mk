@@ -25,8 +25,8 @@ HELPER_SRCS := tools/helper/helper.c
 
 # The copy helper: shipped inside the app (assets/copier.elf); NASBridge sends
 # it to the PS5's ELF loader and hands it each file to copy (see copier.c).
-# It copies over SMB with libsmb2 (below), built for it from the same sources
-# and config.h as the app's.
+# It copies over SMB with libsmb2 and over NFS with libnfs (below), built for
+# it from the same sources and config.h files as the app's.
 COPIER_SRCS := tools/copier/copier.c
 
 SELFTEST_DIR := $(BUILD_DIR)/selftest/NASBSELFTEST
@@ -58,14 +58,38 @@ LIBSMB2_SRCS := aes128ccm.c alloc.c asn1-ber.c compat.c dcerpc.c dcerpc-lsa.c \
 LIBSMB2_OURS := smb2_compat.c aes_fast.c
 LIBSMB2_DIR  := src/third_party/libsmb2
 LIBSMB2_INCLUDES := $(LIBSMB2_DIR) $(LIBSMB2_DIR)/include $(LIBSMB2_DIR)/include/smb2
-APP_ENV      := APP_DEFINITIONS=HAVE_CONFIG_H APP_INCLUDE_PATHS="$(LIBSMB2_INCLUDES)"
+# libnfs (pinned in the image): its library sources (lib/CMakeLists.txt's
+# list and its protocol folders', without Kerberos or threads) are built into
+# the app with our config.h and nfs_compat.c (app/third_party/libnfs). Its
+# sources keep their folders, each with a copy of our config.h and libnfs's
+# private headers beside them (libsmb2's config.h and slist.h are on the
+# include path, ahead of libnfs's folders), and
+# its protocol headers also go beside libnfs.h in include/nfsc, as an
+# installed libnfs has them.
+LIBNFS       := /opt/libnfs
+LIBNFS_PROTOCOLS := mount nfs nfs4 nlm nsm portmap rquota
+LIBNFS_SRCS  := lib/init.c lib/libnfs.c lib/libnfs-sync.c lib/libnfs-zdr.c lib/nfs_v3.c \
+  lib/nfs_v4.c lib/pdu.c lib/socket.c mount/libnfs-raw-mount.c mount/mount.c \
+  nfs/libnfs-raw-nfs.c nfs/nfs.c nfs/nfsacl.c nfs4/libnfs-raw-nfs4.c nfs4/nfs4.c \
+  nlm/libnfs-raw-nlm.c nlm/nlm.c nsm/libnfs-raw-nsm.c nsm/nsm.c portmap/libnfs-raw-portmap.c \
+  portmap/portmap.c rquota/libnfs-raw-rquota.c rquota/rquota.c
+LIBNFS_OURS  := lib/nfs_compat.c
+LIBNFS_DIR   := src/third_party/libnfs
+LIBNFS_INCLUDES := $(LIBNFS_DIR)/include $(LIBNFS_DIR)/include/nfsc \
+  $(addprefix $(LIBNFS_DIR)/,$(LIBNFS_PROTOCOLS))
+APP_ENV      := APP_DEFINITIONS=HAVE_CONFIG_H APP_INCLUDE_PATHS="$(LIBSMB2_INCLUDES) $(LIBNFS_INCLUDES)"
 # The copy helper's libsmb2: the payload SDK's compiler, warnings off (it isn't
 # our code), the image's paths kept out of the ELF.
 COPIER_SMB_OBJS := $(patsubst %.c,$(BUILD_DIR)/libsmb2/%.o,$(LIBSMB2_SRCS) $(LIBSMB2_OURS))
 COPIER_SMB_FLAGS := -std=c11 -O2 -g -w -DHAVE_CONFIG_H -Iapp/third_party/libsmb2 \
   -I$(LIBSMB2)/include -I$(LIBSMB2)/include/smb2 -I$(LIBSMB2)/lib \
   -ffile-prefix-map=$(LIBSMB2)/=libsmb2/ -ffile-prefix-map=/src/=./
-COPIER_INCLUDES := -I$(LIBSMB2)/include
+# And its libnfs, the same way (our config.h ahead of libnfs's folders).
+COPIER_NFS_OBJS := $(patsubst %.c,$(BUILD_DIR)/libnfs/%.o,$(LIBNFS_SRCS)) $(BUILD_DIR)/libnfs/nfs_compat.o
+COPIER_NFS_FLAGS := -std=gnu11 -O2 -g -w -DHAVE_CONFIG_H -Iapp/third_party/libnfs \
+  -I$(LIBNFS)/include -I$(LIBNFS)/include/nfsc $(addprefix -I$(LIBNFS)/,$(LIBNFS_PROTOCOLS)) \
+  -ffile-prefix-map=$(LIBNFS)/=libnfs/ -ffile-prefix-map=/src/=./
+COPIER_INCLUDES := -I$(LIBSMB2)/include -I$(LIBNFS)/include
 
 # Home-screen app: the kit's app (renderer, shell, input, sound) with our
 # screens (app/screens) in place of its demo designs, our overrides
@@ -119,8 +143,15 @@ $(BUILD_DIR)/libsmb2/%.o: app/third_party/libsmb2/%.c app/third_party/libsmb2/co
 	@mkdir -p $(@D)
 	@$(CC) $(COPIER_SMB_FLAGS) -c -o $@ $<
 
-$(COPIER): $(COPIER_SRCS) $(COPIER_SMB_OBJS) $(BUILD_DIR)/toolchain.id | $(OUT_DIR)
-	$(CC) $(CFLAGS) $(COPIER_INCLUDES) -o $@ $(COPIER_SRCS) $(COPIER_SMB_OBJS)
+$(BUILD_DIR)/libnfs/%.o: $(LIBNFS)/%.c app/third_party/libnfs/config.h $(BUILD_DIR)/toolchain.id
+	@mkdir -p $(@D)
+	@$(CC) $(COPIER_NFS_FLAGS) -c -o $@ $<
+$(BUILD_DIR)/libnfs/nfs_compat.o: app/third_party/libnfs/nfs_compat.c app/third_party/libnfs/config.h $(BUILD_DIR)/toolchain.id
+	@mkdir -p $(@D)
+	@$(CC) $(COPIER_NFS_FLAGS) -c -o $@ $<
+
+$(COPIER): $(COPIER_SRCS) $(COPIER_SMB_OBJS) $(COPIER_NFS_OBJS) $(BUILD_DIR)/toolchain.id | $(OUT_DIR)
+	$(CC) $(CFLAGS) $(COPIER_INCLUDES) -o $@ $(COPIER_SRCS) $(COPIER_SMB_OBJS) $(COPIER_NFS_OBJS)
 	@sha256sum $@
 
 # ---- release: one ELF that installs the app ----
@@ -217,6 +248,18 @@ app-work: FORCE
 	@cp -p $(addprefix $(LIBSMB2)/lib/,$(LIBSMB2_SRCS)) $(LIBSMB2)/lib/*.h $(APP_WORK)/$(LIBSMB2_DIR)/lib/
 	@cp -pR $(LIBSMB2)/include $(LIBSMB2)/COPYING $(LIBSMB2)/LICENCE-LGPL-2.1.txt $(APP_WORK)/$(LIBSMB2_DIR)/
 	@cp -p app/third_party/libsmb2/* $(APP_WORK)/$(LIBSMB2_DIR)/
+	@test -f $(LIBNFS)/lib/libnfs.c || { echo "libnfs missing from the image: run make image" >&2; exit 1; }
+	@rm -rf $(APP_WORK)/$(LIBNFS_DIR) && mkdir -p $(APP_WORK)/$(LIBNFS_DIR)
+	@cd $(LIBNFS) && cp -p --parents $(LIBNFS_SRCS) lib/*.h $(addsuffix /*.h,$(LIBNFS_PROTOCOLS)) \
+	  $(CURDIR)/$(APP_WORK)/$(LIBNFS_DIR)/
+	@cp -pR $(LIBNFS)/include $(LIBNFS)/COPYING $(LIBNFS)/LICENCE-LGPL-2.1.txt $(APP_WORK)/$(LIBNFS_DIR)/
+	@cp -p $(foreach p,$(LIBNFS_PROTOCOLS),$(LIBNFS)/$(p)/libnfs-raw-$(p).h) $(APP_WORK)/$(LIBNFS_DIR)/include/nfsc/
+	@# libsmb2 has a slist.h too: libnfs's private headers go beside its
+	@# sources as well (they're all included in quotes).
+	@for d in include include/nfsc lib $(LIBNFS_PROTOCOLS); do \
+	  cp -p app/third_party/libnfs/config.h $(APP_WORK)/$(LIBNFS_DIR)/$$d/; done
+	@for d in lib $(LIBNFS_PROTOCOLS); do cp -p $(LIBNFS)/include/*.h $(APP_WORK)/$(LIBNFS_DIR)/$$d/; done
+	@cp -p app/third_party/libnfs/nfs_compat.c $(APP_WORK)/$(LIBNFS_DIR)/lib/
 
 app: app-work $(HELPER) $(COPIER)
 	@cp $(HELPER) $(APP_WORK)/assets/helper.elf
@@ -236,12 +279,12 @@ snapshots: app-work
 	@echo "==> [snapshots] Rendering NASBridge's screens"
 	@rm -rf $(OUT_DIR)/snapshots
 	@# The kit's snapshot build takes no include paths or definitions:
-	@# libsmb2's headers come through CPATH, and its HAVE_CONFIG_H (and the
-	@# GNU C it's written in, over the kit's -std=c11) through a compiler
-	@# that adds them.
+	@# libsmb2's and libnfs's headers come through CPATH, and their
+	@# HAVE_CONFIG_H (and the GNU C they're written in, over the kit's
+	@# -std=c11) through a compiler that adds them.
 	@mkdir -p $(APP_WORK)/build && printf '#!/bin/sh\nexec clang-18 -DHAVE_CONFIG_H "$$@" -std=gnu11\n' > $(APP_WORK)/build/snapshot-cc && chmod +x $(APP_WORK)/build/snapshot-cc
 	@cd $(APP_WORK) && $(KIT_HOST_ENV) HOST_CC=$(CURDIR)/$(APP_WORK)/build/snapshot-cc \
-	  CPATH=$(subst $(subst ,, ),:,$(addprefix $(CURDIR)/$(APP_WORK)/,$(LIBSMB2_INCLUDES))) \
+	  CPATH=$(subst $(subst ,, ),:,$(addprefix $(CURDIR)/$(APP_WORK)/,$(LIBSMB2_INCLUDES) $(LIBNFS_INCLUDES))) \
 	  MESA_SHADER_CACHE_DISABLE=true bash tools/host-snapshots.sh $(CURDIR)/$(OUT_DIR)/snapshots all
 	@echo "Pictures: $(OUT_DIR)/snapshots"
 
@@ -287,13 +330,17 @@ $(HOST_INSTALLER): $(INSTALLER_SRCS) tools/installer/sha256.h
 # each test talks to its own fake NAS ports.
 HOST_OBJ := build/host/obj
 HOST_INCLUDES := -DGL_GLEXT_PROTOTYPES=1 -I$(APP_WORK)/src -I$(APP_WORK)/.deps/ps5-opengl/current/include \
-  -I$(APP_WORK)/$(LIBSMB2_DIR)/include
+  -I$(APP_WORK)/$(LIBSMB2_DIR)/include -I$(APP_WORK)/$(LIBNFS_DIR)/include
 host_objs = $(patsubst %.c,$(HOST_OBJ)/%.o,$(patsubst %.cpp,$(HOST_OBJ)/%.o,$(1)))
 
 # libsmb2 for this computer, built as for the PS5 (same config.h), and our
 # SMB layer over it: linked into every test that reaches the NAS over SMB.
 LIBSMB2_HOST := $(APP_WORK)/src/concepts/smb.cpp $(addprefix $(APP_WORK)/$(LIBSMB2_DIR)/,$(LIBSMB2_OURS)) \
   $(addprefix $(APP_WORK)/$(LIBSMB2_DIR)/lib/,$(LIBSMB2_SRCS))
+# libnfs the same way, and our NFS layer over it: linked into every test that
+# reaches the NAS (it uses libsmb2's address lookup, so always with the above).
+LIBNFS_HOST := $(APP_WORK)/src/concepts/nfs.cpp \
+  $(addprefix $(APP_WORK)/$(LIBNFS_DIR)/,$(LIBNFS_SRCS) $(LIBNFS_OURS))
 
 # Our code and the tests with warnings on; the kit's own files without.
 $(HOST_OBJ)/$(APP_WORK)/src/concepts/%.o: $(APP_WORK)/src/concepts/%.cpp | app-work
@@ -308,6 +355,9 @@ $(HOST_OBJ)/%.o: %.cpp | app-work
 $(HOST_OBJ)/$(APP_WORK)/$(LIBSMB2_DIR)/%.o: $(APP_WORK)/$(LIBSMB2_DIR)/%.c | app-work
 	@mkdir -p $(@D)
 	clang-18 -O1 -w -MMD -MP -DHAVE_CONFIG_H $(addprefix -I$(APP_WORK)/,$(LIBSMB2_INCLUDES)) -c $< -o $@
+$(HOST_OBJ)/$(APP_WORK)/$(LIBNFS_DIR)/%.o: $(APP_WORK)/$(LIBNFS_DIR)/%.c | app-work
+	@mkdir -p $(@D)
+	clang-18 -O1 -w -MMD -MP -DHAVE_CONFIG_H $(addprefix -I$(APP_WORK)/,$(LIBNFS_INCLUDES)) -c $< -o $@
 $(HOST_OBJ)/%.o: %.c | app-work
 	@mkdir -p $(@D)
 	clang-18 -O1 -w -MMD -MP -I$(APP_WORK)/src -c $< -o $@
@@ -321,7 +371,7 @@ KIT_DRAWING := $(addprefix $(APP_WORK)/src/,core/save_file.cpp core/input.cpp gf
 # Copying and deleting games, against tests/fake_nas.py (a stand-in WebDAV NAS
 # and ShadowMountPlus API on this computer).
 HOST_TRANSFER := build/host/test_transfer
-TRANSFER_SRCS := tests/test_transfer.cpp $(LIBSMB2_HOST) \
+TRANSFER_SRCS := tests/test_transfer.cpp $(LIBSMB2_HOST) $(LIBNFS_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,transfer.cpp copy_helper.cpp delete_helper.cpp file_calls.cpp smp.cpp \
     json_scan.cpp http.cpp connection.cpp library_cache.cpp notify.cpp storage.cpp nas.cpp \
     nas_probe.cpp) \
@@ -330,7 +380,7 @@ TRANSFER_SRCS := tests/test_transfer.cpp $(LIBSMB2_HOST) \
 # The folder picker's moves and listings (drawing isn't exercised, but the
 # kit's drawing code is linked in so it builds as on the console).
 HOST_PICKER := build/host/test_folder_picker
-PICKER_SRCS := tests/test_folder_picker.cpp $(LIBSMB2_HOST) \
+PICKER_SRCS := tests/test_folder_picker.cpp $(LIBSMB2_HOST) $(LIBNFS_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,folder_picker.cpp http.cpp nas_probe.cpp connection.cpp) \
   $(addprefix $(APP_WORK)/src/,core/save_file.cpp gfx/draw_list.cpp gfx/triangulate.cpp \
     gfx/font.cpp ui/widgets.cpp ui/glyphs.cpp ui/theme.cpp ui/pixel_font.cpp \
@@ -338,21 +388,21 @@ PICKER_SRCS := tests/test_folder_picker.cpp $(LIBSMB2_HOST) \
 
 # The connection test's game count, against what the library finds.
 HOST_COUNT := build/host/test_game_count
-COUNT_SRCS := tests/test_game_count.cpp $(LIBSMB2_HOST) \
+COUNT_SRCS := tests/test_game_count.cpp $(LIBSMB2_HOST) $(LIBNFS_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,nas_probe.cpp http.cpp connection.cpp nas_library.cpp \
     library_cache.cpp exfat.cpp png.cpp nas.cpp) \
   $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
 
 # The Connection screen's lock while a copy needs its settings.
 HOST_LOCK := build/host/test_connection_lock
-LOCK_SRCS := tests/test_connection_lock.cpp $(LIBSMB2_HOST) \
+LOCK_SRCS := tests/test_connection_lock.cpp $(LIBSMB2_HOST) $(LIBNFS_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,connection_page.cpp connection.cpp nas_probe.cpp \
     http.cpp folder_picker.cpp) \
   $(KIT_DRAWING) $(KIT_COMPONENTS)
 
 # The queue panel, driven by pad input over a real queue.
 HOST_QUEUE := build/host/test_queue_panel
-QUEUE_SRCS := tests/test_queue_panel.cpp $(LIBSMB2_HOST) \
+QUEUE_SRCS := tests/test_queue_panel.cpp $(LIBSMB2_HOST) $(LIBNFS_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,queue_panel.cpp transfer.cpp copy_helper.cpp delete_helper.cpp \
     file_calls.cpp smp.cpp json_scan.cpp http.cpp connection.cpp library_cache.cpp notify.cpp \
     storage.cpp app_settings.cpp nas.cpp nas_probe.cpp) \
@@ -367,10 +417,11 @@ HOST_HELPER := build/host/helper
 HOST_COPIER := build/host/copier
 HOST_COPIER_SMB := $(call host_objs,$(addprefix $(APP_WORK)/$(LIBSMB2_DIR)/,$(LIBSMB2_OURS)) \
   $(addprefix $(APP_WORK)/$(LIBSMB2_DIR)/lib/,$(LIBSMB2_SRCS)))
-$(HOST_COPIER): tools/copier/copier.c $(HOST_COPIER_SMB)
+HOST_COPIER_NFS := $(call host_objs,$(addprefix $(APP_WORK)/$(LIBNFS_DIR)/,$(LIBNFS_SRCS) $(LIBNFS_OURS)))
+$(HOST_COPIER): tools/copier/copier.c $(HOST_COPIER_SMB) $(HOST_COPIER_NFS)
 	@mkdir -p $(dir $@)
 	clang-18 -std=c11 -Wall -Wextra -Werror -O1 -D_DEFAULT_SOURCE -DCOPIER_HOST_TEST -pthread \
-	  -I$(APP_WORK)/$(LIBSMB2_DIR)/include -o $@ $^
+	  -I$(APP_WORK)/$(LIBSMB2_DIR)/include -I$(APP_WORK)/$(LIBNFS_DIR)/include -o $@ $^
 $(HOST_HELPER): tools/helper/helper.c
 	@mkdir -p $(@D)
 	clang-18 -std=c11 -Wall -Wextra -Werror -O1 -D_DEFAULT_SOURCE -DHELPER_HOST_TEST -o $@ $<
@@ -383,7 +434,17 @@ SMB_SRCS := tests/test_smb.cpp $(LIBSMB2_HOST) $(APP_WORK)/src/concepts/connecti
 # The library and the copy queue over SMB, against a real Samba server
 # (tests/smb_server.py), through the copy helper as well as in-app.
 HOST_SMB_NAS := build/host/test_smb_nas
-SMB_NAS_SRCS := tests/test_smb_nas.cpp $(LIBSMB2_HOST) \
+SMB_NAS_SRCS := tests/test_smb_nas.cpp $(LIBSMB2_HOST) $(LIBNFS_HOST) \
+  $(addprefix $(APP_WORK)/src/concepts/,nas.cpp nas_library.cpp library_cache.cpp exfat.cpp png.cpp \
+    nas_probe.cpp http.cpp connection.cpp transfer.cpp copy_helper.cpp delete_helper.cpp \
+    file_calls.cpp smp.cpp json_scan.cpp notify.cpp storage.cpp) \
+  $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
+
+# The library, Test connection and the copy queue over NFS, against a real
+# NFS server (tests/nfs_server.py, UNFS3), through the copy helper as well as
+# in-app.
+HOST_NFS_NAS := build/host/test_nfs_nas
+NFS_NAS_SRCS := tests/test_nfs_nas.cpp $(LIBSMB2_HOST) $(LIBNFS_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,nas.cpp nas_library.cpp library_cache.cpp exfat.cpp png.cpp \
     nas_probe.cpp http.cpp connection.cpp transfer.cpp copy_helper.cpp delete_helper.cpp \
     file_calls.cpp smp.cpp json_scan.cpp notify.cpp storage.cpp) \
@@ -401,8 +462,9 @@ $(HOST_QUEUE): $(call host_objs,$(QUEUE_SRCS))
 $(HOST_DELETE): $(call host_objs,$(DELETE_SRCS))
 $(HOST_SMB): $(call host_objs,$(SMB_SRCS))
 $(HOST_SMB_NAS): $(call host_objs,$(SMB_NAS_SRCS))
+$(HOST_NFS_NAS): $(call host_objs,$(NFS_NAS_SRCS))
 $(HOST_TRANSFER) $(HOST_PICKER) $(HOST_COUNT) $(HOST_LOCK) $(HOST_QUEUE) $(HOST_DELETE) $(HOST_SMB) \
-  $(HOST_SMB_NAS):
+  $(HOST_SMB_NAS) $(HOST_NFS_NAS):
 	@mkdir -p $(@D)
 	clang++-18 -o $@ $^ -lpthread
 
@@ -413,7 +475,7 @@ $(HOST_TRANSFER) $(HOST_PICKER) $(HOST_COUNT) $(HOST_LOCK) $(HOST_QUEUE) $(HOST_
 # and work folder each): run-transfer runs all three.
 TRANSFER_PARTS := run-transfer-1 run-transfer-2 run-transfer-3
 HOST_RUNS := run-installer run-release $(TRANSFER_PARTS) run-picker run-count run-lock run-queue run-delete \
-  run-smb run-smb-nas
+  run-smb run-smb-nas run-nfs-nas
 .PHONY: $(HOST_RUNS) run-transfer
 run-installer: selftest $(HOST_INSTALLER)
 	python3 -u tests/test_installer.py
@@ -436,6 +498,8 @@ run-smb: $(HOST_SMB)
 	$(HOST_SMB)
 run-smb-nas: $(HOST_SMB_NAS) $(HOST_COPIER)
 	$(HOST_SMB_NAS) build/host/smb-nas-test $(HOST_COPIER)
+run-nfs-nas: $(HOST_NFS_NAS) $(HOST_COPIER)
+	$(HOST_NFS_NAS) build/host/nfs-nas-test $(HOST_COPIER)
 
 # app-work goes first, in a make of its own: it copies our sources into the
 # kit, and a make that copied them while also building would judge the

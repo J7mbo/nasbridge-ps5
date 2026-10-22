@@ -1,20 +1,23 @@
-// NASBridge - Reading the NAS over WebDAV or SMB, whichever the connection uses.
+// NASBridge - Reading the NAS over WebDAV, SMB or NFS, whichever the connection uses.
 // Copyright (C) 2026 NASBridge contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // The library and the copy queue read the NAS through this, so they don't
 // care which way it's shared. Paths are the same either way: the games folder
 // setting plus what's under it ("/Games/PS5/Game/sce_sys/"); for SMB the first
-// part is the share. Listings come back as DavEntry for both, with a folder's
-// entries' paths decoded from the root.
+// part is the share, for NFS it's the path on the NAS. Listings come back as
+// DavEntry for all of them, with a folder's entries' paths decoded from the
+// root.
 //
 // One NasReader belongs to one thread: over SMB it keeps one sign-in open for
-// all its requests (signing in costs several round trips). Every call blocks.
+// all its requests (signing in costs several round trips), over NFS one
+// connection to the export. Every call blocks.
 
 #pragma once
 
 #include "concepts/connection.hpp"
 #include "concepts/http.hpp"
+#include "concepts/nfs.hpp"
 #include "concepts/smb.hpp"
 #include "concepts/nas_probe.hpp"
 
@@ -33,6 +36,7 @@ struct NasProblem
 {
     HttpReply reply;   // WebDAV: the reply (connected false: it never connected)
     SmbFailure smb;    // SMB: what went wrong
+    NfsFailure nfs;    // NFS: what went wrong
     std::string brief; // a few words for a note: "not found (HTTP 404)", "access denied"
     bool reached = false; // the NAS answered (it refused, rather than couldn't be reached)
 };
@@ -50,6 +54,16 @@ class NasReader
     {
         return connection_.type == ConnectionType::smb;
     }
+    bool nfs() const
+    {
+        return connection_.type == ConnectionType::nfs;
+    }
+    // Whether walk() lists several folders at once (SMB and NFS; WebDAV
+    // lists deeply instead).
+    bool walks() const
+    {
+        return smb() || nfs();
+    }
 
     // A folder's entries ("/Games/PS5/"), without hidden and NAS-internal ones.
     bool list(const std::string &folder, std::vector<DavEntry> *entries,
@@ -60,20 +74,24 @@ class NasReader
     // Exactly `length` bytes at `offset` of a file.
     bool read_range(const std::string &path, std::uint64_t offset, std::size_t length,
                     std::string *out, std::string *why);
-    // SMB only: every folder under `folder`, and it, several listed at once
-    // (SmbSession::walk). `found` gets each folder ("/Games/PS5/Game/sub/")
-    // and its listing, and returns false to stop (false, problem->brief "").
-    bool walk_smb(const std::string &folder,
-                  const std::function<bool(const std::string &folder,
-                                           const std::vector<DavEntry> &entries)> &found,
-                  NasProblem *problem = nullptr);
+    // SMB and NFS only (walks()): every folder under `folder`, and it,
+    // several listed at once (SmbSession::walk, NfsSession::walk). `found`
+    // gets each folder ("/Games/PS5/Game/sub/") and its listing, and returns
+    // false to stop (false, problem->brief "").
+    bool walk(const std::string &folder,
+              const std::function<bool(const std::string &folder,
+                                       const std::vector<DavEntry> &entries)> &found,
+              NasProblem *problem = nullptr);
     // The SMB sign-in itself (SMB only), for streaming a file.
     SmbSession &session();
+    // The NFS connection itself (NFS only).
+    NfsSession &nfs_session();
 
   private:
     Connection connection_;
     int seconds_;
     std::unique_ptr<SmbSession> session_;
+    std::unique_ptr<NfsSession> nfs_session_;
 };
 
 // A games folder listing that failed, in Test connection's words.
@@ -81,5 +99,7 @@ ProbeResult explain_nas_failure(const Connection &connection, const NasProblem &
 
 // SMB entries as a listing of `folder` (the same paths a WebDAV listing has).
 std::vector<DavEntry> smb_as_listing(const std::string &folder, const std::vector<SmbEntry> &entries);
+// NFS entries the same way.
+std::vector<DavEntry> nfs_as_listing(const std::string &folder, const std::vector<NfsEntry> &entries);
 
 } // namespace hui::concepts

@@ -5,6 +5,7 @@
 #include "concepts/folder_picker.hpp"
 
 #include "concepts/http.hpp"
+#include "concepts/nfs.hpp"
 #include "concepts/smb.hpp"
 #include "concepts/nas_probe.hpp"
 
@@ -197,10 +198,40 @@ void *ask_main(void *argument)
                       [](const std::string &a, const std::string &b)
                       { return compare_names(a, b) < 0; });
             answer.listing.ok = true;
+            answer.listing.choosable = ask->path != "/";
         }
         else
         {
             describe_smb_failure(ask->connection, failure, &answer.listing.headline,
+                                 &answer.listing.detail);
+        }
+        std::lock_guard<std::mutex> hold(ask->shared->lock);
+        ask->shared->answers.push_back(std::move(answer));
+        delete ask;
+        return nullptr;
+    }
+    if (ask->connection.type == ConnectionType::nfs)
+    {
+        // Above the exports, the folders leading to them; inside one, its
+        // folders, any of which can be chosen.
+        NfsSession session(ask->connection);
+        std::vector<NfsEntry> entries;
+        std::vector<std::string> exports;
+        NfsFailure failure;
+        if (session.list(ask->path, &entries, &failure) && session.list_exports(&exports, &failure))
+        {
+            for (const NfsEntry &entry : entries)
+                if (entry.folder)
+                    answer.listing.names.push_back(entry.name);
+            std::sort(answer.listing.names.begin(), answer.listing.names.end(),
+                      [](const std::string &a, const std::string &b)
+                      { return compare_names(a, b) < 0; });
+            answer.listing.ok = true;
+            answer.listing.choosable = !nfs_location(exports, ask->path).exported.empty();
+        }
+        else
+        {
+            describe_nfs_failure(ask->connection, failure, &answer.listing.headline,
                                  &answer.listing.detail);
         }
         std::lock_guard<std::mutex> hold(ask->shared->lock);
@@ -453,8 +484,9 @@ FolderPicker::Result FolderPicker::handle(const InputFrame &input, app::Feedback
     }
     if (input.is_pressed(Action::west))
     {
-        // SMB: the top lists shares, and the games folder is inside one.
-        if (!ready || !listing->ok || (connection_.type == ConnectionType::smb && path_ == "/"))
+        // SMB's top lists shares, and the games folder is inside one; NFS's
+        // folders above its exports can't be read either.
+        if (!ready || !listing->ok || !listing->choosable)
         {
             refuse(feedback, -1.0f, 0.0f); // still reading, or it couldn't be read
             return Result::none;
@@ -629,7 +661,8 @@ void FolderPicker::draw(gfx::DrawList &list, std::uint32_t glass, float clock) c
     }
 
     // Under it, what this folder holds. SMB's top holds the NAS's shares,
-    // and isn't a folder that can be chosen.
+    // and isn't a folder that can be chosen (nor are NFS's folders above its
+    // exports).
     const Listing *listing = current();
     const bool shares = connection_.type == ConnectionType::smb && path_ == "/";
     std::string count;
@@ -731,9 +764,10 @@ void FolderPicker::draw(gfx::DrawList &list, std::uint32_t glass, float clock) c
     const ui::Hint hints[] = {{ui::Button::cross, "Open"},
                               {ui::Button::square, "Use this folder"},
                               {ui::Button::circle, path_ == "/" ? "Close" : "Up"}};
-    // Without Square at SMB's top, where a share has to be opened first.
+    // Without Square where a folder can't be chosen (SMB's top, where a share
+    // has to be opened first, and NFS's folders above its exports).
     const ui::Hint top_hints[] = {hints[0], hints[2]};
-    if (shares)
+    if (shares || (listing != nullptr && listing->ok && !listing->choosable))
         ui::draw_hints(list, fonts_, ui::GlyphStyle::dark(), top_hints, 2,
                        kPanel.x + kPanel.w - kPad, true, layout);
     else

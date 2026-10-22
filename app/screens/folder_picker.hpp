@@ -9,7 +9,8 @@
 // only lists folders and only chooses one: Cross opens the focused folder,
 // Square chooses the folder being shown, Circle goes up (and closes at the
 // top). Listings come from the NAS on a worker thread (WebDAV: PROPFIND,
-// Depth 1; SMB: the NAS's shares at the top, then the folders in them), with
+// Depth 1; SMB: the NAS's shares at the top, then the folders in them; NFS:
+// the folders leading to the NAS's exports, then the folders in them), with
 // the connection as it is being edited.
 
 #pragma once
@@ -85,6 +86,9 @@ class FolderPicker
     {
         bool ok = false;
         std::vector<std::string> names;
+        // False for a list to open one of, not a folder to choose: SMB's
+        // shares, and NFS's folders above its exports.
+        bool choosable = true;
         std::string headline; // why it failed
         std::string detail;
     };

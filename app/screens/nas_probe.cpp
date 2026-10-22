@@ -1,10 +1,11 @@
-// NASBridge - "Test connection": one listing from the NAS (WebDAV or SMB), off the UI thread.
+// NASBridge - "Test connection": one listing from the NAS (WebDAV, SMB or NFS), off the UI thread.
 // Copyright (C) 2026 NASBridge contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "concepts/nas_probe.hpp"
 
 #include "concepts/http.hpp"
+#include "concepts/nfs.hpp"
 #include "concepts/smb.hpp"
 
 #include <algorithm>
@@ -150,6 +151,76 @@ ProbeResult probe_smb(const Connection &connection, bool count,
     return result;
 }
 
+// The test over NFS: ask for the exports, then name them (no folder in one
+// yet) or list the games folder, and count the games in it. A test that
+// worked also says whether this PS5 connected from a privileged port, which
+// some exports insist on.
+ProbeResult probe_nfs(const Connection &connection, bool count,
+                      const std::function<bool()> &stop,
+                      const std::function<void(int, int)> &progress)
+{
+    NfsSession session(connection);
+    NfsFailure failure;
+    const auto failed_with = [&](const NfsFailure &why)
+    {
+        ProbeResult result;
+        result.state = State::failed;
+        describe_nfs_failure(connection, why, &result.headline, &result.detail);
+        return result;
+    };
+    const std::string port_note = nfs_privileged_ports()
+                                      ? " NASBridge connected from a privileged port."
+                                      : " NASBridge connected from an ordinary port (above 1023).";
+    std::vector<std::string> exports;
+    if (!session.list_exports(&exports, &failure))
+        return failed_with(failure);
+    const NfsLocation location = nfs_location(exports, folder_path(connection));
+    if (location.exported.empty())
+    {
+        if (connection.folder != "/")
+        {
+            failure.kind = NfsFailure::Kind::no_export;
+            return failed_with(failure);
+        }
+        ProbeResult result;
+        result.state = State::ok;
+        result.headline = "Connected";
+        if (exports.empty())
+        {
+            result.detail = "The NAS answered, but has no NFS exports. Turn on NFS export for the "
+                            "share your games are in.";
+            return result;
+        }
+        std::string names;
+        for (std::size_t i = 0; i < exports.size() && i < 4; ++i)
+            names += (i == 0 ? "" : ", ") + exports[i];
+        if (exports.size() > 4)
+            names += " and " + std::to_string(exports.size() - 4) + " more";
+        result.detail = "Exports: " + names + ". Pick your games folder with the folder button.";
+        return result;
+    }
+    std::vector<NfsEntry> top;
+    if (!session.list(folder_path(connection), &top, &failure))
+        return failed_with(failure);
+    ProbeResult result = describe_entries(connection, listed(top));
+    GameCount games;
+    const Lister list = [&](const std::string &path, std::vector<Listed> *entries)
+    {
+        std::vector<NfsEntry> inside;
+        NfsFailure why;
+        if (!session.list(path, &inside, &why))
+            return false;
+        *entries = listed(inside);
+        return true;
+    };
+    if (count && result.state == State::ok && !top.empty() &&
+        count_in(folder_path(connection), listed(top), list, stop, progress, &games))
+        result.detail = describe_count(connection, games);
+    if (result.state == State::ok)
+        result.detail += port_note;
+    return result;
+}
+
 // The whole test, start to finish, on the worker thread.
 ProbeResult probe(const Connection &connection, bool count,
                   const std::function<bool()> &stop,
@@ -161,6 +232,8 @@ ProbeResult probe(const Connection &connection, bool count,
                       "address is in its network settings, or your router's device list.");
     if (connection.type == ConnectionType::smb)
         return probe_smb(connection, count, stop, progress);
+    if (connection.type == ConnectionType::nfs)
+        return probe_nfs(connection, count, stop, progress);
     const HttpReply reply =
         http_request(connection, "PROPFIND", folder_path(connection),
                      "Depth: 1\r\nContent-Type: application/xml; charset=utf-8\r\n",

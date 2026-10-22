@@ -105,7 +105,8 @@ ConnectionPage::ConnectionPage(const ui::Fonts &fonts) : fonts_(fonts), picker_(
     // In ConnectionType's order: the list's index is the type.
     type_.set_options({{"WebDAV", "Built into most NAS systems"},
                        {"FTP", "Coming later"},
-                       {"SMB", "Also built into most NAS systems"}});
+                       {"SMB", "Also built into most NAS systems"},
+                       {"NFS", "Built into most NAS systems, no sign-in"}});
     std::vector<ui::SelectOption> options = type_.options();
     options[1].disabled = true;
     type_.set_options(std::move(options));
@@ -200,6 +201,10 @@ void ConnectionPage::sync_fields()
     field(kFolder).set_text(connection_.folder == "/" ? "" : connection_.folder);
     field(kUser).set_text(connection_.username);
     field(kPassword).set_text(connection_.password);
+    // NFS has no sign-in: the fields stay, unused, so the screen keeps its shape.
+    const bool nfs = connection_.type == ConnectionType::nfs;
+    field(kUser).set_helper(nfs ? "Not used: NFS has no sign-in" : "Leave empty if your NAS doesn't ask");
+    field(kPassword).set_helper(nfs ? "Not used: NFS has no sign-in" : "Kept only on this PS5");
     char port[16];
     std::snprintf(port, sizeof(port), "%d", connection_.default_port());
     field(kPort).set_placeholder(port);
@@ -257,9 +262,10 @@ bool ConnectionPage::handle(const InputFrame &input, app::Feedback &feedback)
         move(input.nav, input, feedback);
     if (input.is_pressed(Action::confirm))
     {
-        if (locked() && focus_ != kTest)
+        if ((locked() && focus_ != kTest) || unused(focus_))
         {
-            // A copy needs these settings as they are: say so, change nothing.
+            // A copy needs these settings as they are, or NFS doesn't use
+            // this one: say so, change nothing.
             feedback.play(audio::Cue::error);
             refusal_.trigger();
             return true;
@@ -444,7 +450,7 @@ void ConnectionPage::update(float dt)
     for (int i = kHost; i <= kPassword; ++i)
     {
         fields_[i].set_active(focus_ == i && !editing);
-        fields_[i].set_disabled(locked());
+        fields_[i].set_disabled(locked() || unused(i));
         fields_[i].update(dt);
     }
     type_.update(dt);
@@ -517,6 +523,7 @@ void ConnectionPage::draw(gfx::DrawList &list, std::uint32_t glass, float clock,
     const ui::Hint hints[] = {{ui::Button::dpad, "Move"},
                               {ui::Button::cross, focus_ == kTest     ? "Test"
                                                   : locked()          ? "Locked"
+                                                  : unused(focus_)    ? "Not used"
                                                   : focus_ == kType   ? "Choose"
                                                   : focus_ == kBrowse ? "Browse"
                                                                       : "Edit"},
@@ -560,6 +567,10 @@ void ConnectionPage::draw_panel(gfx::DrawList &list, ui::Painter &paint,
         connection_.type == ConnectionType::smb
             ? "Turn on SMB in your NAS's settings, then enter the NAS's "
               "address and sign-in here, and pick the games folder: its first part is the share. "
+              "NASBridge only reads from your NAS: NASBridge never changes or deletes anything there."
+        : connection_.type == ConnectionType::nfs
+            ? "Turn on NFS in your NAS's settings and export the games share to this PS5, then "
+              "enter the NAS's address here and pick the games folder (Unraid: /mnt/user/...). "
               "NASBridge only reads from your NAS: NASBridge never changes or deletes anything there."
             : "Turn on WebDAV in your NAS's settings, then enter the NAS's address here. "
               "Synology's WebDAV Server uses port 5005. NASBridge only reads from your NAS: "
