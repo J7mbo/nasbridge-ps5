@@ -1140,7 +1140,8 @@ class Copier
             if (result != Result::fallback)
                 return result;
         }
-        const int fd = ::open(local.c_str(), O_RDWR | O_CREAT, 0666);
+        // With the execute bit: a game whose files lack it won't start (issue #4).
+        const int fd = ::open(local.c_str(), O_RDWR | O_CREAT, 0777);
         if (fd < 0)
         {
             *why = errno_text("Couldn't create a file on the drive", errno);
@@ -1920,7 +1921,7 @@ class Copier
         pieces.before = before;
         pieces.done.assign(static_cast<std::size_t>((size + kPiece - 1) / kPiece), 0);
         pieces.claimed.assign(pieces.done.size(), 0);
-        pieces.fd = ::open(part.c_str(), O_RDWR | O_CREAT, 0666);
+        pieces.fd = ::open(part.c_str(), O_RDWR | O_CREAT, 0777);
         if (pieces.fd < 0)
         {
             *why = errno_text("Couldn't create a file on the drive", errno);

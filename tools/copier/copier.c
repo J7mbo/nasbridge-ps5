@@ -96,6 +96,10 @@
 #define MAX_REQUEST (64 * 1024)
 #define MAX_FILE 2048
 #define MAX_SIGN_IN 4096
+/* Game files are open to every user, as an FTP copy or the installer leaves
+ * them: a game whose files lack the execute bit shows "Can't Start Game"
+ * (issue #4), and NASBridge, as another user, moves and deletes them later. */
+#define FILE_MODE 0777
 #define PROTO_SMB "NBS1"
 #define SMB_READ (1u << 20) /* one SMB read (the NAS may allow less) */
 #define SMB_IN_FLIGHT 8     /* SMB reads asked for before the first answers */
@@ -1293,13 +1297,13 @@ static void run_smb_job(job_t *j, char *line) {
   in.user = sign[2];
   in.domain = sign[3];
   in.password = sign[4];
-  j->fd = open(path, O_RDWR | O_CREAT, 0666);
+  j->fd = open(path, O_RDWR | O_CREAT, FILE_MODE);
   if (j->fd < 0) {
     send_line(j->ctl, "ERR file %s", strerror(errno));
     free(bytes);
     return;
   }
-  (void)fchmod(j->fd, 0666); /* NASBridge moves and deletes it later */
+  (void)fchmod(j->fd, FILE_MODE); /* open's mode is reduced by the umask */
   if ((err = resume_point(j)) != 0) {
     send_line(j->ctl, "ERR file %s", strerror(err));
   } else {
@@ -1451,9 +1455,9 @@ static int write_all(int fd, const char *p, size_t len) {
 static int batch_one(batch_t *b, int w, const bfile_t *f, char *buf, char *head) {
   char value[64], why[200];
   int fd, tries;
-  fd = open(f->path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  fd = open(f->path, O_WRONLY | O_CREAT | O_TRUNC, FILE_MODE);
   if (fd < 0) return batch_fail(b, f->index, "file", strerror(errno));
-  (void)fchmod(fd, 0666); /* NASBridge moves and deletes it later */
+  (void)fchmod(fd, FILE_MODE); /* open's mode is reduced by the umask */
   if (f->size == 0) goto done;
   for (tries = 0;; ++tries) {
     size_t hlen, body_at;
@@ -1588,9 +1592,9 @@ static void smb_drop(batch_t *b, int w) {
 static int batch_one_smb(batch_t *b, int w, const bfile_t *f, char *buf) {
   char why[200];
   int fd, tries;
-  fd = open(f->path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+  fd = open(f->path, O_WRONLY | O_CREAT | O_TRUNC, FILE_MODE);
   if (fd < 0) return batch_fail(b, f->index, "file", strerror(errno));
-  (void)fchmod(fd, 0666); /* NASBridge moves and deletes it later */
+  (void)fchmod(fd, FILE_MODE); /* open's mode is reduced by the umask */
   if (f->size == 0) goto done;
   for (tries = 0;; ++tries) {
     struct smb2_context *smb2 = b->smb2[w];
@@ -2041,12 +2045,12 @@ static void run_job(int ctl) {
   j.request = request;
   j.reqlen = reqlen;
 
-  j.fd = open(path, O_RDWR | O_CREAT, 0666);
+  j.fd = open(path, O_RDWR | O_CREAT, FILE_MODE);
   if (j.fd < 0) {
     send_line(ctl, "ERR file %s", strerror(errno));
     goto out;
   }
-  (void)fchmod(j.fd, 0666); /* NASBridge moves and deletes it later */
+  (void)fchmod(j.fd, FILE_MODE); /* open's mode is reduced by the umask */
   if ((err = resume_point(&j)) != 0) {
     send_line(ctl, "ERR file %s", strerror(err));
     goto out;
