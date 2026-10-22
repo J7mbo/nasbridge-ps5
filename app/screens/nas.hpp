@@ -1,12 +1,13 @@
-// NASBridge - Reading the NAS over WebDAV or SMB, whichever the connection uses.
+// NASBridge - Reading the NAS over WebDAV or SMB, or a USB drive, whichever the connection uses.
 // Copyright (C) 2026 NASBridge contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // The library and the copy queue read the NAS through this, so they don't
 // care which way it's shared. Paths are the same either way: the games folder
 // setting plus what's under it ("/Games/PS5/Game/sce_sys/"); for SMB the first
-// part is the share. Listings come back as DavEntry for both, with a folder's
-// entries' paths decoded from the root.
+// part is the share, and for a drive it's the full path ("/mnt/usb0/Games/").
+// Listings come back as DavEntry for all of them, with a folder's entries'
+// paths decoded from the root.
 //
 // One NasReader belongs to one thread: over SMB it keeps one sign-in open for
 // all its requests (signing in costs several round trips). Every call blocks.
@@ -33,6 +34,7 @@ struct NasProblem
 {
     HttpReply reply;   // WebDAV: the reply (connected false: it never connected)
     SmbFailure smb;    // SMB: what went wrong
+    int drive_error = 0; // a USB drive: errno
     std::string brief; // a few words for a note: "not found (HTTP 404)", "access denied"
     bool reached = false; // the NAS answered (it refused, rather than couldn't be reached)
 };
@@ -50,6 +52,15 @@ class NasReader
     {
         return connection_.type == ConnectionType::smb;
     }
+    bool drive() const
+    {
+        return connection_.on_drive();
+    }
+    // WebDAV: deep listings, ranges and the rest of HTTP.
+    bool webdav() const
+    {
+        return !smb() && !drive();
+    }
 
     // A folder's entries ("/Games/PS5/"), without hidden and NAS-internal ones.
     bool list(const std::string &folder, std::vector<DavEntry> *entries,
@@ -60,10 +71,11 @@ class NasReader
     // Exactly `length` bytes at `offset` of a file.
     bool read_range(const std::string &path, std::uint64_t offset, std::size_t length,
                     std::string *out, std::string *why);
-    // SMB only: every folder under `folder`, and it, several listed at once
-    // (SmbSession::walk). `found` gets each folder ("/Games/PS5/Game/sub/")
-    // and its listing, and returns false to stop (false, problem->brief "").
-    bool walk_smb(const std::string &folder,
+    // SMB and drives (not WebDAV): every folder under `folder`, and it; over
+    // SMB several listed at once (SmbSession::walk). `found` gets each folder
+    // ("/Games/PS5/Game/sub/") and its listing, and returns false to stop
+    // (false, problem->brief "").
+    bool walk(const std::string &folder,
                   const std::function<bool(const std::string &folder,
                                            const std::vector<DavEntry> &entries)> &found,
                   NasProblem *problem = nullptr);

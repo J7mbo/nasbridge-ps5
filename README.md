@@ -12,7 +12,8 @@ A native PS5 homebrew app to browse and install games from your NAS.
 
 ## What it does
 
-- **Browses your NAS over WebDAV or SMB**. Your games show up as a library with 
+- **Browses your NAS over WebDAV or SMB, or a USB drive plugged into the
+  PS5**. Your games show up as a library with 
   their names, covers and
   sizes, read from each game's `sce_sys` folder. Game folders are found up to
   four folders down, and `.exfat` images are read without downloading them.
@@ -51,6 +52,10 @@ A native PS5 homebrew app to browse and install games from your NAS.
     Unraid, a share set to Public (guest) is refused. Set the games share to
     Private, add a user for NASBridge under Users, and give it Read-only
     access to the share.
+- Or a **USB drive** plugged into the PS5, with your games on it: choose
+  **USB drive** as the connection type and pick the folder with the folder
+  button. Games are copied from it to another drive (usually the PS5's
+  internal storage).
 - Only to build it yourself: a Mac or Linux machine with Docker (Docker
   Desktop or OrbStack) and `make`.
 
@@ -121,6 +126,14 @@ Your NAS's games folder can hold:
 | An `.exfat` image, on its own or in a folder | `Games/Astro Bot.exfat` |
 
 NASBridge only reads from your NAS. It never changes or deletes anything there.
+
+**From a USB drive**, one thing is different. When ShadowMountPlus already
+runs a game from the drive, it keeps using the drive's copy while the drive
+is plugged in, even after the game is copied to the PS5. So once it's copied,
+NASBridge renames the drive's copy to start with a dot (`.Astro Bot`), which
+ShadowMountPlus skips, and the PS5 copy is used. When you delete the PS5 copy
+from NASBridge, the drive copy gets its name back, at once or the next time
+the drive is plugged in. Nothing on the drive is ever deleted.
 
 ## Good to know
 

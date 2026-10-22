@@ -26,6 +26,7 @@
 #include "concepts/concepts.hpp"
 #include "concepts/app_settings.hpp"
 #include "concepts/connection_page.hpp"
+#include "concepts/drive.hpp"
 #include "concepts/settings_page.hpp"
 #include "concepts/keep_awake.hpp"
 #include "concepts/library_cache.hpp"
@@ -1129,8 +1130,12 @@ class Library final : public app::Concept
     {
         if (confirm_.is_open())
         {
-            if (confirm_.handle(input, feedback) == ui::Event::activated && confirm_.choice() == 1)
+            if (confirm_.handle(input, feedback) == ui::Event::activated && confirm_.choice() >= 1)
+            {
+                if (confirm_.choice() == 2)
+                    set_hidden_warning_off(true); // "Delete, don't warn again"
                 confirmed(feedback);
+            }
             return;
         }
         if (places_.is_open())
@@ -1221,15 +1226,27 @@ class Library final : public app::Concept
                removal_.entry == game.source.entry;
     }
 
-    // The game ShadowMountPlus has for this one (by title ID), if any.
+    // The game ShadowMountPlus has for this one (by title ID), if any. From a
+    // USB drive, ShadowMountPlus may list the drive's own copy: that's the
+    // source, not a copy on the PS5 (and deleting it would delete the source).
     const SmpGame *ps5_game(const Game &game) const
     {
         if (game.title_id.empty())
             return nullptr;
         for (const SmpGame &smp : space_.games)
-            if (smp.title_id == game.title_id)
+            if (smp.title_id == game.title_id && !on_source_drive(smp.path))
                 return &smp;
         return nullptr;
+    }
+
+    // Whether `path` is on the USB drive the games are read from.
+    bool on_source_drive(const std::string &path) const
+    {
+        const Connection &source = connection_.connection();
+        if (!source.on_drive())
+            return false;
+        const std::string root = drive_root_of(source.folder);
+        return !root.empty() && drive_root_of(path) == root;
     }
 
     // "On PS5" comes from ShadowMountPlus's list, once it has answered.
@@ -1338,6 +1355,9 @@ class Library final : public app::Concept
         case CopyCheck::not_writable:
             label = "Can't write here";
             break;
+        case CopyCheck::source_drive:
+            label = "Pick another drive";
+            break;
         case CopyCheck::checking:
             label = "Checking drive...";
             break;
@@ -1443,8 +1463,24 @@ class Library final : public app::Concept
                                           : "the PS5";
             content.title = "Delete " + game.title + " from the PS5?";
             content.body = "The game will be removed from the home screen and its files deleted from " +
-                           where + ". The copy on your NAS isn't touched.";
+                           where + ". The copy on your " +
+                           (connection_.connection().on_drive() ? "USB drive" : "NAS") +
+                           " isn't touched.";
             content.buttons = {{"Cancel"}, {"Delete", ui::ButtonKind::primary, true}};
+            // A copy NASBridge hid on a USB drive that isn't plugged in now:
+            // it can't be renamed back yet.
+            HiddenCopy hidden;
+            std::string where_now;
+            if (!hidden_warning_off() && hidden_copy(game.title_id, &hidden) &&
+                !find_hidden_copy(hidden, &where_now))
+            {
+                content.body += "\nIts copy on " + drive_name(drive_root_of(hidden.path)) +
+                                " is hidden from ShadowMountPlus. Plug that drive in and NASBridge "
+                                "unhides it, or remove the dot from \"" +
+                                hidden.hidden.substr(hidden.hidden.rfind('/') + 1) +
+                                "\" yourself.";
+                content.buttons.push_back({"Delete, don't warn again", ui::ButtonKind::secondary, true});
+            }
         }
         confirm_.open(std::move(content), feedback);
     }
@@ -1494,14 +1530,17 @@ class Library final : public app::Concept
         {
             ui::SelectOption option(destination_name(place.path));
             char line[160];
-            if (place.writable == 0)
+            const bool source = on_source_drive(place.path);
+            if (source)
+                std::snprintf(line, sizeof(line), "The games are read from this drive");
+            else if (place.writable == 0)
                 std::snprintf(line, sizeof(line), "NASBridge can't write here (%s)",
                               place.why.c_str());
             else
                 std::snprintf(line, sizeof(line), "%.1f GB free  ·  %s",
                               static_cast<double>(place.free) / 1e9, place.path.c_str());
             option.description = line;
-            option.disabled = place.writable == 0;
+            option.disabled = place.writable == 0 || source;
             if (place.path == destination_)
                 current = static_cast<int>(options.size());
             options.push_back(option);
@@ -1534,6 +1573,7 @@ class Library final : public app::Concept
         space_unknown, // the PS5 didn't say how much is free
         unavailable,   // the chosen drive isn't connected
         not_writable,  // NASBridge can't write there
+        source_drive,  // the USB drive the games are read from
         checking,      // NASBridge is still checking it can write there
     };
 
@@ -1542,6 +1582,8 @@ class Library final : public app::Concept
         if (!space_.asked)
             return CopyCheck::space_unknown;
         std::uint64_t free = 0;
+        if (on_source_drive(destination_))
+            return CopyCheck::source_drive;
         if (const Destination *place = destination())
         {
             if (place->writable == 0)
@@ -1697,7 +1739,11 @@ class Library final : public app::Concept
         // The server, with the last test's result as a dot (none: untested).
         const Connection &nas = connection_.connection();
         const std::string server =
-            nas.configured() ? ui::fit_label(paint, nas.host, 21.0f, 260.0f) : "Set up NAS";
+            nas.configured() ? ui::fit_label(paint,
+                                             nas.on_drive() ? drive_name(drive_root_of(nas.folder))
+                                                            : nas.host,
+                                             21.0f, 260.0f)
+                             : "Set up NAS";
         const ProbeResult::State tested = connection_.test_result().state;
         const Color dot = tested == ProbeResult::State::ok       ? theme.success
                           : tested == ProbeResult::State::failed ? theme.danger
@@ -2095,6 +2141,10 @@ class Library final : public app::Concept
             case CopyCheck::checking:
                 std::snprintf(free_text, sizeof(free_text),
                               "%.1f GB free  \u00b7  checking the drive", free_gb);
+                break;
+            case CopyCheck::source_drive:
+                std::snprintf(free_text, sizeof(free_text), "The games are read from this drive");
+                text_ink = theme.danger;
                 break;
             }
             text = free_text;

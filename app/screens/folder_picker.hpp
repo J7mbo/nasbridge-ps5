@@ -9,8 +9,9 @@
 // only lists folders and only chooses one: Cross opens the focused folder,
 // Square chooses the folder being shown, Circle goes up (and closes at the
 // top). Listings come from the NAS on a worker thread (WebDAV: PROPFIND,
-// Depth 1; SMB: the NAS's shares at the top, then the folders in them), with
-// the connection as it is being edited.
+// Depth 1; SMB: the NAS's shares at the top, then the folders in them; a
+// USB drive: the drives plugged in, then their folders), with the connection
+// as it is being edited.
 
 #pragma once
 
@@ -99,7 +100,10 @@ class FolderPicker
     const Listing *current() const;
     void draw_rows(gfx::DrawList &list, ui::Painter &paint, const std::vector<std::string> &rows,
                    int focus, float scroll, float alpha, float dx, bool live,
-                   const gfx::Rect &area) const;
+                   const gfx::Rect &area, bool drives) const;
+    // Whether the top level holds places to open, not folders to choose
+    // (SMB's shares, the drives).
+    bool top_only() const;
 
     const ui::Fonts &fonts_;
     Connection connection_;

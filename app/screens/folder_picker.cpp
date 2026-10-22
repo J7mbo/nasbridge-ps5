@@ -4,6 +4,7 @@
 
 #include "concepts/folder_picker.hpp"
 
+#include "concepts/drive.hpp"
 #include "concepts/http.hpp"
 #include "concepts/smb.hpp"
 #include "concepts/nas_probe.hpp"
@@ -182,6 +183,46 @@ void *ask_main(void *argument)
 #endif
     FolderPicker::Shared::Answer answer;
     answer.path = ask->path;
+    if (ask->connection.on_drive())
+    {
+        // At "/", the drives plugged in (usb0, ext0, ...); below, their folders.
+        if (ask->path == "/")
+        {
+            for (const std::string &root : drive_roots_present())
+                answer.listing.names.push_back(root.substr(5)); // "/mnt/usb0" -> "usb0"
+            answer.listing.ok = !answer.listing.names.empty();
+            if (!answer.listing.ok)
+            {
+                answer.listing.headline = "No USB drive found";
+                answer.listing.detail = "Plug the drive with your games into the PS5.";
+            }
+        }
+        else
+        {
+            std::vector<DavEntry> entries;
+            int error = 0;
+            const std::string folder = "/mnt" + ask->path;
+            if (drive_list(folder, &entries, &error))
+            {
+                for (const DavEntry &entry : entries)
+                    if (entry.folder)
+                        answer.listing.names.push_back(entry.name);
+                std::sort(answer.listing.names.begin(), answer.listing.names.end(),
+                          [](const std::string &a, const std::string &b)
+                          { return compare_names(a, b) < 0; });
+                answer.listing.ok = true;
+            }
+            else
+            {
+                answer.listing.headline = "Couldn't open this folder";
+                answer.listing.detail = "It says: " + drive_error_brief(folder, error) + ".";
+            }
+        }
+        std::lock_guard<std::mutex> hold(ask->shared->lock);
+        ask->shared->answers.push_back(std::move(answer));
+        delete ask;
+        return nullptr;
+    }
     if (ask->connection.type == ConnectionType::smb)
     {
         // At "/", the NAS's shares; below, the folders in them.
@@ -281,7 +322,11 @@ void FolderPicker::open(const Connection &connection, const std::string &start,
     }
     open_ = true;
     chosen_.clear();
-    start_ = as_folder(start);
+    // A drive's folders are shown under the drives, without /mnt.
+    std::string begin = start;
+    if (connection.on_drive())
+        begin = begin.rfind("/mnt/", 0) == 0 ? begin.substr(4) : "/";
+    start_ = as_folder(begin);
     path_ = old_path_ = start_;
     out_rows_.clear();
     focus_ = 0;
@@ -416,7 +461,7 @@ void FolderPicker::step(int delta, bool repeat, app::Feedback &feedback)
 
 std::vector<std::string> FolderPicker::segments(const std::string &path) const
 {
-    std::vector<std::string> parts{connection_.host};
+    std::vector<std::string> parts{connection_.on_drive() ? std::string("Drives") : connection_.host};
     std::size_t at = 1;
     while (at < path.size())
     {
@@ -453,13 +498,16 @@ FolderPicker::Result FolderPicker::handle(const InputFrame &input, app::Feedback
     }
     if (input.is_pressed(Action::west))
     {
-        // SMB: the top lists shares, and the games folder is inside one.
-        if (!ready || !listing->ok || (connection_.type == ConnectionType::smb && path_ == "/"))
+        // SMB: the top lists shares, and the games folder is inside one (a
+        // drive's top: the drives).
+        if (!ready || !listing->ok || (top_only() && path_ == "/"))
         {
             refuse(feedback, -1.0f, 0.0f); // still reading, or it couldn't be read
             return Result::none;
         }
         chosen_ = path_.size() > 1 ? path_.substr(0, path_.size() - 1) : "/";
+        if (connection_.on_drive())
+            chosen_ = "/mnt" + chosen_;
         open_ = false; // silently: the folder shows in its field
         return Result::chosen;
     }
@@ -494,6 +542,11 @@ FolderPicker::Result FolderPicker::handle(const InputFrame &input, app::Feedback
     return Result::none;
 }
 
+bool FolderPicker::top_only() const
+{
+    return connection_.type == ConnectionType::smb || connection_.on_drive();
+}
+
 void FolderPicker::update(float dt)
 {
     age_ += dt;
@@ -513,7 +566,8 @@ void FolderPicker::update(float dt)
 
 void FolderPicker::draw_rows(gfx::DrawList &list, ui::Painter &paint,
                              const std::vector<std::string> &rows, int focus, float scroll,
-                             float alpha, float dx, bool live, const Rect &area) const
+                             float alpha, float dx, bool live, const Rect &area,
+                             bool drives) const
 {
     if (alpha <= 0.01f || rows.empty())
         return;
@@ -552,7 +606,9 @@ void FolderPicker::draw_rows(gfx::DrawList &list, ui::Painter &paint,
             list.rounded_rect({area.x + 14.0f, y + kRowH - 0.5f, area.w - 28.0f, 1.0f}, 0.0f,
                               kWhite.with_alpha(0.045f));
         draw_folder(list, area.x + kIconX, cy, 30.0f);
-        paint.body(ui::fit_label(paint, rows[i], kNameSize, area.w - kNameX - 60.0f),
+        // The drives by name ("USB drive 1"), not by mount ("usb0").
+        const std::string label = drives ? drive_name("/mnt/" + rows[i]) : rows[i];
+        paint.body(ui::fit_label(paint, label, kNameSize, area.w - kNameX - 60.0f),
                    area.x + kNameX, cy + kNameSize * 0.35f, kNameSize,
                    theme.text.with_alpha(focused ? 1.0f : 0.84f));
         // Every row is a folder that opens.
@@ -632,11 +688,15 @@ void FolderPicker::draw(gfx::DrawList &list, std::uint32_t glass, float clock) c
     // and isn't a folder that can be chosen.
     const Listing *listing = current();
     const bool shares = connection_.type == ConnectionType::smb && path_ == "/";
+    const bool drives = connection_.on_drive() && path_ == "/";
     std::string count;
     if (listing == nullptr)
         count = "Reading...";
     else if (!listing->ok)
-        count = "Couldn't be read";
+        count = drives ? "No drives" : "Couldn't be read";
+    else if (drives)
+        count = std::to_string(listing->names.size()) +
+                (listing->names.size() == 1 ? " drive" : " drives");
     else if (shares)
         count = std::to_string(listing->names.size()) +
                 (listing->names.size() == 1 ? " share" : " shares");
@@ -655,12 +715,13 @@ void FolderPicker::draw(gfx::DrawList &list, std::uint32_t glass, float clock) c
     {
         const float leave = tween::clamp01(slide_ * 1.8f);
         draw_rows(list, paint, out_rows_, out_focus_, out_scroll_, 1.0f - tween::smoothstep(leave),
-                  -way * 220.0f * tween::cubic_in(leave), false, area);
+                  -way * 220.0f * tween::cubic_in(leave), false, area,
+                  connection_.on_drive() && old_path_ == "/");
     }
     const float enter_dx = way * 240.0f * (1.0f - tween::quint_out(arrive_));
     if (listing != nullptr && listing->ok)
         draw_rows(list, paint, listing->names, focus_, scroll_.offset(),
-                  tween::smoothstep(arrive_), enter_dx, true, area);
+                  tween::smoothstep(arrive_), enter_dx, true, area, drives);
     list.pop_clip();
 
     // States, not blanks: reading, empty, or why it can't be read.
@@ -720,7 +781,9 @@ void FolderPicker::draw(gfx::DrawList &list, std::uint32_t glass, float clock) c
     const float foot = kPanel.y + kPanel.h - 92.0f;
     list.rounded_rect({kPanel.x + 24.0f, foot - 34.0f, kPanel.w - 48.0f, 1.0f}, 0.0f,
                       kWhite.with_alpha(0.1f));
-    const std::string here = path_.size() > 1 ? path_.substr(0, path_.size() - 1) : "/";
+    std::string here = path_.size() > 1 ? path_.substr(0, path_.size() - 1) : "/";
+    if (connection_.on_drive())
+        here = path_ == "/" ? "Choose a drive" : "/mnt" + here;
     paint.body("Folder", x, foot, 19, theme.text_muted);
     paint.body(ui::fit_label(paint, here, 23.0f, w - 90.0f), x + 90.0f, foot, 23, theme.text);
     ui::HintLayout layout;
@@ -731,9 +794,10 @@ void FolderPicker::draw(gfx::DrawList &list, std::uint32_t glass, float clock) c
     const ui::Hint hints[] = {{ui::Button::cross, "Open"},
                               {ui::Button::square, "Use this folder"},
                               {ui::Button::circle, path_ == "/" ? "Close" : "Up"}};
-    // Without Square at SMB's top, where a share has to be opened first.
+    // Without Square at SMB's top, where a share has to be opened first (a
+    // drive's top: a drive).
     const ui::Hint top_hints[] = {hints[0], hints[2]};
-    if (shares)
+    if (shares || drives)
         ui::draw_hints(list, fonts_, ui::GlyphStyle::dark(), top_hints, 2,
                        kPanel.x + kPanel.w - kPad, true, layout);
     else

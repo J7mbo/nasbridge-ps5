@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Where the NAS is and how to sign in: connection type (a dropdown: WebDAV,
-// or SMB while it's being built), server address, port, folder, user name
-// and password. Each text
+// SMB, or a USB drive plugged into the PS5), server address, port, folder,
+// user name and password (a drive: only the folder). Each text
 // opens the kit's on-screen keyboard (InputPrompt); the folder can also be
 // picked by browsing the NAS (the button beside it, folder_picker.cpp).
 // Every change is saved at once. "Test connection" asks the NAS for the folder's contents in the
@@ -96,6 +96,8 @@ class ConnectionPage
     void store();
     void test(app::Feedback &feedback);
     void browse(app::Feedback &feedback);
+    // Whether a field is on the screen (a drive has only the folder).
+    bool shown(Item item) const;
     ui::TextField &field(Item item);
     const ui::TextField &field(Item item) const;
     void draw_panel(gfx::DrawList &list, ui::Painter &paint, std::uint32_t glass,

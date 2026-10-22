@@ -48,6 +48,8 @@ ProbeResult interpret_response(const Connection &connection, int status,
                                const std::string &header, const std::string &body);
 // What a failed connect or read means (an errno value).
 ProbeResult interpret_socket_error(const Connection &connection, int error, bool connecting);
+// What a failed listing or read of a USB drive means (an errno value).
+ProbeResult explain_drive_failure(const Connection &connection, int error);
 
 // How many games the games folder holds, found the way the library finds
 // them: each folder is a game folder when it has an sce_sys (up to four

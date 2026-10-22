@@ -43,6 +43,12 @@
  * and the replies are as above (no "S" line). The file comes over <streams>
  * sign-ins (1 when left out), each fetching the next CHUNK in turn as over
  * HTTP, with several reads in flight (SMB_IN_FLIGHT) for each chunk.
+ *
+ * From a drive plugged into the PS5 (a USB drive as the source):
+ *   NASBridge -> "NBF1\t<size>\t<file>\t<source length>\t<streams>\n"
+ *                then the source's path ("/mnt/usb0/Games/X/eboot.bin")
+ * and the replies are as above (no "S" line); <streams> readers each take the
+ * next CHUNK in turn. ERR local <why>: the source couldn't be opened or read.
  */
 
 #include <arpa/inet.h>
@@ -101,6 +107,7 @@
  * (issue #4), and NASBridge, as another user, moves and deletes them later. */
 #define FILE_MODE 0777
 #define PROTO_SMB "NBS1"
+#define PROTO_LOCAL "NBF1"
 #define SMB_READ (1u << 20) /* one SMB read (the NAS may allow less) */
 #define SMB_IN_FLIGHT 8     /* SMB reads asked for before the first answers */
 #define UNKNOWN_LEN UINT64_MAX
@@ -326,6 +333,7 @@ typedef struct job {
   uint64_t unsynced;
   int active;         /* connections bringing data in now */
   int nas[MAX_STREAMS]; /* their sockets, to cut them off on a stop (-1: none) */
+  int src;            /* NBF1: the file on the drive it's read from (-1: none) */
 } job_t;
 
 /* Writes len bytes at the file's next position, flushing every SYNC_MS or
@@ -408,7 +416,7 @@ typedef struct single {
   int full[NBUF], full_head, full_n; /* filled, in order */
   int free_[NBUF], free_head, free_n;
   int reader_done, writer_done;
-  int read_err; /* 0, 1 drop, 2 timeout */
+  int read_err; /* 0, 1 drop, 2 timeout, 3 local (the drive), 4 changed */
   char read_why[160];
 } single_t;
 
@@ -478,6 +486,59 @@ static void *single_reader(void *arg) {
     }
     pthread_cond_broadcast(&j->cv);
     pthread_mutex_unlock(&j->mu);
+  }
+  pthread_mutex_lock(&j->mu);
+  s->reader_done = 1;
+  j->active = 0;
+  pthread_cond_broadcast(&j->cv);
+  pthread_mutex_unlock(&j->mu);
+  return NULL;
+}
+
+/* From a drive (NBF1): fills buffers from the source file, as single_reader
+ * does from the network. */
+static void *local_reader(void *arg) {
+  single_t *s = arg;
+  job_t *j = s->j;
+  while (s->received < s->expected) {
+    int idx;
+    size_t len = 0, want;
+    pthread_mutex_lock(&j->mu);
+    while (s->free_n == 0 && !j->abort) pthread_cond_wait(&j->cv, &j->mu);
+    if (j->abort) {
+      pthread_mutex_unlock(&j->mu);
+      break;
+    }
+    idx = pop(s->free_, &s->free_head, &s->free_n);
+    pthread_mutex_unlock(&j->mu);
+    want = s->expected - s->received < BUF_SIZE ? (size_t)(s->expected - s->received) : BUF_SIZE;
+    while (len < want) {
+      ssize_t n = pread(j->src, s->buf[idx] + len, want - len, (off_t)(j->start + s->received + len));
+      if (n > 0) {
+        len += (size_t)n;
+        continue;
+      }
+      if (n < 0 && errno == EINTR) continue;
+      if (n == 0) {
+        s->read_err = 4;
+        snprintf(s->read_why, sizeof s->read_why, "the file on the drive is shorter now");
+      } else {
+        s->read_err = 3;
+        snprintf(s->read_why, sizeof s->read_why, "%s", strerror(errno));
+      }
+      break;
+    }
+    s->received += len;
+    pthread_mutex_lock(&j->mu);
+    if (len > 0) {
+      s->len[idx] = len;
+      push(s->full, &s->full_head, &s->full_n, idx);
+    } else {
+      push(s->free_, &s->free_head, &s->free_n, idx);
+    }
+    pthread_cond_broadcast(&j->cv);
+    pthread_mutex_unlock(&j->mu);
+    if (s->read_err) break;
   }
   pthread_mutex_lock(&j->mu);
   s->reader_done = 1;
@@ -565,7 +626,12 @@ static void single_pump(job_t *j, single_t *s, void *(*reader_main)(void *)) {
   else if (j->abort)
     send_line(j->ctl, "STOPPED");
   else if (s->read_err)
-    send_line(j->ctl, "ERR %s %s", s->read_err == 2 ? "timeout" : "drop", s->read_why);
+    send_line(j->ctl, "ERR %s %s",
+              s->read_err == 2   ? "timeout"
+              : s->read_err == 3 ? "local"
+              : s->read_err == 4 ? "changed"
+                                 : "drop",
+              s->read_why);
   else if (j->start + j->written == j->size)
     send_line(j->ctl, "OK");
   else
@@ -671,7 +737,7 @@ typedef struct multi {
   int nready;
   int fetchers_left, writer_done;
   int no_ranges;  /* the NAS answered a range with the whole file */
-  int net_err;    /* 1 drop, 2 timeout, 3 http, 4 changed, 7 smb (refused) */
+  int net_err;    /* 1 drop, 2 timeout, 3 http, 4 changed, 7 smb (refused), 8 local */
   const struct smb_sign_in *smb; /* over SMB: each connection signs in with this */
   int http_status;
   char why[160];
@@ -786,6 +852,41 @@ static int smb_fetch_chunk(fetcher_t *f, uint64_t chunk, char *buf, size_t *got,
                            size_t why_size);
 static void smb_fetcher_end(fetcher_t *f);
 
+/* One chunk from the source file (NBF1). 0, or multi's codes: 4 changed (it
+ * ended early), 6 stopped, 8 the drive couldn't be read. */
+static int local_fetch_chunk(multi_t *m, uint64_t chunk, char *buf, size_t *got, char *why,
+                             size_t why_size) {
+  job_t *j = m->j;
+  uint64_t from = j->start + chunk * CHUNK, to = from + CHUNK;
+  size_t have = 0, want;
+  int stopped;
+  if (to > j->size) to = j->size;
+  want = (size_t)(to - from);
+  *got = 0;
+  while (have < want) {
+    ssize_t n;
+    pthread_mutex_lock(&j->mu);
+    stopped = j->abort;
+    pthread_mutex_unlock(&j->mu);
+    if (stopped) return 6;
+    n = pread(j->src, buf + have, want - have > SMB_READ ? SMB_READ : want - have,
+              (off_t)(from + have));
+    if (n > 0) {
+      have += (size_t)n;
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    if (n == 0) {
+      snprintf(why, why_size, "the file on the drive is shorter now");
+      return 4;
+    }
+    snprintf(why, why_size, "%s", strerror(errno));
+    return 8;
+  }
+  *got = have;
+  return 0;
+}
+
 static void *fetcher_main(void *arg) {
   fetcher_t *f = arg;
   multi_t *m = f->m;
@@ -810,8 +911,9 @@ static void *fetcher_main(void *arg) {
     ++j->active;
     pthread_mutex_unlock(&j->mu);
     for (tries = 0; tries < CHUNK_TRIES; ++tries) {
-      rc = m->smb ? smb_fetch_chunk(f, chunk, buf, &got, why, sizeof why)
-                  : fetch_chunk(m, f->slot, chunk, buf, &got, &status, why, sizeof why);
+      rc = j->src >= 0 ? local_fetch_chunk(m, chunk, buf, &got, why, sizeof why)
+           : m->smb    ? smb_fetch_chunk(f, chunk, buf, &got, why, sizeof why)
+                       : fetch_chunk(m, f->slot, chunk, buf, &got, &status, why, sizeof why);
       if (rc != 1 && rc != 2) break; /* only the network's hiccups are retried */
       sleep_ms(500u * (unsigned)(tries + 1));
     }
@@ -922,7 +1024,7 @@ static int multi_pass(job_t *j, int streams, const struct smb_sign_in *smb) {
     }
     m.pool_free[m.nfree++] = i;
   }
-  if (!smb) send_line(j->ctl, "S 206");
+  if (!smb && j->src < 0) send_line(j->ctl, "S 206");
   memset(f, 0, sizeof f);
   for (i = 0; i < streams; ++i) {
     f[i].m = &m;
@@ -958,6 +1060,8 @@ static int multi_pass(job_t *j, int streams, const struct smb_sign_in *smb) {
     send_line(j->ctl, "ERR changed %s", m.why);
   } else if (m.net_err == 7) {
     send_line(j->ctl, "ERR smb %s", m.why);
+  } else if (m.net_err == 8) {
+    send_line(j->ctl, "ERR local %s", m.why);
   } else if (m.net_err) {
     send_line(j->ctl, "ERR %s %s", m.net_err == 2 ? "timeout" : "drop", m.why);
   } else if (j->abort) {
@@ -1318,6 +1422,76 @@ static void run_smb_job(job_t *j, char *line) {
   free(bytes);
 }
 
+/* ------------------------------------------------------- from a drive */
+
+/* Copies one file from a drive plugged into the PS5 (the NBF1 line, then the
+ * source's path). Every path out sends its final line. */
+static void run_local_job(job_t *j, char *line) {
+  char *field[6], *save = NULL, path[MAX_FILE], source[MAX_FILE];
+  struct stat st;
+  size_t len;
+  int k, err, streams;
+  single_t s;
+  memset(&s, 0, sizeof s);
+  field[0] = strtok_r(line, "\t", &save);
+  for (k = 1; k < 6; ++k) field[k] = strtok_r(NULL, "\t", &save);
+  if (!field[3]) {
+    send_line(j->ctl, "ERR request not a NASBridge copy request");
+    return;
+  }
+  j->size = strtoull(field[1], NULL, 10);
+  snprintf(path, sizeof path, "%s", field[2]);
+  len = (size_t)strtoull(field[3], NULL, 10);
+  streams = field[4] ? atoi(field[4]) : 1;
+  if (streams < 1) streams = 1;
+  if (streams > MAX_STREAMS) streams = MAX_STREAMS;
+  if (len < 2 || len >= sizeof source || path[0] != '/' ||
+      recv_exact(j->ctl, source, len) != 0) {
+    send_line(j->ctl, "ERR request bad request");
+    return;
+  }
+  source[len] = '\0';
+  j->src = open(source, O_RDONLY);
+  if (j->src < 0) {
+    send_line(j->ctl, "ERR local %s", strerror(errno));
+    return;
+  }
+  if (fstat(j->src, &st) != 0) {
+    send_line(j->ctl, "ERR local %s", strerror(errno));
+    return;
+  }
+  if ((uint64_t)st.st_size != j->size) {
+    send_line(j->ctl, "ERR changed the file on the drive is a different size now");
+    return;
+  }
+  j->fd = open(path, O_RDWR | O_CREAT, FILE_MODE);
+  if (j->fd < 0) {
+    send_line(j->ctl, "ERR file %s", strerror(errno));
+    return;
+  }
+  (void)fchmod(j->fd, FILE_MODE); /* open's mode is reduced by the umask */
+  if ((err = resume_point(j)) != 0) {
+    send_line(j->ctl, "ERR file %s", strerror(err));
+    return;
+  }
+  send_line(j->ctl, "P %llu 0 0 0", (unsigned long long)j->start);
+  j->last_sync = now_ms();
+  if (j->start == j->size) {
+    send_line(j->ctl, "OK");
+    return;
+  }
+  /* Several readers pay off on a big rest (a drive that reads ahead per
+   * request); a small one goes in one. */
+  if (streams > 1 && j->size - j->start >= 2 * CHUNK) {
+    (void)multi_pass(j, streams, NULL); /* always answers: a file takes ranges */
+    return;
+  }
+  s.j = j;
+  s.expected = j->size - j->start;
+  if (single_buffers(j, &s) == 0) single_pump(j, &s, local_reader);
+  for (k = 0; k < NBUF; ++k) free(s.buf[k]);
+}
+
 /* ------------------------------------------------- many small files at once */
 
 /* A folder game can be tens of thousands of small files. One connection per
@@ -1341,9 +1515,13 @@ static void run_smb_job(job_t *j, char *line) {
  * Over SMB the same, with "NBT1\t<ip>\t<port>\t<workers>\t<sign-in length>\n"
  * and the sign-in (share, user, domain, password, each ended by a NUL) first,
  * and each file's path in the share where the GET request would be. Each
- * worker signs in once and keeps that connection. */
+ * worker signs in once and keeps that connection.
+ *
+ * From a drive plugged into the PS5, "NBU1\t<workers>\n", and each file's
+ * full path on the drive where the GET request would be. */
 #define BATCH_PROTO "NBB1"
 #define BATCH_PROTO_SMB "NBT1"
+#define BATCH_PROTO_LOCAL "NBU1"
 #define BATCH_WORKERS 16 /* the Settings screen: 1..16 (a NAS with one disk answered fastest at 16) */
 #define BATCH_QUEUE 64
 #define BATCH_BUF (512u << 10) /* per worker: 16 of them stay within the payload's few MB */
@@ -1378,6 +1556,7 @@ typedef struct batch {
   uint64_t files;
   int nas[BATCH_WORKERS];
   int smb;                                /* NBT1: over SMB */
+  int local;                              /* NBU1: from a drive on this PS5 */
   smb_sign_in_t sign_in;                  /* ... with this (path unused) */
   struct smb2_context *smb2[BATCH_WORKERS]; /* ... each worker's sign-in */
 } batch_t;
@@ -1693,6 +1872,59 @@ stopped:
   return -1;
 }
 
+/* One file from a drive on this PS5 (f->request is its path there), as
+ * batch_one. */
+static int batch_one_local(batch_t *b, const bfile_t *f, char *buf) {
+  struct stat st;
+  uint64_t got = 0;
+  int fd, src, err = 0;
+  src = open(f->request, O_RDONLY);
+  if (src < 0) return batch_fail(b, f->index, "local", strerror(errno));
+  if (fstat(src, &st) != 0 || (uint64_t)st.st_size != f->size) {
+    close(src);
+    return batch_fail(b, f->index, "changed", "the file on the drive is a different size now");
+  }
+  fd = open(f->path, O_WRONLY | O_CREAT | O_TRUNC, FILE_MODE);
+  if (fd < 0) {
+    close(src);
+    return batch_fail(b, f->index, "file", strerror(errno));
+  }
+  (void)fchmod(fd, FILE_MODE); /* open's mode is reduced by the umask */
+  while (got < f->size) {
+    size_t want = f->size - got < BATCH_BUF ? (size_t)(f->size - got) : BATCH_BUF;
+    ssize_t n;
+    if (batch_aborted(b)) {
+      close(src);
+      close(fd);
+      return -1;
+    }
+    n = read(src, buf, want);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) {
+      close(src);
+      close(fd);
+      return n == 0 ? batch_fail(b, f->index, "changed", "the file on the drive is shorter now")
+                    : batch_fail(b, f->index, "local", strerror(errno));
+    }
+    if ((err = write_all(fd, buf, (size_t)n)) != 0) break;
+    got += (uint64_t)n;
+    pthread_mutex_lock(&b->mu);
+    b->bytes += (uint64_t)n;
+    pthread_mutex_unlock(&b->mu);
+  }
+  close(src);
+  if (err) {
+    close(fd);
+    return batch_fail(b, f->index, "write", strerror(err));
+  }
+  if (close(fd) != 0) return batch_fail(b, f->index, "write", strerror(errno));
+  pthread_mutex_lock(&b->mu);
+  b->files++;
+  pthread_mutex_unlock(&b->mu);
+  bsend(b, "D %lld", f->index);
+  return 0;
+}
+
 static void free_bfile(bfile_t *f) {
   free(f->path);
   free(f->request);
@@ -1722,7 +1954,9 @@ static void *batch_worker(void *arg) {
     b->busy++;
     pthread_cond_broadcast(&b->cv);
     pthread_mutex_unlock(&b->mu);
-    rc = b->smb ? batch_one_smb(b, me->w, &f, buf) : batch_one(b, me->w, &f, buf, head);
+    rc = b->local ? batch_one_local(b, &f, buf)
+         : b->smb ? batch_one_smb(b, me->w, &f, buf)
+                  : batch_one(b, me->w, &f, buf, head);
     free_bfile(&f);
     pthread_mutex_lock(&b->mu);
     b->busy--;
@@ -1825,8 +2059,9 @@ static void *batch_reader(void *arg) {
     f.size = strtoull(field[2], NULL, 10);
     f.reqlen = (size_t)strtoull(field[4], NULL, 10);
     f.path = strdup(field[3]);
-    f.request = f.reqlen >= (b->smb ? 1u : 4u) && f.reqlen <= MAX_REQUEST ? malloc(f.reqlen + 1)
-                                                                          : NULL;
+    f.request = f.reqlen >= (b->smb || b->local ? 1u : 4u) && f.reqlen <= MAX_REQUEST
+                    ? malloc(f.reqlen + 1)
+                    : NULL;
     if (!f.path || !f.request) {
       free_bfile(&f);
       batch_fail(b, f.index, "request", "bad request");
@@ -1873,6 +2108,13 @@ static void run_batch(int ctl, char *line) {
   field[0] = strtok_r(line, "\t", &save);
   for (k = 1; k < 5; ++k) field[k] = strtok_r(NULL, "\t", &save);
   b->smb = strcmp(field[0], BATCH_PROTO_SMB) == 0;
+  b->local = strcmp(field[0], BATCH_PROTO_LOCAL) == 0;
+  if (b->local) {
+    /* "NBU1\t<workers>": no NAS to reach. */
+    field[3] = field[1];
+    field[1] = "";
+    field[2] = "0";
+  }
   if (!field[3] || (b->smb && !field[4])) {
     send_line(ctl, "ERR -1 request not a NASBridge batch request");
     free(b);
@@ -1990,6 +2232,7 @@ static void run_job(int ctl) {
   memset(&j, 0, sizeof j);
   j.ctl = ctl;
   j.fd = -1;
+  j.src = -1;
   for (k = 0; k < MAX_STREAMS; ++k) j.nas[k] = -1;
   pthread_mutex_init(&j.mu, NULL);
   pthread_cond_init(&j.cv, NULL);
@@ -2008,12 +2251,17 @@ static void run_job(int ctl) {
   }
 #endif
   if (strncmp(line, BATCH_PROTO "\t", sizeof BATCH_PROTO) == 0 ||
-      strncmp(line, BATCH_PROTO_SMB "\t", sizeof BATCH_PROTO_SMB) == 0) {
+      strncmp(line, BATCH_PROTO_SMB "\t", sizeof BATCH_PROTO_SMB) == 0 ||
+      strncmp(line, BATCH_PROTO_LOCAL "\t", sizeof BATCH_PROTO_LOCAL) == 0) {
     run_batch(ctl, line);
     goto out;
   }
   if (strncmp(line, PROTO_SMB "\t", sizeof PROTO_SMB) == 0) {
     run_smb_job(&j, line);
+    goto out;
+  }
+  if (strncmp(line, PROTO_LOCAL "\t", sizeof PROTO_LOCAL) == 0) {
+    run_local_job(&j, line);
     goto out;
   }
   field[0] = strtok_r(line, "\t", &save);
@@ -2087,6 +2335,7 @@ static void run_job(int ctl) {
 out:
   free(request);
   if (j.fd >= 0) close(j.fd);
+  if (j.src >= 0) close(j.src);
   pthread_mutex_destroy(&j.mu);
   pthread_cond_destroy(&j.cv);
 }

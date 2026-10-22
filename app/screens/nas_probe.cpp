@@ -4,6 +4,7 @@
 
 #include "concepts/nas_probe.hpp"
 
+#include "concepts/drive.hpp"
 #include "concepts/http.hpp"
 #include "concepts/smb.hpp"
 
@@ -150,11 +151,40 @@ ProbeResult probe_smb(const Connection &connection, bool count,
     return result;
 }
 
+// The test for a USB drive: list the games folder on it and count the games.
+ProbeResult probe_drive(const Connection &connection, bool count,
+                        const std::function<bool()> &stop,
+                        const std::function<void(int, int)> &progress)
+{
+    std::vector<DavEntry> top;
+    int error = 0;
+    if (!drive_list(folder_path(connection), &top, &error))
+        return explain_drive_failure(connection, error);
+    ProbeResult result = describe_entries(connection, listed(top));
+    result.headline = "Found the folder";
+    GameCount games;
+    const Lister list = [&](const std::string &path, std::vector<Listed> *entries)
+    {
+        std::vector<DavEntry> inside;
+        int why = 0;
+        if (!drive_list(path, &inside, &why))
+            return false;
+        *entries = listed(inside);
+        return true;
+    };
+    if (count && result.state == State::ok && !top.empty() &&
+        count_in(folder_path(connection), listed(top), list, stop, progress, &games))
+        result.detail = describe_count(connection, games);
+    return result;
+}
+
 // The whole test, start to finish, on the worker thread.
 ProbeResult probe(const Connection &connection, bool count,
                   const std::function<bool()> &stop,
                   const std::function<void(int, int)> &progress)
 {
+    if (connection.on_drive())
+        return probe_drive(connection, count, stop, progress);
     if (connection.host.find_first_not_of("0123456789.") != std::string::npos)
         return failed("Use the NAS's IP address",
                       "Names like nas.local can't be looked up from the PS5 yet. Your NAS's IP "
@@ -307,6 +337,31 @@ std::string describe_count(const Connection &connection, const GameCount &count)
     if (count.unreadable > 0)
         text += " " + plural(count.unreadable, "folder", "folders") + " couldn't be read.";
     return text;
+}
+
+ProbeResult explain_drive_failure(const Connection &connection, int error)
+{
+    const std::string where = connection.folder.empty() ? "/" : connection.folder;
+    const std::string root = drive_root_of(where);
+    if (root.empty())
+        return failed("Pick a folder on a USB drive",
+                      "Choose the folder your games are in with the folder button.");
+    if (!drive_root_present(where))
+        return failed(drive_name(root) + " isn't connected",
+                      "Plug the drive into the PS5. If it is plugged in, use the folder button "
+                      "to pick the folder again: it may be in another port now.");
+    if (error == ENOENT || error == ENOTDIR)
+        return failed("Couldn't find " + where,
+                      "The drive is connected, but that folder isn't on it. Pick the folder "
+                      "your games are in with the folder button.");
+    if (error == EACCES || error == EPERM)
+        return failed("NASBridge isn't allowed to read the drive",
+                      "The PS5 refused to show NASBridge " + where +
+                          ". ShadowMountPlus is what lets apps read USB drives: check it "
+                          "is running.");
+    return failed("Couldn't read the drive",
+                  "Reading " + where + " failed (" + drive_error_brief(where, error) +
+                      "). Check the drive in the PS5's storage settings.");
 }
 
 ProbeResult interpret_socket_error(const Connection &connection, int error, bool connecting)

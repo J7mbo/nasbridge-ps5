@@ -8,7 +8,9 @@
 
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <string_view>
+#include <utility>
 
 namespace hui::concepts
 {
@@ -28,6 +30,8 @@ const char *type_key(ConnectionType type)
         return "ftp";
     case ConnectionType::smb:
         return "smb";
+    case ConnectionType::drive:
+        return "drive";
     case ConnectionType::webdav:
         break;
     }
@@ -79,6 +83,8 @@ bool is_ipv4(const std::string &text)
 
 std::string Connection::display_url() const
 {
+    if (type == ConnectionType::drive)
+        return folder.size() > 1 ? folder + "/" : "No folder chosen";
     std::string url = type == ConnectionType::ftp   ? "ftp://"
                       : type == ConnectionType::smb ? "smb://"
                                                     : "http://";
@@ -91,6 +97,17 @@ std::string Connection::display_url() const
     if (url.back() != '/')
         url += '/';
     return url;
+}
+
+void Connection::set_type(ConnectionType next)
+{
+    if ((next == ConnectionType::drive) != (type == ConnectionType::drive))
+    {
+        std::swap(folder, other_folder);
+        if (folder.empty())
+            folder = "/";
+    }
+    type = next;
 }
 
 bool Connection::load()
@@ -114,9 +131,10 @@ bool Connection::load()
         const std::string_view key = line.substr(0, equals);
         const std::string value(line.substr(equals + 1));
         if (key == "type")
-            type = value == "ftp"   ? ConnectionType::ftp
-                   : value == "smb" ? ConnectionType::smb
-                                    : ConnectionType::webdav;
+            type = value == "ftp"     ? ConnectionType::ftp
+                   : value == "smb"   ? ConnectionType::smb
+                   : value == "drive" ? ConnectionType::drive
+                                      : ConnectionType::webdav;
         else if (key == "host")
             host = value;
         else if (key == "port")
@@ -127,6 +145,8 @@ bool Connection::load()
             username = value;
         else if (key == "password")
             password = value;
+        else if (key == "other_folder")
+            other_folder = value;
     }
     if (port < 0 || port > 65535)
         port = 0;
@@ -143,6 +163,7 @@ std::string Connection::save() const
     payload += "folder=" + folder + "\n";
     payload += "username=" + username + "\n";
     payload += "password=" + password + "\n";
+    payload += "other_folder=" + other_folder + "\n";
     save::ensure_directory(kDirectory);
     return save::write_atomic(kPath, save::encode(save::Kind::prefs, kVersion, payload));
 }
@@ -185,6 +206,24 @@ std::string normalise_folder(std::string *text)
         folder.insert(folder.begin(), '/');
     while (folder.size() > 1 && folder.back() == '/')
         folder.pop_back();
+    *text = folder;
+    return "";
+}
+
+std::string normalise_drive_folder(std::string *text)
+{
+    std::string folder = *text;
+    normalise_folder(&folder);
+    // "/mnt/usb0" or "/mnt/usb0/...": one of the drives' places.
+    const auto on = [&](const char *prefix, char last)
+    {
+        const std::size_t length = std::strlen(prefix);
+        return folder.compare(0, length, prefix) == 0 && folder.size() > length &&
+               folder[length] >= '0' && folder[length] <= last &&
+               (folder.size() == length + 1 || folder[length + 1] == '/');
+    };
+    if (!on("/mnt/usb", '7') && !on("/mnt/ext", '1'))
+        return "Pick a folder on a USB drive, like /mnt/usb0/Games";
     *text = folder;
     return "";
 }

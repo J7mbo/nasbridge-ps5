@@ -4,6 +4,8 @@
 
 #include "concepts/nas.hpp"
 
+#include "concepts/drive.hpp"
+
 #include <cerrno>
 
 namespace hui::concepts
@@ -92,6 +94,14 @@ bool NasReader::list(const std::string &folder, std::vector<DavEntry> *entries, 
     NasProblem scratch;
     NasProblem &why = problem != nullptr ? *problem : scratch;
     why = NasProblem{};
+    if (drive())
+    {
+        if (drive_list(folder, entries, &why.drive_error))
+            return true;
+        why.brief = drive_error_brief(folder, why.drive_error);
+        why.reached = drive_root_present(folder);
+        return false;
+    }
     if (smb())
     {
         std::vector<SmbEntry> inside;
@@ -112,7 +122,7 @@ bool NasReader::list(const std::string &folder, std::vector<DavEntry> *entries, 
     return false;
 }
 
-bool NasReader::walk_smb(
+bool NasReader::walk(
     const std::string &folder,
     const std::function<bool(const std::string &folder, const std::vector<DavEntry> &entries)> &found,
     NasProblem *problem)
@@ -121,6 +131,23 @@ bool NasReader::walk_smb(
     NasProblem &why = problem != nullptr ? *problem : scratch;
     why = NasProblem{};
     const std::string top = folder.empty() || folder.back() != '/' ? folder + "/" : folder;
+    if (drive())
+    {
+        // One folder at a time: a drive answers at once.
+        std::vector<std::string> queue{top};
+        for (std::size_t next = 0; next < queue.size(); ++next)
+        {
+            std::vector<DavEntry> entries;
+            if (!list(queue[next], &entries, &why))
+                return false;
+            if (!found(queue[next], entries))
+                return false;
+            for (const DavEntry &entry : entries)
+                if (entry.folder)
+                    queue.push_back(entry.path + "/");
+        }
+        return true;
+    }
     const bool ok = session().walk(
         folder, kSmbWalkSignIns, kSmbWalkAtOnce,
         [&](const std::string &inside, const std::vector<SmbEntry> &entries)
@@ -144,6 +171,15 @@ bool NasReader::read_file(const std::string &path, std::size_t max, std::string 
     NasProblem scratch;
     NasProblem &why = problem != nullptr ? *problem : scratch;
     why = NasProblem{};
+    if (drive())
+    {
+        bool too_big = false;
+        if (drive_read_file(path, max, out, &too_big, &why.drive_error))
+            return true;
+        why.brief = too_big ? "too big" : drive_error_brief(path, why.drive_error);
+        why.reached = too_big || drive_root_present(path);
+        return false;
+    }
     if (smb())
     {
         bool too_big = false;
@@ -167,6 +203,14 @@ bool NasReader::read_file(const std::string &path, std::size_t max, std::string 
 bool NasReader::read_range(const std::string &path, std::uint64_t offset, std::size_t length,
                            std::string *out, std::string *why)
 {
+    if (drive())
+    {
+        int error = 0;
+        if (drive_read_range(path, offset, length, out, &error))
+            return true;
+        *why = drive_error_brief(path, error);
+        return false;
+    }
     if (!smb())
         return http_read_range(connection_, path, offset, length, out, why);
     SmbFailure failure;
@@ -178,6 +222,8 @@ bool NasReader::read_range(const std::string &path, std::uint64_t offset, std::s
 
 ProbeResult explain_nas_failure(const Connection &connection, const NasProblem &problem)
 {
+    if (connection.on_drive())
+        return explain_drive_failure(connection, problem.drive_error);
     if (connection.type == ConnectionType::smb)
     {
         ProbeResult result;

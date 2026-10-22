@@ -36,10 +36,23 @@ const Rect kPanel{1236.0f, 236.0f, 588.0f, 0.0f}; // height follows its content
 
 const Color kWhite = Color::rgb(0xffffff);
 
-// The rows of the screen, top to bottom; -1 is an empty second column.
-constexpr int kRows[][2] = {{0, -1}, {1, 2}, {3, 7}, {4, 5}, {6, -1}};
+// The rows of the screen, top to bottom; -1 is an empty second column. A
+// drive has no address or sign-in: only the type, the folder and the test.
+constexpr int kNasRows[][2] = {{0, -1}, {1, 2}, {3, 7}, {4, 5}, {6, -1}};
+constexpr int kDriveRows[][2] = {{0, -1}, {3, 7}, {6, -1}};
 constexpr float kBrowseWidth = 84.0f; // the folder button beside Folder
-constexpr int kRowCount = static_cast<int>(std::size(kRows));
+
+// The connection type list, top to bottom (FTP is listed but not selectable).
+constexpr ConnectionType kTypes[] = {ConnectionType::webdav, ConnectionType::ftp,
+                                     ConnectionType::smb, ConnectionType::drive};
+
+int type_index(ConnectionType type)
+{
+    for (int i = 0; i < static_cast<int>(std::size(kTypes)); ++i)
+        if (kTypes[i] == type)
+            return i;
+    return 0;
+}
 
 const ui::Theme &acrylic()
 {
@@ -49,17 +62,30 @@ const ui::Theme &acrylic()
     return ui::themes()[0];
 }
 
-int row_of(int item)
+struct Rows
 {
-    for (int r = 0; r < kRowCount; ++r)
-        if (kRows[r][0] == item || kRows[r][1] == item)
+    const int (*row)[2];
+    int count;
+};
+
+Rows rows_for(const Connection &connection)
+{
+    if (connection.on_drive())
+        return {kDriveRows, static_cast<int>(std::size(kDriveRows))};
+    return {kNasRows, static_cast<int>(std::size(kNasRows))};
+}
+
+int row_of(const Rows &rows, int item)
+{
+    for (int r = 0; r < rows.count; ++r)
+        if (rows.row[r][0] == item || rows.row[r][1] == item)
             return r;
     return 0;
 }
 
-int columns_in(int row)
+int columns_in(const Rows &rows, int row)
 {
-    return kRows[row][1] < 0 ? 1 : 2;
+    return rows.row[row][1] < 0 ? 1 : 2;
 }
 
 // Splits text into lines no wider than width.
@@ -102,14 +128,15 @@ ConnectionPage::ConnectionPage(const ui::Fonts &fonts) : fonts_(fonts), picker_(
     type_.style.theme = theme;
     type_.style.on_page = true;
     type_.set_label("Connection type");
-    // In ConnectionType's order: the list's index is the type.
+    // In kTypes' order.
     type_.set_options({{"WebDAV", "Built into most NAS systems"},
                        {"FTP", "Coming later"},
-                       {"SMB", "Also built into most NAS systems"}});
+                       {"SMB", "Also built into most NAS systems"},
+                       {"USB drive", "A drive plugged into this PS5"}});
     std::vector<ui::SelectOption> options = type_.options();
-    options[1].disabled = true;
+    options[type_index(ConnectionType::ftp)].disabled = true;
     type_.set_options(std::move(options));
-    type_.set_index(static_cast<int>(connection_.type));
+    type_.set_index(type_index(connection_.type));
 
     struct Setup
     {
@@ -158,6 +185,11 @@ ConnectionPage::ConnectionPage(const ui::Fonts &fonts) : fonts_(fonts), picker_(
     layout();
 }
 
+bool ConnectionPage::shown(Item item) const
+{
+    return !connection_.on_drive() || item == kFolder;
+}
+
 ui::TextField &ConnectionPage::field(Item item)
 {
     return fields_[item];
@@ -175,6 +207,16 @@ void ConnectionPage::layout()
     float y = kColumnTop;
     type_.set_bounds({kMargin, y, 520.0f, select_h});
     y += select_h + kRowGap + 8.0f;
+    if (connection_.on_drive())
+    {
+        // The folder right under the type, then the test.
+        field(kFolder).set_bounds({kMargin, y, kColumnWidth - kBrowseWidth - kGap, field_h});
+        const gfx::Rect box = field(kFolder).field_rect();
+        browse_button_ = {kMargin + kColumnWidth - kBrowseWidth, box.y, kBrowseWidth, box.h};
+        y += field_h + kRowGap;
+        test_button_ = {kMargin, y + 6.0f, 340.0f, 64.0f};
+        return;
+    }
     const float port_w = 220.0f;
     field(kHost).set_bounds({kMargin, y, kColumnWidth - port_w - kGap, field_h});
     field(kPort).set_bounds({kMargin + kColumnWidth - port_w, y, port_w, field_h});
@@ -204,6 +246,11 @@ void ConnectionPage::sync_fields()
     std::snprintf(port, sizeof(port), "%d", connection_.default_port());
     field(kPort).set_placeholder(port);
     field(kPort).set_helper(std::string("Empty for ") + port);
+    field(kFolder).set_placeholder(connection_.on_drive() ? "Not chosen" : "/");
+    field(kFolder).set_helper(connection_.on_drive()
+                                  ? "Where your games are on the drive: browse for the folder"
+                                  : "Where your games are, like /games, or browse for the folder");
+    layout(); // a drive shows fewer fields
 }
 
 void ConnectionPage::enter()
@@ -230,7 +277,10 @@ bool ConnectionPage::handle(const InputFrame &input, app::Feedback &feedback)
         if (picker_.handle(input, feedback) == FolderPicker::Result::chosen)
         {
             std::string folder = picker_.chosen();
-            normalise_folder(&folder);
+            if (connection_.on_drive())
+                normalise_drive_folder(&folder);
+            else
+                normalise_folder(&folder);
             connection_.folder = folder;
             store();
         }
@@ -246,7 +296,9 @@ bool ConnectionPage::handle(const InputFrame &input, app::Feedback &feedback)
     {
         if (type_.handle(input, feedback) == ui::Event::changed)
         {
-            connection_.type = static_cast<ConnectionType>(type_.index());
+            const int index = type_.index();
+            if (index >= 0 && index < static_cast<int>(std::size(kTypes)))
+                connection_.set_type(kTypes[index]);
             store();
         }
         return true;
@@ -278,21 +330,22 @@ bool ConnectionPage::handle(const InputFrame &input, app::Feedback &feedback)
 
 void ConnectionPage::move(Direction direction, const InputFrame &input, app::Feedback &feedback)
 {
-    const int row = row_of(focus_);
-    const int column = kRows[row][1] == focus_ ? 1 : 0;
+    const Rows rows = rows_for(connection_);
+    const int row = row_of(rows, focus_);
+    const int column = rows.row[row][1] == focus_ ? 1 : 0;
     int next = -1;
     if (direction == Direction::up || direction == Direction::down)
     {
         const int r = row + (direction == Direction::down ? 1 : -1);
-        if (r >= 0 && r < kRowCount)
-            next = kRows[r][std::min(column_, columns_in(r) - 1)];
+        if (r >= 0 && r < rows.count)
+            next = rows.row[r][std::min(column_, columns_in(rows, r) - 1)];
     }
     else
     {
         const int c = column + (direction == Direction::right ? 1 : -1);
-        if (c >= 0 && c < columns_in(row))
+        if (c >= 0 && c < columns_in(rows, row))
         {
-            next = kRows[row][c];
+            next = rows.row[row][c];
             column_ = c;
         }
     }
@@ -322,7 +375,8 @@ void ConnectionPage::edit(Item item, app::Feedback &feedback)
     prompt_.field.set_placeholder(item == kPort ? port : item == kFolder ? "/" : "");
     prompt_.field.set_helper(item == kPort     ? "Leave empty for the usual port"
                              : item == kHost   ? "The NAS's IP address, like 192.168.1.20"
-                             : item == kFolder ? "Like /games"
+                             : item == kFolder ? (connection_.on_drive() ? "Like /mnt/usb0/Games"
+                                                                         : "Like /games")
                                                : "");
     prompt_.style.password = item == kPassword;
     prompt_.style.max_length = item == kPort ? 5 : item == kFolder ? 200 : 128;
@@ -350,7 +404,7 @@ void ConnectionPage::accept(app::Feedback &feedback)
         error = parse_port(text, &next.port);
         break;
     case kFolder:
-        error = normalise_folder(&text);
+        error = connection_.on_drive() ? normalise_drive_folder(&text) : normalise_folder(&text);
         next.folder = text;
         break;
     case kUser:
@@ -403,8 +457,12 @@ void ConnectionPage::test(app::Feedback &feedback)
     }
     if (!connection_.configured())
     {
-        local_result_ = {ProbeResult::State::failed, "Enter your NAS's address first",
-                         "Put the NAS's IP address in Server address, then test again."};
+        local_result_ = connection_.on_drive()
+                            ? ProbeResult{ProbeResult::State::failed, "Choose the games folder first",
+                                          "Pick the folder your games are in on the drive with the "
+                                          "folder button, then test again."}
+                            : ProbeResult{ProbeResult::State::failed, "Enter your NAS's address first",
+                                          "Put the NAS's IP address in Server address, then test again."};
         heard_ = ProbeResult::State::failed;
         feedback.play(audio::Cue::error);
         refusal_.trigger();
@@ -417,7 +475,7 @@ void ConnectionPage::test(app::Feedback &feedback)
 void ConnectionPage::browse(app::Feedback &feedback)
 {
     press_.trigger();
-    if (!connection_.configured())
+    if (!connection_.configured() && !connection_.on_drive())
     {
         local_result_ = {ProbeResult::State::failed, "Enter your NAS's address first",
                          "Put the NAS's IP address in Server address, then browse the NAS's folders."};
@@ -443,6 +501,8 @@ void ConnectionPage::update(float dt)
     press_.update(dt, 10.0f);
     for (int i = kHost; i <= kPassword; ++i)
     {
+        if (!shown(static_cast<Item>(i)))
+            continue;
         fields_[i].set_active(focus_ == i && !editing);
         fields_[i].set_disabled(locked());
         fields_[i].update(dt);
@@ -488,7 +548,8 @@ void ConnectionPage::draw(gfx::DrawList &list, std::uint32_t glass, float clock,
     type_.draw(canvas);
     list.pop_opacity();
     for (int i = kHost; i <= kPassword; ++i)
-        fields_[i].draw(canvas);
+        if (shown(static_cast<Item>(i)))
+            fields_[i].draw(canvas);
     {
         ui::Look look;
         look.focus = test_focus_.value;
@@ -557,7 +618,12 @@ void ConnectionPage::draw_panel(gfx::DrawList &list, ui::Painter &paint,
 
     const std::vector<std::string> about = wrap(
         paint,
-        connection_.type == ConnectionType::smb
+        connection_.on_drive()
+            ? "Plug the drive into the PS5, then pick the folder your games are in. A game "
+              "that's on the home screen from the drive is hidden there once it's copied (a dot "
+              "goes in front of its name), so the PS5's copy is the one that runs. Deleting "
+              "the PS5's copy puts the name back."
+        : connection_.type == ConnectionType::smb
             ? "Turn on SMB in your NAS's settings, then enter the NAS's "
               "address and sign-in here, and pick the games folder: its first part is the share. "
               "NASBridge only reads from your NAS: NASBridge never changes or deletes anything there."
@@ -576,7 +642,8 @@ void ConnectionPage::draw_panel(gfx::DrawList &list, ui::Painter &paint,
     {
     case ProbeResult::State::idle:
         headline = "Not tested yet";
-        detail = "Test connection checks these settings with your NAS.";
+        detail = connection_.on_drive() ? "Test connection reads the folder on the drive."
+                                        : "Test connection checks these settings with your NAS.";
         break;
     case ProbeResult::State::running:
     {
@@ -592,7 +659,9 @@ void ConnectionPage::draw_panel(gfx::DrawList &list, ui::Painter &paint,
         else
         {
             headline = "Testing...";
-            detail = "Asking " + connection_.display_url() + " for the NAS's folder list.";
+            detail = connection_.on_drive()
+                         ? "Reading " + connection_.display_url()
+                         : "Asking " + connection_.display_url() + " for the NAS's folder list.";
         }
         dot = theme.primary;
         break;

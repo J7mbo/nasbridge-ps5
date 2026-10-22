@@ -755,10 +755,10 @@ struct LibraryLoader::Job
     bool measure(const std::string &url, std::uint64_t *total)
     {
         *total = 0;
-        if (nas->smb())
+        if (!nas->webdav())
         {
             int folders = 0;
-            return nas->walk_smb(url,
+            return nas->walk(url,
                                  [&](const std::string &, const std::vector<DavEntry> &inside)
                                  {
                                      if (cancelled || ++folders > kSizeFolders)

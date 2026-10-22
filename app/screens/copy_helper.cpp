@@ -39,6 +39,8 @@ constexpr const char *kProto = "NBC1";
 constexpr const char *kBatchProto = "NBB1";
 constexpr const char *kSmbProto = "NBS1";      // one file over SMB
 constexpr const char *kSmbBatchProto = "NBT1"; // small files over SMB
+constexpr const char *kDriveProto = "NBF1";      // one file from a drive on this PS5
+constexpr const char *kDriveBatchProto = "NBU1"; // small files from one
 constexpr int kStartMs = 20000;   // the loader can take a while to run it
 constexpr int kSilentMs = 90000;  // longer than the helper ever goes quiet
 
@@ -266,8 +268,8 @@ HelperCopy run_copy(const std::string &job, const std::string &payload, const Pr
                 result.end = End::refused;
                 result.status = std::atoi(result.why.c_str());
             }
-            else if (kind == "smb")
-                result.end = End::refused; // the NAS said no: `why` says what
+            else if (kind == "smb" || kind == "local")
+                result.end = End::refused; // the NAS (or the drive) said no: `why` says what
             else if (kind == "chunked")
                 result.end = End::unsupported;
             else if (kind == "changed")
@@ -433,7 +435,7 @@ HelperBatch run_batch(const std::string &opening, const std::vector<BatchFile> &
                     result.status = std::atoi(result.why.c_str());
                     return finish(End::refused);
                 }
-                if (kind == "smb")
+                if (kind == "smb" || kind == "local")
                     return finish(End::refused);
                 if (kind == "changed")
                     return finish(End::changed);
@@ -500,6 +502,26 @@ HelperBatch copy_smb_batch_with_helper(const std::string &ip, int port, int work
                          "\t" + std::to_string(workers) + "\t" + std::to_string(bytes.size()) +
                          "\n" + bytes,
                      files, done, synced, progress, stopping);
+}
+
+HelperCopy copy_drive_with_helper(std::uint64_t size, const std::string &local,
+                                  const std::string &source, int streams,
+                                  const Progress &progress, const std::function<bool()> &stopping)
+{
+    const std::string job = std::string(kDriveProto) + "\t" + std::to_string(size) + "\t" + local +
+                            "\t" + std::to_string(source.size()) + "\t" +
+                            std::to_string(streams) + "\n";
+    return run_copy(job, source, progress, stopping);
+}
+
+HelperBatch copy_drive_batch_with_helper(int workers, const std::vector<BatchFile> &files,
+                                         const std::function<void(std::size_t)> &done,
+                                         const std::function<void()> &synced,
+                                         const BatchProgress &progress,
+                                         const std::function<bool()> &stopping)
+{
+    return run_batch(std::string(kDriveBatchProto) + "\t" + std::to_string(workers) + "\n", files,
+                     done, synced, progress, stopping);
 }
 
 bool copy_helper_enabled()

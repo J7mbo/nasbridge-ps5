@@ -61,7 +61,7 @@ struct BatchFile
 {
     std::string local;   // where it goes on the PS5
     std::uint64_t size = 0;
-    std::string request; // the GET (keep-alive), sign-in and all; SMB: the path in the share
+    std::string request; // the GET (keep-alive), sign-in and all; SMB: the path in the share; a drive: the path on it
 };
 
 struct HelperBatch
@@ -110,6 +110,22 @@ HelperBatch copy_smb_batch_with_helper(const std::string &ip, int port, int work
                                        const std::function<void()> &synced,
                                        const BatchProgress &progress,
                                        const std::function<bool()> &stopping);
+
+// copy_with_helper from a drive plugged into this PS5: `source` is the file's
+// path there ("/mnt/usb0/Games/X/eboot.bin"), read by `streams` readers, each
+// taking the next chunk. A source that can't be opened or read ends refused,
+// with `why`.
+HelperCopy copy_drive_with_helper(std::uint64_t size, const std::string &local,
+                                  const std::string &source, int streams,
+                                  const std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, int)> &progress,
+                                  const std::function<bool()> &stopping);
+
+// copy_batch_with_helper from a drive: each file's `request` is its path there.
+HelperBatch copy_drive_batch_with_helper(int workers, const std::vector<BatchFile> &files,
+                                         const std::function<void(std::size_t)> &done,
+                                         const std::function<void()> &synced,
+                                         const BatchProgress &progress,
+                                         const std::function<bool()> &stopping);
 
 bool copy_helper_enabled();
 

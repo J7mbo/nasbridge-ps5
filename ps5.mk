@@ -324,14 +324,15 @@ HOST_TRANSFER := build/host/test_transfer
 TRANSFER_SRCS := tests/test_transfer.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,transfer.cpp copy_helper.cpp delete_helper.cpp file_calls.cpp smp.cpp \
     json_scan.cpp http.cpp connection.cpp library_cache.cpp notify.cpp storage.cpp nas.cpp \
-    nas_probe.cpp) \
+    nas_probe.cpp drive.cpp) \
   $(APP_WORK)/src/core/save_file.cpp
 
 # The folder picker's moves and listings (drawing isn't exercised, but the
 # kit's drawing code is linked in so it builds as on the console).
 HOST_PICKER := build/host/test_folder_picker
 PICKER_SRCS := tests/test_folder_picker.cpp $(LIBSMB2_HOST) \
-  $(addprefix $(APP_WORK)/src/concepts/,folder_picker.cpp http.cpp nas_probe.cpp connection.cpp) \
+  $(addprefix $(APP_WORK)/src/concepts/,folder_picker.cpp http.cpp nas_probe.cpp connection.cpp \
+    drive.cpp json_scan.cpp library_cache.cpp) \
   $(addprefix $(APP_WORK)/src/,core/save_file.cpp gfx/draw_list.cpp gfx/triangulate.cpp \
     gfx/font.cpp ui/widgets.cpp ui/glyphs.cpp ui/theme.cpp ui/pixel_font.cpp \
     ui/components/component.cpp)
@@ -340,14 +341,14 @@ PICKER_SRCS := tests/test_folder_picker.cpp $(LIBSMB2_HOST) \
 HOST_COUNT := build/host/test_game_count
 COUNT_SRCS := tests/test_game_count.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,nas_probe.cpp http.cpp connection.cpp nas_library.cpp \
-    library_cache.cpp exfat.cpp png.cpp nas.cpp) \
+    library_cache.cpp exfat.cpp png.cpp nas.cpp drive.cpp json_scan.cpp) \
   $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
 
 # The Connection screen's lock while a copy needs its settings.
 HOST_LOCK := build/host/test_connection_lock
 LOCK_SRCS := tests/test_connection_lock.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,connection_page.cpp connection.cpp nas_probe.cpp \
-    http.cpp folder_picker.cpp) \
+    http.cpp folder_picker.cpp drive.cpp json_scan.cpp library_cache.cpp) \
   $(KIT_DRAWING) $(KIT_COMPONENTS)
 
 # The queue panel, driven by pad input over a real queue.
@@ -355,7 +356,7 @@ HOST_QUEUE := build/host/test_queue_panel
 QUEUE_SRCS := tests/test_queue_panel.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,queue_panel.cpp transfer.cpp copy_helper.cpp delete_helper.cpp \
     file_calls.cpp smp.cpp json_scan.cpp http.cpp connection.cpp library_cache.cpp notify.cpp \
-    storage.cpp app_settings.cpp nas.cpp nas_probe.cpp) \
+    storage.cpp app_settings.cpp nas.cpp nas_probe.cpp drive.cpp) \
   $(KIT_DRAWING) $(KIT_COMPONENTS)
 
 # The delete helper (tools/helper/helper.c) and its client (delete_helper.cpp),
@@ -386,8 +387,17 @@ HOST_SMB_NAS := build/host/test_smb_nas
 SMB_NAS_SRCS := tests/test_smb_nas.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,nas.cpp nas_library.cpp library_cache.cpp exfat.cpp png.cpp \
     nas_probe.cpp http.cpp connection.cpp transfer.cpp copy_helper.cpp delete_helper.cpp \
-    file_calls.cpp smp.cpp json_scan.cpp notify.cpp storage.cpp) \
+    file_calls.cpp smp.cpp json_scan.cpp notify.cpp storage.cpp drive.cpp) \
   $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
+
+# A USB drive as the source: the drive calls, hiding and unhiding a drive
+# copy, and the queue copying from a drive (in-app and through the helper).
+HOST_DRIVE := build/host/test_drive
+DRIVE_SRCS := tests/test_drive.cpp $(LIBSMB2_HOST) \
+  $(addprefix $(APP_WORK)/src/concepts/,drive.cpp transfer.cpp copy_helper.cpp delete_helper.cpp \
+    file_calls.cpp smp.cpp json_scan.cpp http.cpp connection.cpp library_cache.cpp notify.cpp \
+    storage.cpp nas.cpp nas_probe.cpp) \
+  $(APP_WORK)/src/core/save_file.cpp
 
 HOST_DELETE := build/host/test_delete
 DELETE_SRCS := tests/test_delete.cpp \
@@ -401,8 +411,9 @@ $(HOST_QUEUE): $(call host_objs,$(QUEUE_SRCS))
 $(HOST_DELETE): $(call host_objs,$(DELETE_SRCS))
 $(HOST_SMB): $(call host_objs,$(SMB_SRCS))
 $(HOST_SMB_NAS): $(call host_objs,$(SMB_NAS_SRCS))
+$(HOST_DRIVE): $(call host_objs,$(DRIVE_SRCS))
 $(HOST_TRANSFER) $(HOST_PICKER) $(HOST_COUNT) $(HOST_LOCK) $(HOST_QUEUE) $(HOST_DELETE) $(HOST_SMB) \
-  $(HOST_SMB_NAS):
+  $(HOST_SMB_NAS) $(HOST_DRIVE):
 	@mkdir -p $(@D)
 	clang++-18 -o $@ $^ -lpthread
 
@@ -413,7 +424,7 @@ $(HOST_TRANSFER) $(HOST_PICKER) $(HOST_COUNT) $(HOST_LOCK) $(HOST_QUEUE) $(HOST_
 # and work folder each): run-transfer runs all three.
 TRANSFER_PARTS := run-transfer-1 run-transfer-2 run-transfer-3
 HOST_RUNS := run-installer run-release $(TRANSFER_PARTS) run-picker run-count run-lock run-queue run-delete \
-  run-smb run-smb-nas
+  run-smb run-smb-nas run-drive
 .PHONY: $(HOST_RUNS) run-transfer
 run-installer: selftest $(HOST_INSTALLER)
 	python3 -u tests/test_installer.py
@@ -436,6 +447,8 @@ run-smb: $(HOST_SMB)
 	$(HOST_SMB)
 run-smb-nas: $(HOST_SMB_NAS) $(HOST_COPIER)
 	$(HOST_SMB_NAS) build/host/smb-nas-test $(HOST_COPIER)
+run-drive: $(HOST_DRIVE) $(HOST_COPIER)
+	$(HOST_DRIVE) build/host/drive-test $(HOST_COPIER)
 
 # app-work goes first, in a make of its own: it copies our sources into the
 # kit, and a make that copied them while also building would judge the

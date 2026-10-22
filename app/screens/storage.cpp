@@ -21,6 +21,7 @@
 #include "concepts/storage.hpp"
 
 #include "concepts/connection.hpp"
+#include "concepts/drive.hpp"
 #include "concepts/file_calls.hpp"
 #include "concepts/http.hpp"
 #include "concepts/json_scan.hpp"
@@ -444,28 +445,6 @@ StorageSpace shadowmount_storage()
     return storage_from_json(reply.body);
 }
 
-std::string destination_name(const std::string &path)
-{
-    if (path == "/data/homebrew" || path.rfind("/data/", 0) == 0 || path == "/data")
-        return "Internal storage";
-    // "/mnt/ext0/..." and "/mnt/usb3/...": the drive's kind and number.
-    const auto numbered = [&](const char *prefix, const char *name, bool first_plain)
-    {
-        const std::size_t length = std::strlen(prefix);
-        if (path.compare(0, length, prefix) != 0 || path.size() <= length ||
-            path[length] < '0' || path[length] > '9')
-            return std::string();
-        const int number = path[length] - '0';
-        if (first_plain && number == 0)
-            return std::string(name);
-        return std::string(name) + " " + std::to_string(number + 1);
-    };
-    std::string name = numbered("/mnt/ext", "Extended storage", true);
-    if (name.empty())
-        name = numbered("/mnt/usb", "USB drive", false);
-    return name.empty() ? path : name;
-}
-
 void check_destination(Destination *destination)
 {
     destination->writable = 0;
@@ -591,6 +570,14 @@ void *watch(void *argument)
     std::vector<Destination> checked;
     while (!shared->stop.load())
     {
+        // A USB drive plugged back in: copies NASBridge hid on it whose PS5
+        // copy was deleted get their names back, and ShadowMountPlus looks.
+        prune_hidden();
+        if (finish_unhides() > 0)
+        {
+            std::string why, deferred;
+            smp_scan(true, &why, &deferred);
+        }
         StorageSpace space = shadowmount_storage();
         if (!space.known)
         {

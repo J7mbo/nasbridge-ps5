@@ -6,6 +6,7 @@
 
 #include "concepts/copy_helper.hpp"
 #include "concepts/delete_helper.hpp"
+#include "concepts/drive.hpp"
 #include "concepts/file_calls.hpp"
 #include "concepts/http.hpp"
 #include "concepts/library_cache.hpp"
@@ -298,12 +299,27 @@ int current_cpu()
 #endif
 }
 
+// A copy's failure, said for a USB drive: the messages speak of "the NAS".
+std::string drive_wording(std::string text)
+{
+    for (const char *nas : {"the NAS", "The NAS"})
+    {
+        const std::string drive = nas[0] == 't' ? "the USB drive" : "The USB drive";
+        for (std::size_t at = text.find(nas); at != std::string::npos;
+             at = text.find(nas, at + drive.size()))
+            text.replace(at, std::strlen(nas), drive);
+    }
+    return text;
+}
+
 } // namespace
 
 // ---- the saved plan ----
 
 std::string nas_identity(const Connection &connection)
 {
+    if (connection.on_drive())
+        return "drive:" + folder_path(connection);
     // WebDAV keeps its old form, so copies saved by earlier versions still match.
     const std::string where = connection.host + ":" +
                               std::to_string(connection.effective_port()) + folder_path(connection);
@@ -656,7 +672,7 @@ class Lister
         // A NAS that didn't list deeply once isn't asked again (it can cost
         // the whole wait each time). SMB has no deep listing.
         const std::string nas = nas_identity(connection_);
-        const bool try_deep = !nas_.smb() && !shallow_nas(nas);
+        const bool try_deep = nas_.webdav() && !shallow_nas(nas);
         if (!try_deep || !deep(plan))
         {
             if (try_deep && !stopping())
@@ -789,8 +805,8 @@ class Lister
     // folders at once.
     bool walk(CopyPlan *plan, std::string *why)
     {
-        if (nas_.smb())
-            return walk_smb(plan, why);
+        if (!nas_.webdav())
+            return walk_nas(plan, why);
         std::vector<std::string> queue{root_ + "/"};
         for (std::size_t next = 0; next < queue.size(); ++next)
         {
@@ -821,12 +837,12 @@ class Lister
         return true;
     }
 
-    bool walk_smb(CopyPlan *plan, std::string *why)
+    bool walk_nas(CopyPlan *plan, std::string *why)
     {
         int folders = 0;
         bool too_many = false;
         NasProblem problem;
-        const bool ok = nas_.walk_smb(
+        const bool ok = nas_.walk(
             root_ + "/",
             [&](const std::string &, const std::vector<DavEntry> &entries)
             {
@@ -922,6 +938,9 @@ class Copier
             shared_->files_total = static_cast<int>(plan.files.size());
             shared_->files_done = 0;
         }
+        plan_source_ = plan.source;
+        title_id_ = plan.title_id;
+        plan_image_ = plan.image;
         const std::string incoming = plan.destination + "/" + kIncoming;
         staging_ = incoming + "/" + plan.name;
 
@@ -1052,12 +1071,56 @@ class Copier
         // to close ("game_active").
         std::string scan_why;
         std::string deferred;
+        if (drive())
+            hide_source(why);
         if (!smp_scan(true, &scan_why, &deferred))
             *why = "ShadowMountPlus wasn't asked to look for the game: " + scan_why;
         else if (deferred == "game_active")
             held_back_ = true;
         return Outcome::done;
     }
+
+    // From a USB drive: when ShadowMountPlus runs this game from the drive
+    // (it's in one of its scan folders there), that copy keeps winning over
+    // the new one while the drive is plugged in. So the drive copy gets a dot
+    // in front of its name, which ShadowMountPlus skips (drive.hpp).
+    void hide_source(std::string *why)
+    {
+        const std::string source = tidy_path(plan_source_);
+        if (source.empty() || title_id_.empty())
+            return;
+        std::vector<SmpGame> games;
+        std::string list_why;
+        if (!smp_games(&games, &list_why))
+            return; // ShadowMountPlus isn't answering: nothing runs from the drive then either
+        for (const SmpGame &game : games)
+        {
+            if (game.title_id != title_id_ || tidy_path(game.path) != source)
+                continue;
+            std::string hide_why;
+            if (!hide_drive_copy(title_id_, source, plan_image_, &hide_why))
+                *why = "The copy on the USB drive couldn't be hidden from ShadowMountPlus (" +
+                       hide_why + "), so it still starts the drive copy. Rename it to start "
+                       "with a dot to use the PS5 copy.";
+            return;
+        }
+    }
+
+    // "/mnt/usb0/Games/X" for "/mnt/usb0//Games/X/".
+    static std::string tidy_path(const std::string &path)
+    {
+        std::string out;
+        for (const char c : path)
+            if (c != '/' || out.empty() || out.back() != '/')
+                out += c;
+        while (out.size() > 1 && out.back() == '/')
+            out.pop_back();
+        return out;
+    }
+
+    std::string plan_source_;
+    std::string title_id_;
+    bool plan_image_ = false;
 
   public:
     // ShadowMountPlus took the scan but waits for NASBridge to close.
@@ -1134,7 +1197,7 @@ class Copier
             if (result != Result::fallback)
                 return result;
         }
-        if (size >= kParallelMin && !smb())
+        if (size >= kParallelMin && webdav())
         {
             const Result result = copy_pieces(remote, local, size, before, path, why);
             if (result != Result::fallback)
@@ -1147,8 +1210,9 @@ class Copier
             *why = errno_text("Couldn't create a file on the drive", errno);
             return Result::failed;
         }
-        const Result result = smb() ? fill_smb(fd, remote, size, before, why)
-                                    : fill(fd, remote, size, before, why);
+        const Result result = drive()  ? fill_drive(fd, remote, size, before, why)
+                              : smb()  ? fill_smb(fd, remote, size, before, why)
+                                       : fill(fd, remote, size, before, why);
         if (result == Result::ok && ::fsync(fd) != 0)
         {
             *why = errno_text("Couldn't finish writing a file", errno);
@@ -1211,7 +1275,11 @@ class Copier
                     ::unlink((item.local + kPartSuffix).c_str());
                     forget_part(entry_);
                 }
-                if (smb())
+                if (drive())
+                {
+                    item.request = drive_real_path(plan.source + file.path); // the file on the drive
+                }
+                else if (smb())
                 {
                     item.request = smb_location(plan.source + file.path).path;
                 }
@@ -1260,7 +1328,9 @@ class Copier
                 };
             const auto batch_stopping = [this] { return stopping(); };
             const HelperBatch batch =
-                smb() ? copy_smb_batch_with_helper(connection_.host, connection_.effective_port(),
+                drive() ? copy_drive_batch_with_helper(batch_workers(), files, file_done, nullptr,
+                                                       batch_progress, batch_stopping)
+                : smb() ? copy_smb_batch_with_helper(connection_.host, connection_.effective_port(),
                                                    batch_workers(), sign_in(), files, file_done,
                                                    nullptr, batch_progress, batch_stopping)
                       : copy_batch_with_helper(connection_.host, connection_.effective_port(),
@@ -1395,7 +1465,9 @@ class Copier
                 };
             const auto copy_stopping = [this] { return stopping(); };
             const HelperCopy copy =
-                smb() ? copy_smb_with_helper(connection_.host, connection_.effective_port(), size,
+                drive() ? copy_drive_with_helper(size, local, drive_real_path(remote), helper_streams_, copy_progress,
+                                                 copy_stopping)
+                : smb() ? copy_smb_with_helper(connection_.host, connection_.effective_port(), size,
                                              local, sign_in(), smb_location(remote).path,
                                              helper_streams_, copy_progress, copy_stopping)
                       : copy_with_helper(connection_.host, connection_.effective_port(), size,
@@ -2261,6 +2333,81 @@ class Copier
         }
     }
 
+    // A file from a drive plugged into the PS5, in-app (without the copy
+    // helper): read and written in blocks, carrying on from what's there.
+    Result fill_drive(int fd, const std::string &remote, std::uint64_t size, std::uint64_t before,
+                      std::string *why)
+    {
+        int failures = 0;
+        while (true)
+        {
+            std::uint64_t offset = 0;
+            bool whole = false;
+            if (!resume_at(fd, size, &offset, &whole, why))
+                return Result::failed;
+            if (whole)
+                return Result::ok;
+            if (stopping())
+                return Result::stopped;
+            std::uint64_t position = offset;
+            buffer_.clear();
+            window_start_ = now_ms();
+            window_bytes_ = 0;
+            {
+                std::lock_guard<std::mutex> hold(shared_->lock);
+                shared_->connections = 1;
+            }
+            int error = 0;
+            std::string block;
+            while (position < size && !stopping())
+            {
+                const std::size_t want =
+                    static_cast<std::size_t>(std::min<std::uint64_t>(size - position, 1u << 20));
+                if (!drive_read_range(remote, position, want, &block, &error))
+                    break;
+                buffer_.insert(buffer_.end(), block.begin(), block.end());
+                position += want;
+                if (buffer_.size() >= kWriteBlock && !flush(fd))
+                {
+                    std::lock_guard<std::mutex> hold(shared_->lock);
+                    shared_->connections = 0;
+                    *why = errno_text("Couldn't write to the drive", errno);
+                    return Result::failed;
+                }
+                measure(before + position, want);
+            }
+            {
+                std::lock_guard<std::mutex> hold(shared_->lock);
+                shared_->connections = 0;
+            }
+            if (!buffer_.empty() && !flush(fd))
+            {
+                *why = errno_text("Couldn't write to the drive", errno);
+                return Result::failed;
+            }
+            if (position == size)
+            {
+                if (::ftruncate(fd, static_cast<off_t>(size)) != 0)
+                {
+                    *why = errno_text("Couldn't finish a file", errno);
+                    return Result::failed;
+                }
+                return Result::ok;
+            }
+            if (stopping())
+                return Result::stopped;
+            if (error == ENOENT || error == EACCES || error == EPERM || error == ENOTDIR)
+            {
+                *why = "Couldn't read a file on the USB drive (" + drive_error_brief(remote, error) + ")";
+                return Result::failed;
+            }
+            if (!retry_after(&failures, position > offset + kRefetch,
+                             "Couldn't read the USB drive (" + drive_error_brief(remote, error) + ")",
+                             why))
+                return Result::failed;
+        }
+    }
+
     // fill() over SMB: the rest of the file, over the copy's one sign-in.
     Result fill_smb(int fd, const std::string &remote, std::uint64_t size, std::uint64_t before,
                     std::string *why)
@@ -2383,6 +2530,14 @@ class Copier
     {
         return connection_.type == ConnectionType::smb;
     }
+    bool drive() const
+    {
+        return connection_.on_drive();
+    }
+    bool webdav() const
+    {
+        return !smb() && !drive();
+    }
 
     // The helper's SMB sign-in: the share from the games folder, "guest"
     // without a user name.
@@ -2479,6 +2634,8 @@ void run_queue(const SharedPtr &shared)
         std::string why;
         Copier copier(connection, shared, head.plan.entry);
         const Outcome outcome = copier.run(&why);
+        if (connection.on_drive())
+            why = drive_wording(why);
         switch (outcome)
         {
         case Outcome::done:
@@ -2823,6 +2980,35 @@ bool remove_with_smp(const SharedPtr &shared, const SmpGame &game, std::string *
     return true;
 }
 
+// The PS5 copy is gone: a copy of the game NASBridge hid on a USB drive gets
+// its name back, so ShadowMountPlus runs that one again.
+void unhide_after_delete(const SharedPtr &shared, const std::string &title_id)
+{
+    {
+        std::lock_guard<std::mutex> hold(shared->lock);
+        if (shared->removal.state != TransferState::deleted)
+            return;
+    }
+    std::string why;
+    const Unhide unhide = unhide_drive_copy(title_id, &why);
+    std::string note;
+    if (unhide == Unhide::done)
+    {
+        std::string scan_why, deferred;
+        smp_scan(true, &scan_why, &deferred);
+        note = "Deleted from the PS5. The copy on the USB drive is back on the home screen shortly.";
+    }
+    else if (unhide == Unhide::later)
+        note = "Deleted from the PS5. Plug the USB drive back in and NASBridge brings its copy back.";
+    else if (unhide == Unhide::failed)
+        note = "Deleted from the PS5, but the copy on the USB drive couldn't be renamed back (" +
+               why + "). Remove the dot from its name yourself.";
+    if (note.empty())
+        return;
+    std::lock_guard<std::mutex> hold(shared->lock);
+    shared->removal.message = note;
+}
+
 void remove_game(const SharedPtr &shared, const std::string &title_id)
 {
     // ShadowMountPlus's list is still readable while NASBridge is open. From
@@ -2947,6 +3133,7 @@ void *work_main(void *argument)
         break;
     case Work::Kind::remove:
         remove_game(work->shared, work->title_id);
+        unhide_after_delete(work->shared, work->title_id);
         break;
     case Work::Kind::finish:
         finish_unfinished(work->shared);
