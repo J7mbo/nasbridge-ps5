@@ -47,6 +47,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <sys/stat.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -1025,8 +1027,9 @@ class Library final : public app::Concept
         const Game &game = games_[static_cast<std::size_t>(index)];
         ui::CardItem card;
         card.title = game.title;
-        card.subtitle =
-            game.size_gb > 0.0 ? game.format + "  ·  " + gigabytes(game.size_gb) : game.format;
+        const double size_gb = shown_size_gb(game);
+        card.subtitle = size_gb > 0.0 ? shown_format(game) + "  ·  " + gigabytes(size_gb)
+                                      : shown_format(game);
         card.badge = game.on_ps5 ? "ON PS5" : "";
         card.texture = game.cover;
         card.uv = game.uv;
@@ -1232,12 +1235,47 @@ class Library final : public app::Concept
         return nullptr;
     }
 
+    // The size of the image a game is on the PS5 as, or 0 (not an image, or
+    // not known yet).
+    std::uint64_t installed_image_bytes(const Game &game) const
+    {
+        const SmpGame *smp = game.on_ps5 ? ps5_game(game) : nullptr;
+        if (smp == nullptr || smp->source_type != "image")
+            return 0;
+        const auto found = image_sizes_.find(smp->path);
+        return found == image_sizes_.end() ? 0 : found->second;
+    }
+
+    // What the game is, as shown on its card and page: once it's on the PS5
+    // as an image (a game folder copied as an exFAT image, say), the image
+    // and its size; otherwise the copy on the NAS.
+    std::string shown_format(const Game &game) const
+    {
+        return installed_image_bytes(game) > 0 ? "exFAT image" : game.format;
+    }
+
+    double shown_size_gb(const Game &game) const
+    {
+        const std::uint64_t bytes = installed_image_bytes(game);
+        return bytes > 0 ? static_cast<double>(bytes) / 1e9 : game.size_gb;
+    }
+
     // "On PS5" comes from ShadowMountPlus's list, once it has answered.
     void sync_installed()
     {
         if (!space_.games_known)
             return;
         bool changed = false;
+        // Each image's size, once (a finished image doesn't change).
+        for (const SmpGame &smp : space_.games)
+        {
+            if (smp.source_type != "image" || image_sizes_.count(smp.path) != 0)
+                continue;
+            struct stat info{};
+            image_sizes_[smp.path] =
+                ::stat(smp.path.c_str(), &info) == 0 ? static_cast<std::uint64_t>(info.st_size) : 0;
+            changed = true;
+        }
         for (Game &game : games_)
         {
             if (!game.from_nas)
@@ -1855,7 +1893,8 @@ class Library final : public app::Concept
         // ---- title and details ----
         list.push_opacity(content);
         list.push_transform(1.0f, 0.0f, 0.0f, 0.0f, rise);
-        paint.label(game.label, kMargin, 532, 22, theme.primary);
+        paint.label(game.label == game.format ? shown_format(game) : game.label, kMargin, 532, 22,
+                    theme.primary);
         paint.heading(ui::fit_label(paint, game.title, 76.0f, 1080.0f), kMargin - 3, 610, 76,
                       kWhite);
         std::string line;
@@ -1867,9 +1906,12 @@ class Library final : public app::Concept
                 line += "   ·   ";
             line += part;
         };
-        if (game.size_gb > 0.0)
-            add(gigabytes(game.size_gb));
-        add(game.format);
+        if (shown_size_gb(game) > 0.0)
+            add(gigabytes(shown_size_gb(game)));
+        add(shown_format(game));
+        // On the PS5 as an image, from a game folder on the NAS: say both.
+        if (installed_image_bytes(game) > 0 && !game.source.image)
+            add("game folder on the NAS");
         add(game.title_id);
         add(game.version.empty() ? "" : "v" + game.version);
         paint.body(line, kMargin, 662, 26, kWhite.with_alpha(0.78f));
@@ -2032,7 +2074,7 @@ class Library final : public app::Concept
             heading = smp != nullptr && smp->source_type != "pkg"
                           ? "On " + destination_name(smp->path)
                           : "On this PS5";
-            text = game.size_gb > 0.0 ? "Uses " + gigabytes(game.size_gb) : "";
+            text = shown_size_gb(game) > 0.0 ? "Uses " + gigabytes(shown_size_gb(game)) : "";
         }
         else if (game.from_nas && queue_.waiting(game.source.entry) != nullptr)
         {
@@ -2167,6 +2209,7 @@ class Library final : public app::Concept
     ui::TabBar tabs_;
     Filter filter_ = kAll;
     std::vector<Game> games_;
+    std::map<std::string, std::uint64_t> image_sizes_; // images on the PS5, by path: their size
     std::vector<int> shown_; // indices into games_, in grid order
     Source source_ = Source::unset;
     ProbeResult failure_;
