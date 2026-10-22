@@ -1537,6 +1537,15 @@ class Library final : public app::Concept
         checking,      // NASBridge is still checking it can write there
     };
 
+    // What copying the game takes on the drive: a game folder copied as an
+    // exFAT image (Settings > Copying) is a little bigger than its files.
+    double needed_gb(const Game &game) const
+    {
+        if (game.from_nas && !game.source.image && copy_as_image() && game.size_gb > 0.0)
+            return static_cast<double>(image_estimate(static_cast<std::uint64_t>(game.size_gb * 1e9))) / 1e9;
+        return game.size_gb;
+    }
+
     CopyCheck copy_check(const Game &game) const
     {
         if (!space_.asked)
@@ -1567,7 +1576,7 @@ class Library final : public app::Concept
         // What the queue will still write to this drive is spoken for.
         const std::uint64_t queued = queue_.queued_for(destination_);
         const double room = free > queued ? static_cast<double>(free - queued) : 0.0;
-        return game.size_gb * 1e9 > room ? CopyCheck::too_big : CopyCheck::fits;
+        return needed_gb(game) * 1e9 > room ? CopyCheck::too_big : CopyCheck::fits;
     }
 
     double destination_free_gb() const
@@ -2054,20 +2063,20 @@ class Library final : public app::Concept
                 if (queued_gb > 0.0)
                     std::snprintf(free_text, sizeof(free_text),
                                   "%.1f GB free  \u00b7  %.1f GB queued  \u00b7  %.1f GB left after",
-                                  free_gb, queued_gb, free_gb - queued_gb - game.size_gb);
+                                  free_gb, queued_gb, free_gb - queued_gb - needed_gb(game));
                 else
                     std::snprintf(free_text, sizeof(free_text),
                                   "%.1f GB free  \u00b7  %.1f GB left after copying", free_gb,
-                                  free_gb - game.size_gb);
+                                  free_gb - needed_gb(game));
                 break;
             case CopyCheck::too_big:
                 if (queued_gb > 0.0)
                     std::snprintf(free_text, sizeof(free_text),
-                                  "Needs %.1f GB: %.1f GB free, %.1f GB of it queued", game.size_gb,
+                                  "Needs %.1f GB: %.1f GB free, %.1f GB of it queued", needed_gb(game),
                                   free_gb, queued_gb);
                 else
                     std::snprintf(free_text, sizeof(free_text), "Needs %.1f GB, only %.1f GB free",
-                                  game.size_gb, free_gb);
+                                  needed_gb(game), free_gb);
                 text_ink = theme.danger;
                 break;
             case CopyCheck::size_unknown:

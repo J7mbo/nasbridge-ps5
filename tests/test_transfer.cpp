@@ -1763,6 +1763,28 @@ int main(int argc, char **argv)
                 }
                 set_control("{}");
                 notes();
+
+                // Room for the estimate but not the image (600 small files each
+                // take a whole cluster): stopped once the image is laid out,
+                // before anything is written.
+                {
+                    const std::uint64_t tight = image_estimate(many_size) + (4u << 20);
+                    Transfers transfers;
+                    transfers.set_space_check([tight](const std::string &, std::uint64_t *free)
+                                              {
+                                                  *free = tight;
+                                                  return true;
+                                              });
+                    transfers.enqueue(connection, many_game, "Many Files", dest, &why);
+                    wait_for(transfers, stopped, 60);
+                    const QueueStatus q = transfers.queue();
+                    check(q.state == QueueState::failed &&
+                              q.message.find("Not enough space") != std::string::npos && !there(staged_image),
+                          "an image bigger than the room left stops before it's written", q.message);
+                    transfers.remove(0, &why);
+                    wait_for(transfers, [](const QueueStatus &s) { return s.entries.empty() && s.discarding.empty(); });
+                }
+                notes();
             }
             set_copy_as_image(false);
 

@@ -1005,6 +1005,22 @@ class Copier
                 }
                 shared_->save();
             }
+            // The queue checked the room against an estimate; now the size is
+            // known (a game of many small files wastes more of each cluster).
+            struct stat staged{};
+            const std::uint64_t have =
+                ::stat(staging_.c_str(), &staged) == 0 ? static_cast<std::uint64_t>(staged.st_size) : 0;
+            const std::uint64_t need = image.size > have ? image.size - have : 0;
+            std::uint64_t free = 0;
+            if (shared_->space && shared_->space(plan.destination, &free) && need > free)
+            {
+                char text[200];
+                std::snprintf(text, sizeof(text),
+                              "Not enough space on %s for %s as an exFAT image: it needs %.1f GB, %.1f GB is free",
+                              destination_name(plan.destination).c_str(), plan.title.c_str(),
+                              gigabytes(need), gigabytes(free));
+                return fail(text, why);
+            }
         }
 
         // 2. Somewhere to put it: not over a game of the same name. (When an
