@@ -340,7 +340,7 @@ PICKER_SRCS := tests/test_folder_picker.cpp $(LIBSMB2_HOST) \
 HOST_COUNT := build/host/test_game_count
 COUNT_SRCS := tests/test_game_count.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,nas_probe.cpp http.cpp connection.cpp nas_library.cpp \
-    library_cache.cpp exfat.cpp png.cpp nas.cpp) \
+    library_cache.cpp exfat.cpp exfat_image.cpp png.cpp nas.cpp) \
   $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
 
 # The Connection screen's lock while a copy needs its settings.

@@ -256,6 +256,46 @@ struct Tree
     }
 };
 
+// A folder's size in the image: its entries, in whole clusters (at least one).
+std::uint64_t folder_length(std::uint64_t entries)
+{
+    return std::max<std::uint64_t>(round_up(entries * 32, kCluster), kCluster);
+}
+
+// The volume around a game whose folders and files take `game_clusters`:
+// bitmap, up-case table, the room kept free, the FAT, and where the heap
+// starts.
+struct Volume
+{
+    static constexpr std::uint64_t kUpcaseClusters = 1; // 5,836 bytes
+    std::uint64_t bitmap_clusters = 1;
+    std::uint64_t cluster_count = 0;
+    std::uint64_t spare = 0;
+    std::uint64_t fat_sectors = 0;
+    std::uint64_t heap_sector = 0;
+    std::uint64_t volume_sectors = 0;
+};
+
+Volume volume_for(std::uint64_t game_clusters)
+{
+    Volume v;
+    for (int pass = 0; pass < 8; ++pass)
+    {
+        const std::uint64_t used = v.bitmap_clusters + Volume::kUpcaseClusters + game_clusters;
+        const std::uint64_t spare_bytes = std::clamp<std::uint64_t>(used * kCluster / 200, kSpareMin, kSpareMax);
+        v.spare = spare_bytes / kCluster;
+        v.cluster_count = used + v.spare;
+        const std::uint64_t need = round_up((v.cluster_count + 7) / 8, kCluster) / kCluster;
+        if (need == v.bitmap_clusters)
+            break;
+        v.bitmap_clusters = need;
+    }
+    v.fat_sectors = round_up(((v.cluster_count + 2) * 4 + kSector - 1) / kSector, kSectorsPerCluster);
+    v.heap_sector = kFatOffset + v.fat_sectors;
+    v.volume_sectors = v.heap_sector + v.cluster_count * kSectorsPerCluster;
+    return v;
+}
+
 // Entries a child takes in its folder: File, Stream Extension, and a File
 // Name per 15 units.
 std::uint64_t entries_for(const Node &node)
@@ -472,7 +512,7 @@ bool plan_exfat_image(const std::vector<std::string> &folders, const std::vector
             }
             entries += entries_for(nodes[child]);
         }
-        dir.length = std::max<std::uint64_t>(round_up(entries * 32, kCluster), kCluster);
+        dir.length = folder_length(entries);
         if (dir.length > kMaxFolderBytes)
         {
             *why = "a folder of the game holds more files than exFAT allows";
@@ -505,24 +545,16 @@ bool plan_exfat_image(const std::vector<std::string> &folders, const std::vector
         if (nodes[child].directory)
             stack.emplace_back(child, 0);
     }
-    const std::uint64_t upcase_clusters = 1; // 5,836 bytes
-    std::uint64_t bitmap_clusters = 1, cluster_count = 0, spare = 0;
-    for (int pass = 0; pass < 8; ++pass)
-    {
-        const std::uint64_t used = bitmap_clusters + upcase_clusters + game_clusters;
-        const std::uint64_t spare_bytes = std::clamp<std::uint64_t>(used * kCluster / 200, kSpareMin, kSpareMax);
-        spare = spare_bytes / kCluster;
-        cluster_count = used + spare;
-        const std::uint64_t need = round_up((cluster_count + 7) / 8, kCluster) / kCluster;
-        if (need == bitmap_clusters)
-            break;
-        bitmap_clusters = need;
-    }
-    if (cluster_count > kMaxClusters)
+    const Volume volume = volume_for(game_clusters);
+    if (volume.cluster_count > kMaxClusters)
     {
         *why = "the game is too big for one exFAT image";
         return false;
     }
+    const std::uint64_t upcase_clusters = Volume::kUpcaseClusters;
+    const std::uint64_t bitmap_clusters = volume.bitmap_clusters, cluster_count = volume.cluster_count,
+                        spare = volume.spare, fat_sectors = volume.fat_sectors,
+                        heap_sector = volume.heap_sector, volume_sectors = volume.volume_sectors;
     const std::uint64_t used = cluster_count - spare;
     std::uint64_t next_cluster = 2;
     const std::uint32_t bitmap_first = static_cast<std::uint32_t>(next_cluster);
@@ -534,10 +566,6 @@ bool plan_exfat_image(const std::vector<std::string> &folders, const std::vector
         nodes[n].first_cluster = static_cast<std::uint32_t>(next_cluster);
         next_cluster += nodes[n].clusters;
     }
-    const std::uint64_t fat_sectors =
-        round_up(((cluster_count + 2) * 4 + kSector - 1) / kSector, kSectorsPerCluster);
-    const std::uint64_t heap_sector = kFatOffset + fat_sectors;
-    const std::uint64_t volume_sectors = heap_sector + cluster_count * kSectorsPerCluster;
 
     // 4. The bytes.
     std::uint32_t serial = 2166136261u; // FNV-1a over the list
@@ -623,6 +651,74 @@ bool plan_exfat_image(const std::vector<std::string> &folders, const std::vector
     image->size = volume_sectors * kSector;
     image->free_bytes = spare * kCluster;
     return true;
+}
+
+// ---- an image's size, as a listing streams in ----
+
+bool ExfatImageSize::name_entries(const std::string &name, std::uint64_t *entries)
+{
+    std::u16string units;
+    if (!to_utf16(name, &units) || !name_problem(name, units).empty())
+    {
+        bad_ = true;
+        return false;
+    }
+    *entries = 2 + (units.size() + 14) / 15;
+    return true;
+}
+
+bool ExfatImageSize::folder(const std::string &path)
+{
+    if (folders_.count(path) != 0)
+        return true;
+    if (path.empty())
+    {
+        folders_[path] = 0; // the root
+        return true;
+    }
+    const std::size_t slash = path.rfind('/');
+    const std::string parent = slash == std::string::npos ? std::string() : path.substr(0, slash);
+    std::uint64_t entries = 0;
+    if (!folder(parent) || !name_entries(slash == std::string::npos ? path : path.substr(slash + 1), &entries))
+        return false;
+    folders_[parent] += entries;
+    folders_[path] = 0;
+    return true;
+}
+
+void ExfatImageSize::add_folder(const std::string &path)
+{
+    if (!path.empty())
+        folder(path);
+}
+
+void ExfatImageSize::add_file(const std::string &path, std::uint64_t size)
+{
+    const std::size_t slash = path.rfind('/');
+    const std::string parent = slash == std::string::npos ? std::string() : path.substr(0, slash);
+    std::uint64_t entries = 0;
+    if (!folder(parent) || !name_entries(slash == std::string::npos ? path : path.substr(slash + 1), &entries))
+        return;
+    folders_[parent] += entries;
+    file_clusters_ += (size + kCluster - 1) / kCluster;
+}
+
+std::uint64_t ExfatImageSize::size() const
+{
+    if (bad_)
+        return 0;
+    std::uint64_t game_clusters = file_clusters_;
+    if (folders_.count("") == 0)
+        game_clusters += 1; // an empty root still takes a cluster
+    for (const auto &[path, entries] : folders_)
+    {
+        const std::uint64_t length = folder_length(entries + (path.empty() ? 3 : 0));
+        if (length > kMaxFolderBytes)
+            return 0;
+        game_clusters += length / kCluster;
+    }
+    const Volume volume = volume_for(game_clusters);
+    return volume.cluster_count > kMaxClusters ? 0 : volume.volume_sectors * kSector;
 }
 
 bool check_exfat_image(const ExfatReader::ReadAt &read, const std::vector<std::string> &folders,

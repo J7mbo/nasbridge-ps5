@@ -800,6 +800,7 @@ class Library final : public app::Concept
                     Game &game = games_[static_cast<std::size_t>(index)];
                     game.source.size = event.bytes;
                     game.source.size_known = true;
+                    game.source.image_size = event.image_bytes;
                     game.size_gb = static_cast<double>(event.bytes) / 1e9;
                     update_card(index);
                 }
@@ -1580,7 +1581,13 @@ class Library final : public app::Concept
     double needed_gb(const Game &game) const
     {
         if (game.from_nas && !game.source.image && copy_as_image() && game.size_gb > 0.0)
-            return static_cast<double>(image_estimate(static_cast<std::uint64_t>(game.size_gb * 1e9))) / 1e9;
+        {
+            // Exact once the folder was measured; until then, an estimate.
+            const std::uint64_t bytes = game.source.image_size > 0
+                                            ? game.source.image_size
+                                            : image_estimate(static_cast<std::uint64_t>(game.size_gb * 1e9));
+            return static_cast<double>(bytes) / 1e9;
+        }
         return game.size_gb;
     }
 

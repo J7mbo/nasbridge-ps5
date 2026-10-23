@@ -4,6 +4,7 @@
 
 #include "concepts/nas_library.hpp"
 
+#include "concepts/exfat_image.hpp"
 #include "concepts/library_cache.hpp"
 #include "concepts/nas.hpp"
 #include "concepts/nas_probe.hpp"
@@ -12,6 +13,7 @@
 #include <cstring>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <map>
 #include <pthread.h>
 #include <sched.h>
@@ -752,7 +754,10 @@ struct LibraryLoader::Job
     // listed one folder at a time instead, which is much slower. (SMB has no
     // deep listing: several folders are listed at once instead, over the one
     // sign-in.)
-    bool measure(const std::string &url, std::uint64_t *total)
+    //
+    // `seen` hears every entry listed (each once), for the exFAT image size.
+    bool measure(const std::string &url, std::uint64_t *total,
+                 const std::function<void(const DavEntry &)> &seen)
     {
         *total = 0;
         if (nas->smb())
@@ -764,12 +769,15 @@ struct LibraryLoader::Job
                                      if (cancelled || ++folders > kSizeFolders)
                                          return false;
                                      for (const DavEntry &entry : inside)
+                                     {
+                                         seen(entry);
                                          if (!entry.folder && !is_archive(entry.name))
                                              *total += entry.size;
+                                     }
                                      return true;
                                  });
         }
-        if (deep_size(url, total))
+        if (deep_size(url, total, seen))
             return true;
         *total = 0;
         std::vector<std::string> queue{url};
@@ -782,6 +790,7 @@ struct LibraryLoader::Job
                 return false;
             for (const DavEntry &entry : inside)
             {
+                seen(entry);
                 if (entry.folder)
                     queue.push_back(queue[next] + entry.name + "/");
                 else if (!is_archive(entry.name))
@@ -791,8 +800,37 @@ struct LibraryLoader::Job
         return true;
     }
 
+    // Adds a listed entry to the image size when a copy would take it: under
+    // the folder the copy starts from, nothing hidden or NAS-internal on the
+    // way (as transfer.cpp's safe_relative), and not an archive.
+    static void add_to_image(ExfatImageSize *image, const std::string &copy_root, const DavEntry &entry)
+    {
+        std::string path = entry.path;
+        while (path.size() > 1 && path.back() == '/')
+            path.pop_back();
+        if (path.size() <= copy_root.size() + 1 || path.compare(0, copy_root.size() + 1, copy_root + "/") != 0)
+            return;
+        const std::string relative = path.substr(copy_root.size() + 1);
+        for (std::size_t start = 0; start <= relative.size();)
+        {
+            std::size_t end = relative.find('/', start);
+            if (end == std::string::npos)
+                end = relative.size();
+            const std::string part = relative.substr(start, end - start);
+            if (part.empty() || part == "." || part == ".." || part[0] == '.' || part[0] == '@' ||
+                part[0] == '#')
+                return;
+            start = end + 1;
+        }
+        if (entry.folder)
+            image->add_folder(relative);
+        else if (!is_archive(entry.name))
+            image->add_file(relative, entry.size);
+    }
+
     // One deep listing, summed as it arrives. False when the NAS won't give one.
-    bool deep_size(const std::string &url, std::uint64_t *total)
+    bool deep_size(const std::string &url, std::uint64_t *total,
+                   const std::function<void(const DavEntry &)> &seen)
     {
         *total = 0;
         std::string pending; // XML not yet read: at most part of one entry, plus a read
@@ -822,8 +860,11 @@ struct LibraryLoader::Job
             if (parse_listing(pending.substr(0, cut), url, &entries) || cut > 0)
                 ++responses;
             for (const DavEntry &entry : entries)
+            {
+                seen(entry);
                 if (!entry.folder && !is_archive(entry.name))
                     *total += entry.size;
+            }
             pending.erase(0, cut);
         };
         const HttpReply reply = http_stream(
@@ -1019,14 +1060,24 @@ struct LibraryLoader::Job
             progress(static_cast<int>(k), static_cast<int>(to_measure.size()),
                      "Measuring " + game.title);
             std::uint64_t bytes = 0;
-            if (!measure(root + game.entry + "/", &bytes))
+            // The exFAT image the game would be copied as: what the copy
+            // takes (the folder holding sce_sys, which may be one inside the
+            // game's folder), laid out as exfat_image.cpp lays it out.
+            const std::size_t slash = game.base.rfind('/');
+            const std::string copy_root =
+                root + (slash == std::string::npos ? game.entry : game.base.substr(0, slash));
+            ExfatImageSize image;
+            const auto seen = [&](const DavEntry &entry) { add_to_image(&image, copy_root, entry); };
+            if (!measure(root + game.entry + "/", &bytes, seen))
                 continue;
             game.size = bytes;
+            game.image_size = image.size();
             game.size_known = true;
             LibraryEvent event;
             event.kind = LibraryEvent::Kind::size;
             event.entry = game.entry;
             event.bytes = bytes;
+            event.image_bytes = game.image_size;
             post(std::move(event));
         }
         if (!to_measure.empty() && !cancelled)

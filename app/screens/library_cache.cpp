@@ -35,7 +35,7 @@ std::string list_path()
 }
 constexpr std::uint16_t kVersion = 1;
 constexpr const char *kHeader = "nasbridge-library 1";
-constexpr std::size_t kFields = 32;
+constexpr std::size_t kFields = 33; // 32 before the exFAT image size was kept
 
 void make_directories()
 {
@@ -199,6 +199,7 @@ std::string library_to_text(const Connection &connection, const std::vector<NasG
         f.push_back(g.folder_stamp);
         f.push_back(g.cover_saved ? "1" : "0");
         f.push_back(g.art_saved ? "1" : "0");
+        f.push_back(std::to_string(g.image_size));
         std::string line;
         for (std::size_t i = 0; i < f.size(); ++i)
             line += (i == 0 ? "" : "\t") + escaped(f[i]);
@@ -231,7 +232,7 @@ bool library_from_text(const Connection &connection, const std::string &text,
         if (line.empty())
             continue;
         const std::vector<std::string> f = split_tabs(line);
-        if (f.size() != kFields || f[0].empty())
+        if ((f.size() != kFields && f.size() != kFields - 1) || f[0].empty())
             return false;
         NasGame g;
         g.entry = f[0];
@@ -258,6 +259,10 @@ bool library_from_text(const Connection &connection, const std::string &text,
         g.folder_stamp = f[29];
         g.cover_saved = f[30] == "1";
         g.art_saved = f[31] == "1";
+        if (f.size() == kFields)
+            g.image_size = number(f[32]);
+        else if (!g.image)
+            g.size_known = false; // saved before image sizes: measured again, for that
         games->push_back(std::move(g));
     }
     return true;

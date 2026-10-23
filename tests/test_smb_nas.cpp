@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <functional>
 #include <signal.h>
 #include <string>
@@ -127,6 +128,7 @@ struct Library
     std::string headline;
     int covers = 0;
     std::vector<std::pair<std::string, std::uint64_t>> sizes;
+    std::map<std::string, std::uint64_t> image_sizes; // the exFAT image each would copy as
 };
 
 // The library as the screen reads it: what the cache saved last time first.
@@ -156,6 +158,7 @@ Library read_library(const Connection &connection)
                 break;
             case LibraryEvent::Kind::size:
                 got.sizes.emplace_back(event.entry, event.bytes);
+                got.image_sizes[event.entry] = event.image_bytes;
                 break;
             case LibraryEvent::Kind::finished:
                 got.finished = true;
@@ -317,6 +320,7 @@ int main(int argc, char **argv)
 
     // 2. The library finds what it finds over WebDAV (tests/test_game_count.cpp).
     set_cache_root(work + "/cache");
+    std::uint64_t one_image_size = 0; // measured with Game One's size
     {
         const Library library = read_library(connection);
         int folders = 0, images = 0;
@@ -338,6 +342,9 @@ int main(int argc, char **argv)
         for (const auto &[entry, bytes] : library.sizes)
             measured = measured || (entry == "Game One" && bytes == one_size);
         check(measured, "a folder game's size is added up, archives left out");
+        one_image_size = library.image_sizes.count("Game One") ? library.image_sizes.at("Game One") : 0;
+        check(one_image_size > one_size, "the exFAT image it would copy as is measured with it",
+              std::to_string(one_image_size));
         check(library.finished && library.headline.empty(), "the library finishes cleanly",
               library.headline);
 
@@ -445,6 +452,10 @@ int main(int argc, char **argv)
             for (int i = 0; i < 40; ++i)
                 many = many && inside("data/many/f" + std::to_string(i) + ".bin");
             std::string none;
+            struct stat made{};
+            check(::stat(got.c_str(), &made) == 0 && static_cast<std::uint64_t>(made.st_size) == one_image_size,
+                  "the image is exactly the size the library measured",
+                  std::to_string(static_cast<long long>(made.st_size)) + " vs " + std::to_string(one_image_size));
             check(copied && inside("data/big.bin") && inside("sce_sys/param.json") &&
                       inside("data/sub/tiny.txt") && inside("data/sub/empty.txt") && many &&
                       !from_image(got, "Game One.zip", &none) && !there(dest + "/Game One"),

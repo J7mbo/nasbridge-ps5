@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace hui::concepts
@@ -72,6 +73,28 @@ struct ExfatImage
 // that differ only in case.
 bool plan_exfat_image(const std::vector<std::string> &folders, const std::vector<ImageFile> &files,
                       const std::string &label, ExfatImage *image, std::string *why);
+
+// An image's exact size, worked out as a game's listing streams in, without
+// keeping the list: the size plan_exfat_image lays the same game out at.
+// Each folder and file is added once, in any order (a file's folders needn't
+// come first), with its path relative to the game. size() is 0 when the game
+// can't be an image (a name exFAT can't hold, a folder too full, too big).
+// Two names differing only in case aren't caught here: the copy finds those.
+class ExfatImageSize
+{
+  public:
+    void add_folder(const std::string &path);
+    void add_file(const std::string &path, std::uint64_t size);
+    std::uint64_t size() const;
+
+  private:
+    bool folder(const std::string &path);
+    bool name_entries(const std::string &name, std::uint64_t *entries);
+
+    std::unordered_map<std::string, std::uint64_t> folders_; // each folder: its children's entries
+    std::uint64_t file_clusters_ = 0;
+    bool bad_ = false;
+};
 
 // Reads an image back and checks it holds exactly these folders and files,
 // each file at its size, laid out where the image has room. False with *why.

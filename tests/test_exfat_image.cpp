@@ -138,6 +138,15 @@ void round_trip(const std::string &work, const std::string &what, const std::vec
         check(false, what + ": laid out", why);
         return;
     }
+    // Worked out as a listing streams in (files first, folders after, in
+    // reverse): the same size, to the byte.
+    ExfatImageSize sizer;
+    for (auto file = files.rbegin(); file != files.rend(); ++file)
+        sizer.add_file(file->path, file->size);
+    for (auto folder = folders.rbegin(); folder != folders.rend(); ++folder)
+        sizer.add_folder(*folder);
+    check(sizer.size() == image.size, what + ": its size is known from the listing alone",
+          std::to_string(sizer.size()) + " vs " + std::to_string(image.size));
     std::uint64_t total = 0;
     for (const ImagePiece &piece : image.pieces)
         total += piece.length;
@@ -231,6 +240,13 @@ int main(int argc, char **argv)
         check(image.free_bytes == (64u << 20), "a small image keeps 64 MiB free inside it");
     }
 
+    // A name exFAT can't hold: no size.
+    {
+        ExfatImageSize sizer;
+        sizer.add_file("data/a?.bin", 10);
+        check(sizer.size() == 0, "a name exFAT can't hold gives no image size");
+    }
+
     // A big game: laid out without reading anything (sizes only).
     {
         std::vector<ImageFile> files;
@@ -240,6 +256,10 @@ int main(int argc, char **argv)
         std::string why;
         const bool ok = plan_exfat_image({}, files, "PPSA01234", &image, &why);
         const std::uint64_t data = 20 * 5000000000ull;
+        ExfatImageSize sizer;
+        for (const ImageFile &file : files)
+            sizer.add_file(file.path, file.size);
+        check(sizer.size() == image.size, "a 100 GB game's size is known from the listing alone");
         check(ok && image.size > data && image.size < data + data / 100 + (64u << 20),
               "a 100 GB game is laid out, a little over its size",
               std::to_string(image.size));
