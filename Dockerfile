@@ -159,11 +159,12 @@ RUN git init -q "$LIBSMB2" && cd "$LIBSMB2" \
  && rm -rf .git \
  && chmod -R a+rX "$LIBSMB2"
 
-# For the SMB tests only (none of it is in what's installed): Samba's smbd as
-# the test NAS, and nss_wrapper, which gives the user the container runs as
-# an account name for smbd (tests/smb_server.py).
+# For the tests only (none of it is in what's installed): Samba's smbd as
+# the SMB tests' NAS, nss_wrapper, which gives the user the container runs as
+# an account name for smbd (tests/smb_server.py), and fsck.exfat, which checks
+# the exFAT images NASBridge lays out (tests/test_exfat_image.cpp).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends samba libnss-wrapper \
+ && apt-get install -y --no-install-recommends samba libnss-wrapper exfatprogs \
  && rm -rf /var/lib/apt/lists/*
 
 # Record exact tool versions inside the image (shown by `make toolchain-info`).

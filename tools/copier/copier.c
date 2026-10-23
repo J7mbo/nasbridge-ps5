@@ -88,6 +88,7 @@
  * here are all on the heap. */
 #define THREAD_STACK (256u * 1024u)
 #define MAX_STREAMS 4 /* the Settings screen: 1..4 */
+#define MAX_CONNS 16  /* connections one job may have open (an image: one per worker) */
 #define CHUNK_TRIES 3     /* a dropped chunk is asked for again this often */
 #define REFETCH (4ull << 20) /* a file's last bytes may not have reached the disk */
 #define SYNC_MS 250
@@ -325,7 +326,7 @@ typedef struct job {
   uint64_t last_sync; /* now_ms() of the last fsync */
   uint64_t unsynced;
   int active;         /* connections bringing data in now */
-  int nas[MAX_STREAMS]; /* their sockets, to cut them off on a stop (-1: none) */
+  int nas[MAX_CONNS]; /* their sockets, to cut them off on a stop (-1: none) */
 } job_t;
 
 /* Writes len bytes at the file's next position, flushing every SYNC_MS or
@@ -364,7 +365,7 @@ static void stop_all(job_t *j) {
   int i;
   pthread_mutex_lock(&j->mu);
   j->abort = 1;
-  for (i = 0; i < MAX_STREAMS; ++i)
+  for (i = 0; i < MAX_CONNS; ++i)
     if (j->nas[i] >= 0) shutdown(j->nas[i], SHUT_RDWR);
   pthread_cond_broadcast(&j->cv);
   pthread_mutex_unlock(&j->mu);
@@ -1979,6 +1980,580 @@ out:
   free(b);
 }
 
+/* ------------------------------------------- a folder game as one image file */
+
+/* "Copy as an exFAT image": NASBridge lays the image out from the game's file
+ * list (exfat_image.cpp) and sends it as pieces in the image's order; this
+ * writes them strictly front to back into one file, fetching the game's files
+ * on several connections at once, a few pieces ahead of the writer:
+ *   NASBridge -> "NBI1\t<ip>\t<port>\t<image size>\t<file>\t<list length>\t<connections>\n"
+ *                then the list, <list length> bytes:
+ *                  "H <n>\n" and n bytes: the header lines each GET carries
+ *                    (Host, sign-in, "Connection: keep-alive"), or
+ *                  "S <n>\n" and n bytes: the SMB sign-in (share, user,
+ *                    domain, password, each ended by a NUL),
+ *                then the image, front to back:
+ *                  "D <n>\n" and n bytes  the file system's own bytes
+ *                  "Z <n>\n"              n zero bytes
+ *                  "F <size> <name>\n"    a file of the game: the GET's target,
+ *                                         or its path in the share
+ *   helper  -> as for one file: "P ..." lines, then "OK" | "STOPPED" |
+ *              "ERR <kind> <why>", the why naming the game's file; kind
+ *              "ranges" when the NAS won't send part of a file.
+ * The image only grows, so it resumes as a file does, from its length. */
+#define IMAGE_PROTO "NBI1"
+#define IMAGE_UNIT (4u << 20)         /* a file is fetched this much at a time */
+#define IMAGE_AHEAD 32                /* pieces fetched ahead of the writer, at most */
+#define IMAGE_AHEAD_BYTES (48u << 20) /* ... and bytes */
+#define MAX_IMAGE_LIST (512u << 20)
+
+typedef struct ipiece {
+  char kind;       /* 'D', 'Z' or 'F' */
+  uint64_t at;     /* where it starts in the image */
+  uint64_t len;
+  const char *data; /* D: its bytes; F: the file's name */
+} ipiece_t;
+
+typedef struct iunit {
+  uint32_t piece; /* an F piece */
+  uint64_t off;   /* in the file */
+  uint32_t len;
+} iunit_t;
+
+typedef struct islot {
+  char *buf; /* a fetched unit, waiting for the writer */
+  int ready;
+} islot_t;
+
+typedef struct image {
+  job_t *j;
+  ipiece_t *pieces;
+  size_t npieces;
+  iunit_t *units;
+  size_t nunits;
+  size_t next_claim, next_write;
+  uint64_t ahead_bytes;
+  islot_t slot[IMAGE_AHEAD];
+  int workers, workers_left, writer_done;
+  const char *headers; /* HTTP */
+  size_t headers_len;
+  const smb_sign_in_t *smb; /* SMB */
+  int failed;               /* the first failure is kept */
+  char kind[16];
+  char why[MAX_FILE + 96];
+} image_t;
+
+typedef struct iworker {
+  image_t *im;
+  int w;
+  int nas;                   /* HTTP: this worker's connection, kept between files */
+  struct smb2_context *smb2; /* SMB: its sign-in */
+  struct smb2fh *fh;         /* ... and the file it has open */
+  uint32_t fh_piece;
+  char *head;
+} iworker_t;
+
+static int image_done(void *arg) {
+  image_t *im = arg;
+  return im->workers_left == 0 && im->writer_done;
+}
+
+/* Keeps the first failure and stops everything. */
+static void image_fail(image_t *im, const char *kind, const char *fmt, ...) {
+  va_list ap;
+  pthread_mutex_lock(&im->j->mu);
+  if (!im->failed && !im->j->abort) {
+    im->failed = 1;
+    snprintf(im->kind, sizeof im->kind, "%s", kind);
+    va_start(ap, fmt);
+    vsnprintf(im->why, sizeof im->why, fmt, ap);
+    va_end(ap);
+  }
+  pthread_mutex_unlock(&im->j->mu);
+  stop_all(im->j);
+}
+
+static int image_aborted(image_t *im) {
+  int a;
+  pthread_mutex_lock(&im->j->mu);
+  a = im->j->abort;
+  pthread_mutex_unlock(&im->j->mu);
+  return a;
+}
+
+static void image_set_nas(iworker_t *me, int fd) {
+  job_t *j = me->im->j;
+  pthread_mutex_lock(&j->mu);
+  j->nas[me->w] = fd;
+  if (j->abort && fd >= 0) shutdown(fd, SHUT_RDWR);
+  pthread_mutex_unlock(&j->mu);
+}
+
+static void image_drop_http(iworker_t *me) {
+  if (me->nas < 0) return;
+  image_set_nas(me, -1);
+  close(me->nas);
+  me->nas = -1;
+}
+
+static void image_drop_smb(iworker_t *me) {
+  if (!me->smb2) return;
+  image_set_nas(me, -1);
+  smb2_destroy_context(me->smb2); /* closes the file too */
+  me->smb2 = NULL;
+  me->fh = NULL;
+}
+
+/* One unit over HTTP. 0, 1 a network hiccup (tried again), or -1 having
+ * failed the job. */
+static int image_fetch_http(iworker_t *me, const iunit_t *u, char *buf) {
+  image_t *im = me->im;
+  const ipiece_t *p = &im->pieces[u->piece];
+  char value[96], expect[64], range[96];
+  size_t hlen, body_at, have = 0;
+  uint64_t expected;
+  int status, rc, keep = 1;
+  if (me->nas < 0) {
+    me->nas = connect_nas(im->j->ip, im->j->port);
+    if (me->nas < 0) return 1;
+    image_set_nas(me, me->nas);
+  }
+  snprintf(range, sizeof range, "Range: bytes=%llu-%llu\r\n\r\n", (unsigned long long)u->off,
+           (unsigned long long)(u->off + u->len - 1));
+  if (send_all(me->nas, "GET ", 4) != 0 || send_all(me->nas, p->data, strlen(p->data)) != 0 ||
+      send_all(me->nas, " HTTP/1.1\r\n", 11) != 0 ||
+      send_all(me->nas, im->headers, im->headers_len) != 0 ||
+      send_all(me->nas, range, strlen(range)) != 0)
+    return 1;
+  rc = read_head(me->nas, me->head, &hlen, &body_at, &status);
+  if (rc != 0) return 1;
+  if (header(me->head, "transfer-encoding", value, sizeof value) && strstr(value, "chunked")) {
+    image_fail(im, "chunked", "the NAS sends %s in chunks", p->data);
+    return -1;
+  }
+  if (status == 206) {
+    snprintf(expect, sizeof expect, "bytes %llu-", (unsigned long long)u->off);
+    if (!header(me->head, "content-range", value, sizeof value) ||
+        strncmp(value, expect, strlen(expect)) != 0) {
+      image_fail(im, "changed", "the NAS sent a different part of %s", p->data);
+      return -1;
+    }
+  } else if (status == 200) {
+    /* The whole file, which is fine when the whole file was asked for. */
+    if (u->off != 0 || u->len != p->len) {
+      image_fail(im, "ranges", "the NAS won't send part of a file");
+      return -1;
+    }
+  } else {
+    image_fail(im, "http", "%d %s", status, p->data);
+    return -1;
+  }
+  expected = UNKNOWN_LEN;
+  if (header(me->head, "content-length", value, sizeof value)) expected = strtoull(value, NULL, 10);
+  if (expected != u->len) {
+    image_fail(im, "changed", "%s is a different size on the NAS now", p->data);
+    return -1;
+  }
+  if (header(me->head, "connection", value, sizeof value)) {
+    char *c;
+    for (c = value; *c; ++c)
+      if (*c >= 'A' && *c <= 'Z') *c = (char)(*c - 'A' + 'a');
+    if (strstr(value, "close")) keep = 0;
+  }
+  if (hlen > body_at) {
+    have = hlen - body_at;
+    if (have > u->len) have = u->len;
+    memcpy(buf, me->head + body_at, have);
+  }
+  while (have < u->len) {
+    ssize_t n = recv(me->nas, buf + have, u->len - have, 0);
+    if (n > 0) {
+      have += (size_t)n;
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    return 1;
+  }
+  if (!keep) image_drop_http(me);
+  return 0;
+}
+
+/* One unit over SMB, as image_fetch_http. */
+static int image_fetch_smb(iworker_t *me, const iunit_t *u, char *buf) {
+  image_t *im = me->im;
+  const ipiece_t *p = &im->pieces[u->piece];
+  const char *kind = "drop";
+  char why[200];
+  if (!me->smb2) {
+    me->smb2 = smb_connect(im->j->ip, im->j->port, im->smb, &kind, why, sizeof why);
+    if (!me->smb2) {
+      if (strcmp(kind, "smb") == 0) {
+        image_fail(im, kind, "%s", why);
+        return -1;
+      }
+      return 1;
+    }
+    image_set_nas(me, smb2_get_fd(me->smb2)); /* a stop cuts it off */
+  }
+  if (!me->fh || me->fh_piece != u->piece) {
+    struct smb2_stat_64 st;
+    if (me->fh) smb2_close(me->smb2, me->fh);
+    me->fh = smb2_open(me->smb2, p->data, O_RDONLY);
+    if (!me->fh || smb2_fstat(me->smb2, me->fh, &st) < 0) {
+      kind = smb_failure(me->smb2, why, sizeof why);
+      if (strcmp(kind, "smb") == 0) {
+        image_fail(im, kind, "%s: %s", why, p->data);
+        return -1;
+      }
+      image_drop_smb(me);
+      return 1;
+    }
+    me->fh_piece = u->piece;
+    if (st.smb2_size != p->len) {
+      image_fail(im, "changed", "%s is a different size on the NAS now", p->data);
+      return -1;
+    }
+  }
+  if (smb_read_span(me->smb2, me->fh, u->off, u->len, buf) != 0) {
+    kind = smb_failure(me->smb2, why, sizeof why);
+    if (strcmp(kind, "smb") == 0 && !image_aborted(im)) {
+      image_fail(im, kind, "%s: %s", why, p->data);
+      return -1;
+    }
+    image_drop_smb(me);
+    return 1;
+  }
+  return 0;
+}
+
+static void *image_worker(void *arg) {
+  iworker_t *me = arg;
+  image_t *im = me->im;
+  job_t *j = im->j;
+  me->head = malloc(MAX_HEADER + 1);
+  if (!me->head) image_fail(im, "request", "out of memory");
+  while (me->head) {
+    size_t k;
+    iunit_t u;
+    char *buf;
+    int tries, rc = 1;
+    pthread_mutex_lock(&j->mu);
+    while (!j->abort && im->next_claim < im->nunits &&
+           (im->next_claim - im->next_write >= IMAGE_AHEAD ||
+            im->ahead_bytes + im->units[im->next_claim].len > IMAGE_AHEAD_BYTES))
+      pthread_cond_wait(&j->cv, &j->mu);
+    if (j->abort || im->next_claim >= im->nunits) {
+      pthread_mutex_unlock(&j->mu);
+      break;
+    }
+    k = im->next_claim++;
+    u = im->units[k];
+    im->ahead_bytes += u.len;
+    ++j->active;
+    pthread_mutex_unlock(&j->mu);
+    buf = malloc(u.len);
+    if (!buf) {
+      image_fail(im, "request", "out of memory");
+      break;
+    }
+    for (tries = 0; tries < CHUNK_TRIES && rc == 1; ++tries) {
+      if (tries > 0) {
+        if (im->smb)
+          image_drop_smb(me);
+        else
+          image_drop_http(me);
+        if (image_aborted(im)) break;
+        sleep_ms(500u * (unsigned)tries);
+      }
+      rc = im->smb ? image_fetch_smb(me, &u, buf) : image_fetch_http(me, &u, buf);
+    }
+    pthread_mutex_lock(&j->mu);
+    --j->active;
+    if (rc == 0) {
+      im->slot[k % IMAGE_AHEAD].buf = buf;
+      im->slot[k % IMAGE_AHEAD].ready = 1;
+      buf = NULL;
+    }
+    pthread_cond_broadcast(&j->cv);
+    pthread_mutex_unlock(&j->mu);
+    free(buf);
+    if (rc == 1 && !image_aborted(im))
+      image_fail(im, "drop", "the NAS keeps dropping the connection (%s)", im->pieces[u.piece].data);
+    if (rc != 0) break;
+  }
+  if (im->smb)
+    image_drop_smb(me);
+  else
+    image_drop_http(me);
+  free(me->head);
+  pthread_mutex_lock(&j->mu);
+  --im->workers_left;
+  pthread_cond_broadcast(&j->cv);
+  pthread_mutex_unlock(&j->mu);
+  return NULL;
+}
+
+/* Puts the pieces down in order from j->start. */
+static void *image_writer(void *arg) {
+  image_t *im = arg;
+  job_t *j = im->j;
+  static const char zeros[1u << 16];
+  size_t i;
+  int err = 0;
+  for (i = 0; i < im->npieces && !err; ++i) {
+    const ipiece_t *p = &im->pieces[i];
+    uint64_t from = j->start > p->at ? j->start - p->at : 0;
+    if (p->at + p->len <= j->start) continue;
+    if (image_aborted(im)) break;
+    if (p->kind == 'D') {
+      for (; from < p->len && !err; from += BUF_SIZE)
+        err = put(j, p->data + from, (size_t)(p->len - from < BUF_SIZE ? p->len - from : BUF_SIZE));
+    } else if (p->kind == 'Z') {
+      for (; from < p->len && !err; from += sizeof zeros)
+        err = put(j, zeros, (size_t)(p->len - from < sizeof zeros ? p->len - from : sizeof zeros));
+    } else {
+      /* Its units, in order, as the workers bring them in. */
+      while (!err && im->next_write < im->nunits && im->units[im->next_write].piece == i) {
+        islot_t *s = &im->slot[im->next_write % IMAGE_AHEAD];
+        char *buf;
+        uint32_t len = im->units[im->next_write].len;
+        pthread_mutex_lock(&j->mu);
+        while (!s->ready && !j->abort) pthread_cond_wait(&j->cv, &j->mu);
+        if (!s->ready) {
+          pthread_mutex_unlock(&j->mu);
+          goto out;
+        }
+        buf = s->buf;
+        s->buf = NULL;
+        s->ready = 0;
+        pthread_mutex_unlock(&j->mu);
+        err = put(j, buf, len);
+        free(buf);
+        pthread_mutex_lock(&j->mu);
+        ++im->next_write;
+        im->ahead_bytes -= len;
+        pthread_cond_broadcast(&j->cv);
+        pthread_mutex_unlock(&j->mu);
+      }
+    }
+  }
+out:
+  if (err) {
+    pthread_mutex_lock(&j->mu);
+    j->write_err = err;
+    pthread_mutex_unlock(&j->mu);
+    stop_all(j);
+  }
+  pthread_mutex_lock(&j->mu);
+  im->writer_done = 1;
+  pthread_cond_broadcast(&j->cv);
+  pthread_mutex_unlock(&j->mu);
+  return NULL;
+}
+
+/* Reads the list: the sign-in or headers, then the pieces. 0, or -1 having
+ * said why. The pieces point into `list`. */
+static int image_parse(job_t *j, image_t *im, char *list, size_t len, smb_sign_in_t *in) {
+  size_t at = 0, cap = 0;
+  uint64_t image_at = 0;
+  int first = 1;
+  while (at < len) {
+    char *nl = memchr(list + at, '\n', len - at), *sp;
+    char kind;
+    uint64_t n;
+    if (!nl) break;
+    *nl = '\0';
+    kind = list[at];
+    if (list[at + 1] != ' ') break;
+    n = strtoull(list + at + 2, &sp, 10);
+    at = (size_t)(nl - list) + 1;
+    if (first) {
+      char *sign[4];
+      first = 0;
+      if (n > len - at) break;
+      if (kind == 'H') {
+        im->headers = list + at;
+        im->headers_len = (size_t)n;
+      } else if (kind == 'S') {
+        if (smb_fields(list + at, (size_t)n, sign, 4) != 0) break;
+        in->share = sign[0];
+        in->path = NULL;
+        in->user = sign[1];
+        in->domain = sign[2];
+        in->password = sign[3];
+        im->smb = in;
+      } else {
+        break;
+      }
+      at += (size_t)n;
+      continue;
+    }
+    if (im->npieces == cap) {
+      ipiece_t *more;
+      cap = cap ? cap * 2 : 1024;
+      more = realloc(im->pieces, cap * sizeof *more);
+      if (!more) {
+        send_line(j->ctl, "ERR request out of memory");
+        return -1;
+      }
+      im->pieces = more;
+    }
+    im->pieces[im->npieces].kind = kind;
+    im->pieces[im->npieces].at = image_at;
+    im->pieces[im->npieces].len = n;
+    im->pieces[im->npieces].data = NULL;
+    if (kind == 'D') {
+      if (n > len - at) break;
+      im->pieces[im->npieces].data = list + at;
+      at += (size_t)n;
+    } else if (kind == 'F') {
+      if (*sp != ' ' || sp[1] == '\0' || n == 0) break;
+      im->pieces[im->npieces].data = sp + 1;
+    } else if (kind != 'Z') {
+      break;
+    }
+    image_at += n;
+    ++im->npieces;
+  }
+  if (at != len || first || image_at != j->size) {
+    send_line(j->ctl, "ERR request bad image list");
+    return -1;
+  }
+  return 0;
+}
+
+/* The F pieces from j->start on, cut into units. 0, or -1 having said why. */
+static int image_units(job_t *j, image_t *im) {
+  size_t i, cap = 0;
+  for (i = 0; i < im->npieces; ++i) {
+    const ipiece_t *p = &im->pieces[i];
+    uint64_t off;
+    if (p->kind != 'F' || p->at + p->len <= j->start) continue;
+    for (off = j->start > p->at ? j->start - p->at : 0; off < p->len; off += IMAGE_UNIT) {
+      if (im->nunits == cap) {
+        iunit_t *more;
+        cap = cap ? cap * 2 : 1024;
+        more = realloc(im->units, cap * sizeof *more);
+        if (!more) {
+          send_line(j->ctl, "ERR request out of memory");
+          return -1;
+        }
+        im->units = more;
+      }
+      im->units[im->nunits].piece = (uint32_t)i;
+      im->units[im->nunits].off = off;
+      im->units[im->nunits].len = (uint32_t)(p->len - off < IMAGE_UNIT ? p->len - off : IMAGE_UNIT);
+      ++im->nunits;
+    }
+  }
+  return 0;
+}
+
+/* Copies a game into one image (the NBI1 line, then the list). Every path
+ * out sends its final line. */
+static void run_image_job(job_t *j, char *line) {
+  char *field[8], *save = NULL, *list = NULL, ip[64], path[MAX_FILE];
+  iworker_t me[MAX_CONNS];
+  pthread_t workers[MAX_CONNS], writer;
+  smb_sign_in_t in;
+  image_t *im = calloc(1, sizeof *im);
+  size_t len;
+  int k, err, started = 0;
+  if (!im) {
+    send_line(j->ctl, "ERR request out of memory");
+    return;
+  }
+  field[0] = strtok_r(line, "\t", &save);
+  for (k = 1; k < 8; ++k) field[k] = strtok_r(NULL, "\t", &save);
+  if (!field[6]) {
+    send_line(j->ctl, "ERR request not a NASBridge image request");
+    goto out;
+  }
+  snprintf(ip, sizeof ip, "%s", field[1]);
+  j->ip = ip;
+  j->port = atoi(field[2]);
+  j->size = strtoull(field[3], NULL, 10);
+  snprintf(path, sizeof path, "%s", field[4]);
+  len = (size_t)strtoull(field[5], NULL, 10);
+  im->workers = atoi(field[6]);
+  if (im->workers < 1) im->workers = 1;
+  if (im->workers > MAX_CONNS) im->workers = MAX_CONNS;
+  im->j = j;
+  if (len < 4 || len > MAX_IMAGE_LIST || path[0] != '/' || j->size == 0) {
+    send_line(j->ctl, "ERR request bad request");
+    goto out;
+  }
+  list = malloc(len);
+  if (!list || recv_exact(j->ctl, list, len) != 0) {
+    send_line(j->ctl, "ERR request the image list didn't arrive");
+    goto out;
+  }
+  if (image_parse(j, im, list, len, &in) != 0) goto out;
+  j->fd = open(path, O_RDWR | O_CREAT, FILE_MODE);
+  if (j->fd < 0) {
+    send_line(j->ctl, "ERR file %s", strerror(errno));
+    goto out;
+  }
+  (void)fchmod(j->fd, FILE_MODE); /* NASBridge moves and deletes it later */
+  if ((err = resume_point(j)) != 0) {
+    send_line(j->ctl, "ERR file %s", strerror(err));
+    goto out;
+  }
+  send_line(j->ctl, "P %llu 0 0 0", (unsigned long long)j->start);
+  if (j->start == j->size) {
+    send_line(j->ctl, "OK");
+    goto out;
+  }
+  if (image_units(j, im) != 0) goto out;
+  j->last_sync = now_ms();
+  memset(me, 0, sizeof me);
+  for (k = 0; k < im->workers; ++k) {
+    me[k].im = im;
+    me[k].w = k;
+    me[k].nas = -1;
+    pthread_mutex_lock(&j->mu);
+    ++im->workers_left;
+    pthread_mutex_unlock(&j->mu);
+    if (start_thread(&workers[k], image_worker, &me[k]) != 0) {
+      pthread_mutex_lock(&j->mu);
+      --im->workers_left;
+      pthread_mutex_unlock(&j->mu);
+      break;
+    }
+  }
+  started = k;
+  if (started == 0 || start_thread(&writer, image_writer, im) != 0) {
+    stop_all(j);
+    for (k = 0; k < started; ++k) pthread_join(workers[k], NULL);
+    send_line(j->ctl, "ERR request couldn't start a thread");
+    goto out;
+  }
+  watch(j, image_done, im);
+  for (k = 0; k < started; ++k) pthread_join(workers[k], NULL);
+  pthread_join(writer, NULL);
+  (void)fsync(j->fd);
+  if (j->write_err)
+    send_line(j->ctl, "ERR write %s", strerror(j->write_err));
+  else if (im->failed)
+    send_line(j->ctl, "ERR %s %s", im->kind, im->why);
+  else if (j->abort)
+    send_line(j->ctl, "STOPPED");
+  else if (j->start + j->written == j->size)
+    send_line(j->ctl, "OK");
+  else
+    send_line(j->ctl, "ERR drop the image stopped at %llu of %llu bytes",
+              (unsigned long long)(j->start + j->written), (unsigned long long)j->size);
+out:
+  for (k = 0; k < IMAGE_AHEAD; ++k) free(im->slot[k].buf);
+  if (list) {
+    if (im->smb) memset(list, 0, len); /* the password */
+    free(list);
+  }
+  free(im->pieces);
+  free(im->units);
+  free(im);
+}
+
 /* Copies one file. Every path out sends its final line. */
 static void run_job(int ctl) {
   char line[MAX_FILE + 128], *field[7], *save = NULL, *request = NULL;
@@ -1990,7 +2565,7 @@ static void run_job(int ctl) {
   memset(&j, 0, sizeof j);
   j.ctl = ctl;
   j.fd = -1;
-  for (k = 0; k < MAX_STREAMS; ++k) j.nas[k] = -1;
+  for (k = 0; k < MAX_CONNS; ++k) j.nas[k] = -1;
   pthread_mutex_init(&j.mu, NULL);
   pthread_cond_init(&j.cv, NULL);
   send_line(ctl, PROTO);
@@ -2014,6 +2589,10 @@ static void run_job(int ctl) {
   }
   if (strncmp(line, PROTO_SMB "\t", sizeof PROTO_SMB) == 0) {
     run_smb_job(&j, line);
+    goto out;
+  }
+  if (strncmp(line, IMAGE_PROTO "\t", sizeof IMAGE_PROTO) == 0) {
+    run_image_job(&j, line);
     goto out;
   }
   field[0] = strtok_r(line, "\t", &save);

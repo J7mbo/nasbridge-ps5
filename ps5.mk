@@ -324,7 +324,7 @@ HOST_TRANSFER := build/host/test_transfer
 TRANSFER_SRCS := tests/test_transfer.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,transfer.cpp copy_helper.cpp delete_helper.cpp file_calls.cpp smp.cpp \
     json_scan.cpp http.cpp connection.cpp library_cache.cpp notify.cpp storage.cpp nas.cpp \
-    nas_probe.cpp) \
+    nas_probe.cpp exfat_image.cpp exfat.cpp) \
   $(APP_WORK)/src/core/save_file.cpp
 
 # The folder picker's moves and listings (drawing isn't exercised, but the
@@ -340,7 +340,7 @@ PICKER_SRCS := tests/test_folder_picker.cpp $(LIBSMB2_HOST) \
 HOST_COUNT := build/host/test_game_count
 COUNT_SRCS := tests/test_game_count.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,nas_probe.cpp http.cpp connection.cpp nas_library.cpp \
-    library_cache.cpp exfat.cpp png.cpp nas.cpp) \
+    library_cache.cpp exfat.cpp exfat_image.cpp png.cpp nas.cpp) \
   $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
 
 # The Connection screen's lock while a copy needs its settings.
@@ -355,7 +355,7 @@ HOST_QUEUE := build/host/test_queue_panel
 QUEUE_SRCS := tests/test_queue_panel.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,queue_panel.cpp transfer.cpp copy_helper.cpp delete_helper.cpp \
     file_calls.cpp smp.cpp json_scan.cpp http.cpp connection.cpp library_cache.cpp notify.cpp \
-    storage.cpp app_settings.cpp nas.cpp nas_probe.cpp) \
+    storage.cpp app_settings.cpp nas.cpp nas_probe.cpp exfat_image.cpp exfat.cpp) \
   $(KIT_DRAWING) $(KIT_COMPONENTS)
 
 # The delete helper (tools/helper/helper.c) and its client (delete_helper.cpp),
@@ -374,6 +374,11 @@ $(HOST_COPIER): tools/copier/copier.c $(HOST_COPIER_SMB)
 $(HOST_HELPER): tools/helper/helper.c
 	@mkdir -p $(@D)
 	clang-18 -std=c11 -Wall -Wextra -Werror -O1 -D_DEFAULT_SOURCE -DHELPER_HOST_TEST -o $@ $<
+# Laying a folder game out as an exFAT image, read back with our own reader
+# (and fsck.exfat, where this computer has it).
+HOST_EXFAT_IMAGE := build/host/test_exfat_image
+EXFAT_IMAGE_SRCS := tests/test_exfat_image.cpp \
+  $(addprefix $(APP_WORK)/src/concepts/,exfat_image.cpp exfat.cpp)
 # The SMB layer (smb.cpp) and the connection's SMB settings, without a NAS:
 # paths, user names, saving, and the failures it explains.
 HOST_SMB := build/host/test_smb
@@ -386,7 +391,7 @@ HOST_SMB_NAS := build/host/test_smb_nas
 SMB_NAS_SRCS := tests/test_smb_nas.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,nas.cpp nas_library.cpp library_cache.cpp exfat.cpp png.cpp \
     nas_probe.cpp http.cpp connection.cpp transfer.cpp copy_helper.cpp delete_helper.cpp \
-    file_calls.cpp smp.cpp json_scan.cpp notify.cpp storage.cpp) \
+    file_calls.cpp smp.cpp json_scan.cpp notify.cpp storage.cpp exfat_image.cpp) \
   $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
 
 HOST_DELETE := build/host/test_delete
@@ -401,8 +406,9 @@ $(HOST_QUEUE): $(call host_objs,$(QUEUE_SRCS))
 $(HOST_DELETE): $(call host_objs,$(DELETE_SRCS))
 $(HOST_SMB): $(call host_objs,$(SMB_SRCS))
 $(HOST_SMB_NAS): $(call host_objs,$(SMB_NAS_SRCS))
+$(HOST_EXFAT_IMAGE): $(call host_objs,$(EXFAT_IMAGE_SRCS))
 $(HOST_TRANSFER) $(HOST_PICKER) $(HOST_COUNT) $(HOST_LOCK) $(HOST_QUEUE) $(HOST_DELETE) $(HOST_SMB) \
-  $(HOST_SMB_NAS):
+  $(HOST_SMB_NAS) $(HOST_EXFAT_IMAGE):
 	@mkdir -p $(@D)
 	clang++-18 -o $@ $^ -lpthread
 
@@ -413,7 +419,7 @@ $(HOST_TRANSFER) $(HOST_PICKER) $(HOST_COUNT) $(HOST_LOCK) $(HOST_QUEUE) $(HOST_
 # and work folder each): run-transfer runs all three.
 TRANSFER_PARTS := run-transfer-1 run-transfer-2 run-transfer-3
 HOST_RUNS := run-installer run-release $(TRANSFER_PARTS) run-picker run-count run-lock run-queue run-delete \
-  run-smb run-smb-nas
+  run-smb run-smb-nas run-exfat-image
 .PHONY: $(HOST_RUNS) run-transfer
 run-installer: selftest $(HOST_INSTALLER)
 	python3 -u tests/test_installer.py
@@ -436,6 +442,8 @@ run-smb: $(HOST_SMB)
 	$(HOST_SMB)
 run-smb-nas: $(HOST_SMB_NAS) $(HOST_COPIER)
 	$(HOST_SMB_NAS) build/host/smb-nas-test $(HOST_COPIER)
+run-exfat-image: $(HOST_EXFAT_IMAGE)
+	$(HOST_EXFAT_IMAGE) build/host/exfat-image-test
 
 # app-work goes first, in a make of its own: it copies our sources into the
 # kit, and a make that copied them while also building would judge the

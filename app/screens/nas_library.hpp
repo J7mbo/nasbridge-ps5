@@ -41,6 +41,9 @@ struct NasGame
     std::string version;  // "01.000.000", or ""
     std::uint64_t size = 0; // bytes: the image, or everything in the folder
     bool size_known = false;
+    // Folder games: the exact size of the exFAT image a copy would make
+    // ("Copy as an exFAT image"), measured with `size`; 0 when not known.
+    std::uint64_t image_size = 0;
     std::string base;       // folder games: the sce_sys folder, under the games folder
     std::string image_path; // image games: the .exfat file, under the games folder
     // Image games, once their sce_sys was found inside the image:
@@ -78,6 +81,7 @@ struct LibraryEvent
     std::string detail;
     std::string entry;
     std::uint64_t bytes = 0;
+    std::uint64_t image_bytes = 0; // size: the exFAT image it would copy as (0: not known)
     int done = 0;
     int total = 0;
     Image image;

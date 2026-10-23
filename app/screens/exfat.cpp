@@ -22,9 +22,7 @@ namespace hui::concepts
 namespace
 {
 
-constexpr std::size_t kFatWindow = 64 * 1024;          // allocation table read at once
-constexpr std::size_t kMaxFolder = 4u * 1024u * 1024u; // a folder's entries, at most
-constexpr int kMaxFolderEntries = 4096;
+constexpr std::size_t kFatWindow = 64 * 1024; // allocation table read at once
 
 std::uint16_t u16(const unsigned char *p)
 {
@@ -363,7 +361,7 @@ bool ExfatReader::parse_entries(const std::string &data, std::vector<ExfatFile> 
         if (file.name.empty())
             continue;
         entries->push_back(std::move(file));
-        if (static_cast<int>(entries->size()) > kMaxFolderEntries)
+        if (static_cast<int>(entries->size()) > max_folder_entries_)
         {
             *why = "a folder in the image is too big";
             return false;
@@ -375,7 +373,7 @@ bool ExfatReader::parse_entries(const std::string &data, std::vector<ExfatFile> 
 bool ExfatReader::list_root(std::vector<ExfatFile> *entries, std::string *why)
 {
     std::string data;
-    if (!read_chain(geometry_.root_cluster, 0, false, kMaxFolder, &data, why))
+    if (!read_chain(geometry_.root_cluster, 0, false, max_folder_bytes_, &data, why))
         return false;
     return parse_entries(data, entries, why);
 }
@@ -383,7 +381,7 @@ bool ExfatReader::list_root(std::vector<ExfatFile> *entries, std::string *why)
 bool ExfatReader::list(const ExfatFile &folder, std::vector<ExfatFile> *entries, std::string *why)
 {
     std::string data;
-    if (!read_chain(folder.first_cluster, folder.length, folder.contiguous, kMaxFolder, &data, why))
+    if (!read_chain(folder.first_cluster, folder.length, folder.contiguous, max_folder_bytes_, &data, why))
         return false;
     return parse_entries(data, entries, why);
 }

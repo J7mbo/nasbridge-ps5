@@ -149,6 +149,7 @@ class Nas(BaseHTTPRequestHandler):
         c = control()
         size = os.path.getsize(full)
         start = 0
+        end = size - 1
         rng = self.headers.get("Range")
         stray = False
         if rng:
@@ -173,19 +174,22 @@ class Nas(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
         if rng and not c.get("ignore_range") and not stray:
-            start = int(rng.split("=")[1].split("-")[0])
+            first, _, last = rng.split("=")[1].partition("-")
+            start = int(first)
+            if last:
+                end = min(int(last), size - 1)
             self.send_response(206)
-            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, size - 1, size))
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
         else:
             self.send_response(200)
-        self.send_header("Content-Length", str(size - start))
+        self.send_header("Content-Length", str(end + 1 - start))
         self.end_headers()
         sent = 0
         with open(full, "rb") as f:
             f.seek(start)
             while True:
                 c = control()
-                piece = f.read(64 * 1024)
+                piece = f.read(min(64 * 1024, end + 1 - start - sent))
                 if not piece:
                     break
                 drop = c.get("drop_after", 0)

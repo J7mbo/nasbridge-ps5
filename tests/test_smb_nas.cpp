@@ -5,6 +5,7 @@
 
 #include "wait_port.hpp"
 #include "concepts/copy_helper.hpp"
+#include "concepts/exfat_image.hpp"
 #include "concepts/library_cache.hpp"
 #include "concepts/nas.hpp"
 #include "concepts/nas_library.hpp"
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <functional>
 #include <signal.h>
 #include <string>
@@ -74,6 +76,38 @@ bool same(const std::string &a, const std::string &b)
     return std::system(("cmp -s \"" + a + "\" \"" + b + "\"").c_str()) == 0;
 }
 
+// The file at `path` inside the exFAT image `image`, through NASBridge's reader.
+bool from_image(const std::string &image, const std::string &path, std::string *data)
+{
+    ExfatReader reader([&image](std::uint64_t offset, std::size_t length, std::string *out)
+                       {
+                           std::ifstream in(image, std::ios::binary);
+                           out->assign(length, '\0');
+                           in.seekg(static_cast<std::streamoff>(offset));
+                           in.read(&(*out)[0], static_cast<std::streamsize>(length));
+                           return static_cast<std::size_t>(in.gcount()) == length;
+                       });
+    std::string why;
+    std::vector<ExfatFile> entries;
+    if (!reader.open(&why) || !reader.list_root(&entries, &why))
+        return false;
+    std::size_t start = 0;
+    for (;;)
+    {
+        const std::size_t slash = path.find('/', start);
+        const std::string part = path.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+        const ExfatFile *entry = find_entry(entries, part.c_str());
+        if (entry == nullptr)
+            return false;
+        if (slash == std::string::npos)
+            return reader.read(*entry, 64u << 20, data, &why);
+        const ExfatFile inside = *entry;
+        if (!reader.list(inside, &entries, &why))
+            return false;
+        start = slash + 1;
+    }
+}
+
 bool there(const std::string &path)
 {
     struct stat st;
@@ -94,6 +128,7 @@ struct Library
     std::string headline;
     int covers = 0;
     std::vector<std::pair<std::string, std::uint64_t>> sizes;
+    std::map<std::string, std::uint64_t> image_sizes; // the exFAT image each would copy as
 };
 
 // The library as the screen reads it: what the cache saved last time first.
@@ -123,6 +158,7 @@ Library read_library(const Connection &connection)
                 break;
             case LibraryEvent::Kind::size:
                 got.sizes.emplace_back(event.entry, event.bytes);
+                got.image_sizes[event.entry] = event.image_bytes;
                 break;
             case LibraryEvent::Kind::finished:
                 got.finished = true;
@@ -175,6 +211,7 @@ int main(int argc, char **argv)
     if (argc < 2)
         return 2;
     std::string work = argv[1];
+    set_copy_as_image(false); // folder copies here; the image checks turn it on
     if (work[0] != '/')
     {
         char cwd[4096];
@@ -284,6 +321,7 @@ int main(int argc, char **argv)
 
     // 2. The library finds what it finds over WebDAV (tests/test_game_count.cpp).
     set_cache_root(work + "/cache");
+    std::uint64_t one_image_size = 0; // measured with Game One's size
     {
         const Library library = read_library(connection);
         int folders = 0, images = 0;
@@ -305,6 +343,9 @@ int main(int argc, char **argv)
         for (const auto &[entry, bytes] : library.sizes)
             measured = measured || (entry == "Game One" && bytes == one_size);
         check(measured, "a folder game's size is added up, archives left out");
+        one_image_size = library.image_sizes.count("Game One") ? library.image_sizes.at("Game One") : 0;
+        check(one_image_size > one_size, "the exFAT image it would copy as is measured with it",
+              std::to_string(one_image_size));
         check(library.finished && library.headline.empty(), "the library finishes cleanly",
               library.headline);
 
@@ -394,6 +435,37 @@ int main(int argc, char **argv)
         check(copy(transfers, connection, game_one, dest, &message) && game_copied(),
               "a big file copies over four sign-ins, file for file", message);
         set_helper_streams(2);
+        std::system(("rm -rf \"" + dest + "\"/*").c_str());
+
+        // Copied as an exFAT image: one .exfat holding every file, identical.
+        set_copy_as_image(true);
+        {
+            const bool copied = copy(transfers, connection, game_one, dest, &message);
+            const std::string got = dest + "/Game One.exfat";
+            const auto inside = [&](const std::string &path)
+            {
+                std::string data, want;
+                std::ifstream in(one + "/" + path, std::ios::binary);
+                want.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+                return from_image(got, path, &data) && data == want;
+            };
+            bool many = true;
+            for (int i = 0; i < 40; ++i)
+                many = many && inside("data/many/f" + std::to_string(i) + ".bin");
+            std::string none;
+            struct stat made{};
+            check(::stat(got.c_str(), &made) == 0 && static_cast<std::uint64_t>(made.st_size) == one_image_size,
+                  "the image is exactly the size the library measured",
+                  std::to_string(static_cast<long long>(made.st_size)) + " vs " + std::to_string(one_image_size));
+            check(copied && inside("data/big.bin") && inside("sce_sys/param.json") &&
+                      inside("data/sub/tiny.txt") && inside("data/sub/empty.txt") && many &&
+                      !from_image(got, "Game One.zip", &none) && !there(dest + "/Game One"),
+                  "a folder game copies as an exFAT image through the helper, file for file", message);
+            if (std::system("command -v fsck.exfat >/dev/null 2>&1") == 0)
+                check(std::system(("fsck.exfat -n \"" + got + "\" >/dev/null 2>&1").c_str()) == 0,
+                      "fsck.exfat finds nothing wrong with the image");
+        }
+        set_copy_as_image(false);
         std::system(("rm -rf \"" + dest + "\"/*").c_str());
 
         // A file that's gone from the NAS since the library was read.

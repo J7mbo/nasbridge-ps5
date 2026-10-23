@@ -22,13 +22,16 @@ A native PS5 homebrew app to browse and install games from your NAS.
 - **Copies quickly.** Big files are fetched over several connections at once.
   Folders of thousands of small files go through a helper payload that
   fetches many at a time.
+- **Turns game folders into `.exfat` images as they copy** (on by default),
+  so each game is one file on the PS5 instead of thousands.
 - **Adds copied games to the home screen.** It asks ShadowMountPlus to pick
   each game up as soon as it's copied.
 - **Deletes games from the PS5.** The game is removed from the home screen and
   its files deleted, with progress shown. The copy on your NAS isn't touched.
 - **Keeps the PS5 awake** while a copy or a delete runs (optional).
 - **Settings:** NAS connection (with a folder browser and a connection test),
-  connections per big file, small files at once, sounds, and debug info.
+  connections per big file, small files at once, copy as an exFAT image,
+  sounds, and debug info.
 
 ## Requirements
 
@@ -122,6 +125,27 @@ Your NAS's games folder can hold:
 
 NASBridge only reads from your NAS. It never changes or deletes anything there.
 
+### Copying a game folder as an exFAT image
+
+By default, each game folder you queue arrives as one `.exfat` file
+(`Astro Bot.exfat`) that ShadowMountPlus mounts, instead of a folder of
+thousands of files. One file is easier to manage: it moves, backs up and
+deletes in one go. It's made while the game copies, not afterwards, so it
+needs no more room than the game itself plus a little: up to 64 KiB per
+file, and 64 to 512 MB kept free inside the image. The library works out
+the image's exact size, and free space is checked against that.
+
+To copy game folders as folders instead, turn off **Copy as an exFAT image**
+in Settings > Copying.
+
+- It needs the copy helper and a NAS that sends parts of files (WebDAV range
+  requests; every SMB server does). Without them, the game is copied as a
+  folder instead, and NASBridge says why.
+- A game with two names in one folder that differ only in case can't be an
+  image, because exFAT ignores case. It's copied as a folder instead.
+- The setting applies to games queued after it's changed. Image games on
+  the NAS are copied as they are either way.
+
 ## Good to know
 
 - **Deleting big games takes a while.** The PS5 deletes files at around 200
@@ -178,6 +202,9 @@ Dockerfile, Makefile, ps5.mk   the toolchain and build
 - Built on the [PS5 payload SDK](https://github.com/ps5-payload-dev/sdk).
 - SMB support uses [libsmb2](https://github.com/sahlberg/libsmb2) by Ronnie
   Sahlberg (LGPL-2.1-or-later).
+- Copying as an exFAT image follows the image layout of
+  [PS5 Dump Forge](https://github.com/quer3q/ps5-dump-forge) by quer3q
+  (GPL-3.0-or-later), and uses its up-case table.
 - Games are added to the home screen by
   [ShadowMountPlus](https://github.com/drakmor/ShadowMountPlus).
 

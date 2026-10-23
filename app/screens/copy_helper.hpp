@@ -111,6 +111,20 @@ HelperBatch copy_smb_batch_with_helper(const std::string &ip, int port, int work
                                        const BatchProgress &progress,
                                        const std::function<bool()> &stopping);
 
+// A folder game into one image (exfat_image.hpp), front to back into
+// `local`, carrying on from the file's length. `pieces` is the image in the
+// helper's words ("D <n>\n" and n bytes, "Z <n>\n", "F <size> <name>\n", the
+// name being the GET's target, or over SMB the file's path in the share).
+// Over WebDAV `headers` are the lines each GET carries (Host, sign-in,
+// "Connection: keep-alive"), each ended by CRLF; over SMB `sign_in` is set.
+// `workers` files' parts are fetched at once (1..16). End::unsupported: the
+// NAS won't send part of a file, or the helper is too old for images.
+HelperCopy copy_image_with_helper(const std::string &ip, int port, std::uint64_t size,
+                                  const std::string &local, const std::string &headers,
+                                  const SmbSignIn *sign_in, const std::string &pieces, int workers,
+                                  const std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, int)> &progress,
+                                  const std::function<bool()> &stopping);
+
 bool copy_helper_enabled();
 
 // Tests: the helper file ("" turns the helper off), the loader's port and the
