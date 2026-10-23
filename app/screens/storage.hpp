@@ -42,6 +42,22 @@ struct Destination
 // "Internal storage", "Extended storage", "USB drive 1", or the path.
 std::string destination_name(const std::string &path);
 
+// Where ShadowMountPlus finds games on the console's own storage.
+constexpr const char *kInternalGames = "/data/homebrew";
+
+// The drive a path is on ("/mnt/usb0" for "/mnt/usb0/homebrew/Game"; the
+// drives are /mnt/usb0..7 and /mnt/ext0..1), or "" when it's not on one.
+std::string drive_of(const std::string &path);
+
+// A drive's mount, as ShadowMountPlus lists it.
+struct DriveSpace
+{
+    std::string mount_point; // "/mnt/usb0"
+    std::uint64_t free = 0;  // bytes
+    std::uint64_t total = 0; // bytes
+    bool read_only = false;
+};
+
 struct StorageSpace
 {
     bool asked = false;      // false until the first answer arrives
@@ -49,7 +65,15 @@ struct StorageSpace
     std::uint64_t free = 0;  // bytes
     std::uint64_t total = 0; // bytes (0 when unknown)
     std::string how;         // which way answered, or (unknown) why each way failed
-    std::vector<Destination> destinations; // where games can be copied (from ShadowMountPlus)
+    // Where games can be copied: Internal storage first (always there), then
+    // one folder per plugged-in drive (<drive>/homebrew, which ShadowMountPlus
+    // scans). See merge_destinations().
+    std::vector<Destination> destinations;
+    // The drives plugged in now ("/mnt/usb0", ...), and whether that list is
+    // an answer (false until ShadowMountPlus or NASBridge itself could tell).
+    bool drives_known = false;
+    std::vector<std::string> drives;
+    std::vector<DriveSpace> drive_space; // their mounts, when ShadowMountPlus listed them
     // The games ShadowMountPlus knows (on the PS5 or a drive); games_known is
     // false until it has answered once.
     bool games_known = false;
@@ -69,8 +93,25 @@ StorageSpace internal_storage();
 StorageSpace shadowmount_storage();
 
 // For tests: the free space of the console's storage in a /api/v1/storage
-// reply, or why there is none in space->how.
+// reply, or why there is none in space->how. Its drives are the mounts on
+// /mnt/usbN and /mnt/extN.
 StorageSpace storage_from_json(const std::string &json);
+
+// Whether the drive `path` is on is plugged in. Paths that aren't on a drive
+// (Internal storage), and any path while the drives aren't known, count as
+// connected.
+bool drive_connected(const StorageSpace &space, const std::string &path);
+
+// Turns what ShadowMountPlus listed (space->destinations) and the drives
+// plugged in (space->drives) into the choices for a copy: Internal storage
+// first, even when ShadowMountPlus listed nothing, then <drive>/homebrew for
+// each drive, once per drive. A drive ShadowMountPlus has no folder for gets
+// its mount's numbers (space->drive_space), or total 0 (free space unknown).
+void merge_destinations(StorageSpace *space);
+
+// The drives NASBridge sees mounted itself: a drive's folder belongs to
+// another device than /mnt. False when it can't tell (stat refused).
+bool probe_drives(std::vector<std::string> *drives);
 
 // Keeps asking (ShadowMountPlus, then NASBridge itself) on its own thread,
 // every `seconds`, for the free space, the destinations and the game list. The thread ends on its own after the watcher is gone, so

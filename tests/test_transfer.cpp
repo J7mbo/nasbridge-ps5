@@ -7,6 +7,7 @@
 #include "concepts/delete_helper.hpp"
 #include "concepts/notify.hpp"
 #include "concepts/smp.hpp"
+#include "concepts/storage.hpp"
 #include "concepts/transfer.hpp"
 
 #include <algorithm>
@@ -1001,7 +1002,7 @@ int main(int argc, char **argv)
         }
     }
 
-    // Part 2 (10 and 12).
+    // Part 2 (10, 12 to 14).
     if (part == 0 || part == 2)
     {
         // 10. A big file comes down over several connections at once.
@@ -1308,6 +1309,108 @@ int main(int argc, char **argv)
                   "the folders above it, and the patch beside it, are left out");
             clean("Game Deep");
             notes();
+        }
+
+        // 13. Copying to a drive that is unplugged: before the game starts,
+        //     and mid-copy (its folder vanishes). The queue pauses instead of
+        //     failing, says which drive it waits for, and carries on.
+        {
+            set_control("{\"throttle\": 6000000}");
+            std::atomic<bool> gone{true};
+            Transfers transfers;
+            transfers.set_space_check(space);
+            transfers.set_drive_check([&gone](const std::string &) { return gone.load(); });
+            transfers.enqueue(connection, folder_game("Game One", "Game One/sce_sys", one_size),
+                              "Game One", dest, &why);
+            wait_for(transfers, stopped);
+            QueueStatus q = transfers.queue();
+            check(q.state == QueueState::paused && q.drive_wait == dest &&
+                      q.message.find("isn't connected") != std::string::npos &&
+                      !there(dest + "/.nasbridge-incoming"),
+                  "a game whose drive isn't plugged in waits for it, paused", q.message);
+            check(noted(notes(), "Copying Game One paused: "), "waiting for the drive is announced");
+
+            gone.store(false);
+            check(transfers.resume(connection, &why), "resumes once the drive is back", why);
+            wait_for(transfers, [](const QueueStatus &s)
+                     { return !s.entries.empty() && s.entries[0].done > (4u << 20); });
+            gone.store(true);
+            std::system(("rm -rf \"" + dest + "\"").c_str()); // the drive is pulled out
+            wait_for(transfers, stopped);
+            q = transfers.queue();
+            check(q.state == QueueState::paused && q.drive_wait == dest,
+                  "a drive pulled out mid-copy pauses the queue", name(q.state) + (": " + q.message));
+            notes();
+
+            std::system(("mkdir -p \"" + dest + "\"").c_str()); // plugged in again
+            gone.store(false);
+            set_control("{}");
+            check(transfers.resume(connection, &why), "resumes after the drive is back", why);
+            wait_for(transfers, stopped);
+            q = transfers.queue();
+            check(q.state == QueueState::idle && q.drive_wait.empty() &&
+                      same(one + "/data/big.bin", dest + "/Game One/data/big.bin") &&
+                      same(one + "/sce_sys/param.json", dest + "/Game One/sce_sys/param.json"),
+                  "and the game arrives whole", q.message);
+            clean("Game One");
+            notes();
+        }
+
+        // 14. The places a copy can go, from ShadowMountPlus's storage answer.
+        {
+            check(drive_of("/mnt/usb0/homebrew/Game") == "/mnt/usb0" &&
+                      drive_of("/mnt/ext1") == "/mnt/ext1" && drive_of("/mnt/usb10").empty() &&
+                      drive_of("/data/homebrew").empty() && drive_of("/mnt/usb").empty(),
+                  "paths on a drive name the drive");
+            // An older ShadowMountPlus: mounts only, no destinations.
+            const std::string old_reply =
+                "{\"mounts\": [{\"mount_point\": \"/user\", \"total_bytes\": 900000000000, "
+                "\"available_bytes\": 500000000000},"
+                "{\"mount_point\": \"/mnt/usb0\", \"total_bytes\": 2000000000000, "
+                "\"available_bytes\": 1500000000000}]}";
+            StorageSpace space_now = storage_from_json(old_reply);
+            merge_destinations(&space_now);
+            check(space_now.drives_known && space_now.drives == std::vector<std::string>{"/mnt/usb0"} &&
+                      space_now.destinations.size() == 2 &&
+                      space_now.destinations[0].path == "/data/homebrew" &&
+                      space_now.destinations[0].free == 500000000000ull &&
+                      space_now.destinations[1].path == "/mnt/usb0/homebrew" &&
+                      space_now.destinations[1].free == 1500000000000ull,
+                  "with only mounts listed: Internal storage, then the drive's homebrew folder");
+            // A newer one lists the drive's top and its homebrew folder: one choice.
+            const std::string new_reply =
+                "{\"mounts\": [{\"mount_point\": \"/user\", \"total_bytes\": 900000000000, "
+                "\"available_bytes\": 500000000000}], \"destinations\": ["
+                "{\"path\": \"/data/homebrew\", \"mount_point\": \"/user\", "
+                "\"total_bytes\": 900000000000, \"available_bytes\": 400000000000},"
+                "{\"path\": \"/mnt/ext0\", \"mount_point\": \"/mnt/ext0\", "
+                "\"total_bytes\": 1000000000000, \"available_bytes\": 300000000000},"
+                "{\"path\": \"/mnt/usb1\", \"mount_point\": \"/mnt/usb1\", "
+                "\"total_bytes\": 1000000000000, \"available_bytes\": 200000000000},"
+                "{\"path\": \"/mnt/usb1/homebrew\", \"mount_point\": \"/mnt/usb1\", "
+                "\"total_bytes\": 1000000000000, \"available_bytes\": 200000000000}]}";
+            space_now = storage_from_json(new_reply);
+            merge_destinations(&space_now);
+            std::string paths;
+            for (const Destination &place : space_now.destinations)
+                paths += place.path + ";";
+            check(paths == "/data/homebrew;/mnt/usb1/homebrew;/mnt/ext0/homebrew;" &&
+                      space_now.destinations[0].free == 400000000000ull,
+                  "one choice per drive, USB drives before extended storage", paths);
+            check(drive_connected(space_now, "/mnt/usb1/homebrew") &&
+                      !drive_connected(space_now, "/mnt/usb0/homebrew") &&
+                      drive_connected(space_now, "/data/homebrew"),
+                  "a drive is connected while it is listed; Internal storage always is");
+            // Nothing listed at all: Internal storage is still a choice.
+            space_now = storage_from_json("{}");
+            merge_destinations(&space_now);
+            check(space_now.destinations.size() == 1 &&
+                      space_now.destinations[0].path == "/data/homebrew" &&
+                      space_now.destinations[0].total == 0,
+                  "with nothing listed, Internal storage is the one choice (free space unknown)");
+            StorageSpace unknown;
+            check(drive_connected(unknown, "/mnt/usb0/homebrew"),
+                  "while the drives aren't known, none counts as unplugged");
         }
     }
 

@@ -26,6 +26,7 @@
 #include "concepts/json_scan.hpp"
 #include "concepts/smp.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdlib>
@@ -321,6 +322,8 @@ StorageSpace internal_storage()
     usb.total = 2000ull * 1000ull * 1000ull * 1000ull;
     usb.writable = 1;
     space.destinations = {internal, usb};
+    space.drives_known = true;
+    space.drives = {"/mnt/usb0"};
 #endif
     return space;
 }
@@ -384,6 +387,25 @@ StorageSpace storage_from_json(const std::string &json)
         space.destinations.push_back(destination);
     }
     const std::vector<Mount> mounts = json_mounts(json);
+    // The drives: what is mounted on /mnt/usbN and /mnt/extN, and the
+    // drives ShadowMountPlus lists folders on.
+    space.drives_known = true;
+    for (const Mount &mount : mounts)
+    {
+        if (mount.point.empty() || drive_of(mount.point) != mount.point)
+            continue;
+        if (std::find(space.drives.begin(), space.drives.end(), mount.point) != space.drives.end())
+            continue;
+        space.drives.push_back(mount.point);
+        space.drive_space.push_back({mount.point, mount.available, mount.total, mount.read_only});
+    }
+    for (const Destination &destination : space.destinations)
+    {
+        const std::string drive = drive_of(destination.path);
+        if (!drive.empty() &&
+            std::find(space.drives.begin(), space.drives.end(), drive) == space.drives.end())
+            space.drives.push_back(drive);
+    }
     // The console's own storage, by the names it is mounted under.
     for (const char *wanted : {"/user", "/data", "/system_data/priv", "/"})
     {
@@ -444,6 +466,117 @@ StorageSpace shadowmount_storage()
     return storage_from_json(reply.body);
 }
 
+std::string drive_of(const std::string &path)
+{
+    static const char *const kDrives[] = {"/mnt/usb0", "/mnt/usb1", "/mnt/usb2", "/mnt/usb3",
+                                          "/mnt/usb4", "/mnt/usb5", "/mnt/usb6", "/mnt/usb7",
+                                          "/mnt/ext0", "/mnt/ext1"};
+    for (const char *drive : kDrives)
+    {
+        const std::size_t length = std::strlen(drive);
+        if (path.compare(0, length, drive) == 0 &&
+            (path.size() == length || path[length] == '/'))
+            return drive;
+    }
+    return "";
+}
+
+bool drive_connected(const StorageSpace &space, const std::string &path)
+{
+    const std::string drive = drive_of(path);
+    if (drive.empty() || !space.drives_known)
+        return true;
+    return std::find(space.drives.begin(), space.drives.end(), drive) != space.drives.end();
+}
+
+void merge_destinations(StorageSpace *space)
+{
+    std::vector<Destination> merged;
+    // Internal storage: ShadowMountPlus's numbers for it, or the console's.
+    Destination internal;
+    internal.path = kInternalGames;
+    internal.mount_point = "/data";
+    internal.free = space->known ? space->free : 0;
+    internal.total = space->known ? space->total : 0;
+    for (const Destination &listed : space->destinations)
+        if (listed.path == kInternalGames)
+            internal = listed;
+    merged.push_back(internal);
+    // One folder per drive: <drive>/homebrew, a folder ShadowMountPlus scans
+    // (made by the first copy when it isn't there yet).
+    std::vector<std::string> drives = space->drives;
+    if (!space->drives_known)
+    {
+        // Not known this time: the drives ShadowMountPlus listed folders on.
+        for (const Destination &listed : space->destinations)
+        {
+            const std::string drive = drive_of(listed.path);
+            if (!drive.empty() && std::find(drives.begin(), drives.end(), drive) == drives.end())
+                drives.push_back(drive);
+        }
+    }
+    std::sort(drives.begin(), drives.end(),
+              [](const std::string &a, const std::string &b)
+              {
+                  // USB drives first, then extended storage, each by number.
+                  const bool a_usb = a.compare(0, 8, "/mnt/usb") == 0;
+                  const bool b_usb = b.compare(0, 8, "/mnt/usb") == 0;
+                  return a_usb != b_usb ? a_usb : a < b;
+              });
+    for (const std::string &drive : drives)
+    {
+        Destination place;
+        place.path = drive + "/homebrew";
+        place.mount_point = drive;
+        for (const DriveSpace &mount : space->drive_space)
+            if (mount.mount_point == drive)
+            {
+                place.free = mount.free;
+                place.total = mount.total;
+                place.read_only = mount.read_only;
+            }
+        // ShadowMountPlus's own listing of the drive (or its homebrew folder)
+        // wins over the mount's numbers.
+        for (const Destination &listed : space->destinations)
+            if (listed.path == drive || listed.path == place.path)
+            {
+                place.free = listed.free;
+                place.total = listed.total;
+                place.read_only = listed.read_only;
+                if (!listed.mount_point.empty())
+                    place.mount_point = listed.mount_point;
+            }
+        merged.push_back(place);
+    }
+    space->destinations = std::move(merged);
+}
+
+bool probe_drives(std::vector<std::string> *drives)
+{
+    drives->clear();
+#if defined(__PROSPERO__)
+    // An empty /mnt/usbN belongs to /mnt; a mounted drive is another device
+    // (how ShadowMountPlus tells too).
+    struct stat parent;
+    if (::stat("/mnt", &parent) != 0)
+        return false;
+    bool any = false;
+    for (const char *drive : {"/mnt/usb0", "/mnt/usb1", "/mnt/usb2", "/mnt/usb3", "/mnt/usb4",
+                              "/mnt/usb5", "/mnt/usb6", "/mnt/usb7", "/mnt/ext0", "/mnt/ext1"})
+    {
+        struct stat info;
+        if (::stat(drive, &info) != 0)
+            continue;
+        any = true;
+        if (info.st_dev != parent.st_dev)
+            drives->push_back(drive);
+    }
+    return any;
+#else
+    return false; // the PC preview: its fixed list
+#endif
+}
+
 std::string destination_name(const std::string &path)
 {
     if (path == "/data/homebrew" || path.rfind("/data/", 0) == 0 || path == "/data")
@@ -488,7 +621,17 @@ void check_destination(Destination *destination)
     };
     // Laid out like a copy: a folder of NASBridge's, a file written in
     // pieces, reopened to carry on, renamed when done, then removed.
-    const std::string folder = destination->path + "/.nasbridge-check";
+    // A folder not made yet (a drive's homebrew before its first copy):
+    // where the copy will make it.
+    std::string where = destination->path;
+    struct stat info;
+    if (::stat(where.c_str(), &info) != 0 && errno == ENOENT)
+    {
+        const std::size_t slash = where.rfind('/');
+        if (slash != std::string::npos && slash > 0)
+            where.resize(slash);
+    }
+    const std::string folder = where + "/.nasbridge-check";
     const std::string part = folder + "/check.part";
     const std::string done = folder + "/check.bin";
     if (::mkdir(folder.c_str(), 0777) != 0 && errno != EEXIST)
@@ -595,14 +738,38 @@ void *watch(void *argument)
         if (!space.known)
         {
             const std::string why = space.how;
-            std::vector<Destination> destinations = std::move(space.destinations);
+            const StorageSpace answer = std::move(space);
             space = internal_storage();
             space.asked = true;
-            if (!destinations.empty())
-                space.destinations = std::move(destinations);
+            if (!answer.destinations.empty())
+                space.destinations = answer.destinations;
+            if (answer.drives_known)
+            {
+                space.drives_known = true;
+                space.drives = answer.drives;
+                space.drive_space = answer.drive_space;
+            }
             if (!space.known)
                 space.how = why + " | " + space.how;
         }
+        // The drives plugged in: ShadowMountPlus's mount table, or (when it
+        // doesn't answer, or lists none) what NASBridge sees itself.
+        std::vector<std::string> seen_drives;
+        if (space.drives.empty() && probe_drives(&seen_drives))
+        {
+            space.drives = seen_drives;
+            space.drives_known = true;
+        }
+        else if (!space.drives_known)
+        {
+            // Nobody could tell this time: the last answer stands, so a
+            // drive doesn't seem unplugged while ShadowMountPlus is busy.
+            std::lock_guard<std::mutex> hold(shared->lock);
+            space.drives_known = shared->latest.drives_known;
+            space.drives = shared->latest.drives;
+            space.drive_space = shared->latest.drive_space;
+        }
+        merge_destinations(&space);
         // The games ShadowMountPlus knows. Kept from the last round when it
         // doesn't answer this time, so "On PS5" doesn't flicker.
         {

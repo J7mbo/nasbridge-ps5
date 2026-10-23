@@ -17,6 +17,10 @@
 // <destination>/<name> (instant: same drive) and ShadowMountPlus is asked to
 // rescan at once.
 //
+// A game going to a drive that is unplugged (before it starts, or mid-copy)
+// pauses the queue instead of failing it; the screen resumes it when the
+// drive is back, and the copy carries on from what is on the drive.
+//
 // Pause stops the queue after the piece being written. Resume carries on from what is
 // on the drive: each file's size says how far it got (the last 4 MiB are
 // fetched again, in case the end of the file never reached the disk). The
@@ -137,6 +141,9 @@ struct QueueStatus
 {
     QueueState state = QueueState::idle;
     std::string message;
+    // Paused because the front game's drive was unplugged: that destination
+    // ("/mnt/usb0/homebrew"). Resume when the drive is back.
+    std::string drive_wait;
     std::vector<QueueEntry> entries; // front first; [0] is the one copying
     // The front game while the queue runs:
     TransferState phase = TransferState::idle; // preparing, copying or finishing
@@ -227,6 +234,12 @@ class Transfers
     // asks ShadowMountPlus.
     using SpaceCheck = std::function<bool(const std::string &destination, std::uint64_t *free)>;
     void set_space_check(SpaceCheck check);
+    // Where the queue asks whether a destination's drive was unplugged
+    // (before each game, and when a copy fails): then the queue pauses
+    // instead of failing, with QueueStatus::drive_wait set. The default asks
+    // ShadowMountPlus, then looks itself.
+    using DriveCheck = std::function<bool(const std::string &destination)>;
+    void set_drive_check(DriveCheck check);
 
     struct Shared; // what the screen and the worker threads share (transfer.cpp)
 

@@ -148,22 +148,6 @@ std::string data_root()
     return g_root;
 }
 
-std::string load_destination()
-{
-    std::string text;
-    if (!save::read_file(g_root + "/destination.txt", &text, 4096))
-        return {};
-    while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
-        text.pop_back();
-    return !text.empty() && text[0] == '/' ? text : std::string();
-}
-
-void save_destination(const std::string &path)
-{
-    save::ensure_directory(g_root);
-    save::write_atomic(g_root + "/destination.txt", path + "\n");
-}
-
 void set_cache_root(const std::string &root)
 {
     g_root = root;

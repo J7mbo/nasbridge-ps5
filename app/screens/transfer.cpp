@@ -577,6 +577,10 @@ struct Transfers::Shared
         save_unfinished();
     }
     Transfers::SpaceCheck space;
+    Transfers::DriveCheck drive_gone;
+    // The front game's drive, while the queue is paused because it was
+    // unplugged (the screen resumes when it's back).
+    std::string drive_wait;
     std::atomic<bool> pause{false}; // the screen asked the queue to stop
     std::atomic<bool> stop{false};  // NASBridge is closing
     int ui_cpu = -1;
@@ -950,6 +954,9 @@ class Copier
             *why = "There's already a \"" + plan.name + "\" on this drive";
             return stopped_or(Outcome::failed);
         }
+        // A drive's homebrew folder is made by its first copy.
+        if (::mkdir(plan.destination.c_str(), 0777) != 0 && errno != EEXIST)
+            return fail(errno_text("Couldn't write to the drive", errno), why);
         if (::mkdir(incoming.c_str(), 0777) != 0 && errno != EEXIST)
             return fail(errno_text("Couldn't write to the drive", errno), why);
         if (!plan.image && ::mkdir(staging_.c_str(), 0777) != 0 && errno != EEXIST)
@@ -2423,11 +2430,27 @@ void stop_queue(const SharedPtr &shared, QueueState state, const std::string &me
     std::lock_guard<std::mutex> hold(shared->lock);
     shared->state = shared->queue.empty() ? QueueState::idle : state;
     shared->message = shared->queue.empty() ? std::string() : message;
+    shared->drive_wait.clear();
     shared->phase = TransferState::idle;
     shared->detail.clear();
     shared->rate = 0.0;
     shared->worker = false;
     shared->save();
+}
+
+// The front game's drive was unplugged: the queue pauses until it's back.
+// What was copied stays on the drive, and the copy carries on from there.
+void wait_for_drive(const SharedPtr &shared, const Item &head)
+{
+    const std::string drive = destination_name(head.plan.destination);
+    stop_queue(shared, QueueState::paused, drive + " isn't connected. Plug it back in to carry on");
+    {
+        std::lock_guard<std::mutex> hold(shared->lock);
+        if (!shared->queue.empty())
+            shared->drive_wait = head.plan.destination;
+    }
+    ps5_notify("Copying " + head.plan.title + " paused: " + drive +
+               " isn't connected. It carries on when the drive is back.");
 }
 
 void run_queue(const SharedPtr &shared)
@@ -2454,6 +2477,8 @@ void run_queue(const SharedPtr &shared)
             return;
         if (shared->pause.load())
             return stop_queue(shared, QueueState::paused, "");
+        if (shared->drive_gone && shared->drive_gone(head.plan.destination))
+            return wait_for_drive(shared, head);
 
         // Before each game: is there still room for what it needs? (Something
         // else may have filled the drive since it was queued.)
@@ -2510,6 +2535,9 @@ void run_queue(const SharedPtr &shared)
         case Outcome::closing:
             return; // the saved queue comes back paused
         case Outcome::failed:
+            // Most likely the reason it failed: its drive was pulled out.
+            if (shared->drive_gone && shared->drive_gone(head.plan.destination))
+                return wait_for_drive(shared, head);
             stop_queue(shared, QueueState::failed, why);
             ps5_notify("Copying " + head.plan.title + " stopped: " + why);
             return;
@@ -2995,12 +3023,27 @@ bool start_worker(const SharedPtr &shared)
     return true;
 }
 
+// The drives plugged in now: ShadowMountPlus's mounts, or what NASBridge
+// sees itself.
+StorageSpace ask_drives()
+{
+    StorageSpace space = shadowmount_storage();
+    std::vector<std::string> seen;
+    if (space.drives.empty() && probe_drives(&seen))
+    {
+        space.drives = seen;
+        space.drives_known = true;
+    }
+    merge_destinations(&space);
+    return space;
+}
+
 // Asks ShadowMountPlus how much room a destination has.
 bool ask_space(const std::string &destination, std::uint64_t *free)
 {
-    const StorageSpace space = shadowmount_storage();
+    const StorageSpace space = ask_drives();
     for (const Destination &place : space.destinations)
-        if (place.path == destination)
+        if (place.path == destination && place.total > 0)
         {
             *free = place.free;
             return true;
@@ -3013,6 +3056,14 @@ bool ask_space(const std::string &destination, std::uint64_t *free)
     return false; // can't tell: the copy goes ahead
 }
 
+// Whether the drive a destination is on is unplugged (Internal storage never is).
+bool ask_drive_gone(const std::string &destination)
+{
+    if (drive_of(destination).empty())
+        return false;
+    return !drive_connected(ask_drives(), destination);
+}
+
 } // namespace
 
 // ---- Transfers ----
@@ -3021,6 +3072,7 @@ Transfers::Transfers() : shared_(std::make_shared<Shared>())
 {
     shared_->ui_cpu = current_cpu();
     shared_->space = ask_space;
+    shared_->drive_gone = ask_drive_gone;
 }
 
 Transfers::~Transfers()
@@ -3032,6 +3084,12 @@ void Transfers::set_space_check(SpaceCheck check)
 {
     std::lock_guard<std::mutex> hold(shared_->lock);
     shared_->space = std::move(check);
+}
+
+void Transfers::set_drive_check(DriveCheck check)
+{
+    std::lock_guard<std::mutex> hold(shared_->lock);
+    shared_->drive_gone = std::move(check);
 }
 
 void Transfers::load()
@@ -3310,6 +3368,9 @@ QueueStatus Transfers::queue() const
     QueueStatus status;
     status.state = shared_->state;
     status.message = shared_->message;
+    if (status.state == QueueState::paused && !shared_->queue.empty() &&
+        shared_->queue.front().plan.destination == shared_->drive_wait)
+        status.drive_wait = shared_->drive_wait;
     for (const Item &item : shared_->queue)
     {
         QueueEntry entry;
