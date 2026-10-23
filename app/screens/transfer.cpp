@@ -75,7 +75,7 @@ constexpr std::uint64_t kSyncMs = 250;
 constexpr std::uint64_t kSyncBytes = 64ull * 1024ull * 1024ull;
 
 std::string g_root; // set_transfer_root (tests); empty: data_root()
-std::atomic<bool> g_as_image{false}; // set_copy_as_image: folder games become images
+std::atomic<bool> g_as_image{true}; // set_copy_as_image: folder games become images
 
 // Which pieces of the big file being copied are in: one file at a time.
 std::string part_record()
@@ -986,10 +986,7 @@ class Copier
             if (!plan_exfat_image(plan.folders, image_files(plan),
                                   plan.title_id.size() <= 11 ? plan.title_id : std::string(), &image,
                                   &problem))
-                return fail("This game can't be copied as an exFAT image (" + problem +
-                                "). Remove it from the queue, turn off \"Copy as an exFAT image\" "
-                                "in Settings, and add it again to copy it as a folder",
-                            why);
+                return as_folder(plan, problem, why);
             const std::uint64_t layout = layout_of(image);
             if (layout != plan.image_layout || image.size != plan.image_size)
             {
@@ -1057,6 +1054,8 @@ class Copier
         if (plan.as_image)
         {
             const Result result = copy_image(plan, image, why);
+            if (result == Result::fallback)
+                return as_folder(plan, *why, why);
             if (result == Result::stopped)
                 return stopped_or(Outcome::paused);
             if (result != Result::ok)
@@ -1167,6 +1166,40 @@ class Copier
 
   private:
     bool held_back_ = false;
+
+    // A folder game that can't be an exFAT image (`reason`) is copied as a
+    // folder instead, as if the setting were off: the half image goes, and
+    // the copy starts again from the file list it already has.
+    Outcome as_folder(CopyPlan plan, const std::string &reason, std::string *why)
+    {
+        if (plan.image_layout != 0 || exists(staging_))
+            ::unlink(staging_.c_str());
+        const std::string suffix = ".exfat";
+        plan.as_image = false;
+        if (plan.name.size() > suffix.size() &&
+            plan.name.compare(plan.name.size() - suffix.size(), suffix.size(), suffix) == 0)
+            plan.name.resize(plan.name.size() - suffix.size());
+        plan.image_size = 0;
+        plan.image_layout = 0;
+        {
+            std::lock_guard<std::mutex> hold(shared_->lock);
+            for (const Item &queued : shared_->queue)
+                if (queued.plan.entry != entry_ && queued.plan.destination == plan.destination &&
+                    queued.plan.name == plan.name)
+                    return fail(plan.title + " can't be an exFAT image (" + reason +
+                                    "), and a game called \"" + plan.name +
+                                    "\" is already queued for this drive",
+                                why);
+            if (Item *item = shared_->item(entry_))
+            {
+                item->plan = plan;
+                item->done = 0;
+            }
+            shared_->save();
+        }
+        ps5_notify(plan.title + " can't be an exFAT image (" + reason + "), so it's copied as a folder.");
+        return run(why);
+    }
 
     Outcome fail(const std::string &text, std::string *why)
     {
@@ -1484,8 +1517,8 @@ class Copier
     {
         if (!copy_helper_enabled())
         {
-            *why = "Copying as an exFAT image needs the copy helper, which isn't available";
-            return Result::failed;
+            *why = "it needs the copy helper, which isn't available";
+            return Result::fallback;
         }
         // The image in the helper's words; where each file ends in it (so the
         // file count follows the copy), and how many are empty (no piece).
@@ -1574,8 +1607,8 @@ class Copier
             case End::unavailable:
                 if (!helper_used_)
                 {
-                    *why = "The copy helper didn't start, and copying as an exFAT image needs it";
-                    return Result::failed;
+                    *why = "it needs the copy helper, which didn't start";
+                    return Result::fallback;
                 }
                 break; // it ran before: it may come back, so try again
             case End::unsupported:
@@ -1583,8 +1616,10 @@ class Copier
                     *why = "The copy helper running on the PS5 is from an older NASBridge. It "
                            "closes after 2 minutes unused; then Resume";
                 else
-                    *why = "This NAS won't send part of a file (" + copy.why +
-                           "), which copying as an exFAT image needs";
+                {
+                    *why = "this NAS won't send part of a file (" + copy.why + ")";
+                    return Result::fallback;
+                }
                 return Result::failed;
             case End::refused:
             {

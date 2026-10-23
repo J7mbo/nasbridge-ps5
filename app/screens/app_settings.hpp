@@ -22,7 +22,7 @@ struct AppSettings
     int small_files = 16;
     // Folder games are copied into one .exfat image each (exfat_image.hpp)
     // rather than as folders of files.
-    bool as_image = false;
+    bool as_image = true;
     // The PS5 stays out of rest mode while a copy or a delete runs.
     bool keep_awake = true;
     // Every sound NASBridge makes (off: silent; the controller still rumbles).

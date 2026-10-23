@@ -133,6 +133,7 @@ int main(int argc, char **argv)
     if (argc < 2)
         return 2;
     const std::string work = argv[1];
+    set_copy_as_image(false); // folder copies here; the image checks turn it on
     const std::string nas = work + "/nas";
     const std::string dest = work + "/dest";
     const std::string control = work + "/control.json";

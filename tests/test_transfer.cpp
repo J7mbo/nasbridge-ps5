@@ -250,6 +250,7 @@ int main(int argc, char **argv)
     if (argc < 2)
         return 2;
     g_work = argv[1];
+    set_copy_as_image(false); // folder copies here; the image checks turn it on
     // argv[4], optional: the part of the suite to run (1, 2 or 3; 0 or none:
     // all of it). `make test` runs the three parts at once, each with its own
     // work folder and ports, so the suite takes as long as its longest part.
@@ -1801,6 +1802,24 @@ int main(int argc, char **argv)
             }
             clean("Copy.exfat");
             notes();
+
+            // ...and a folder game that would be an image is copied as a
+            // folder instead (an image needs the helper), saying why.
+            set_copy_as_image(true);
+            {
+                Transfers transfers;
+                transfers.set_space_check(space);
+                transfers.enqueue(connection, many_game, "Many Files", dest, &why);
+                wait_for(transfers, stopped, 120);
+                const QueueStatus q = transfers.queue();
+                check(q.state == QueueState::idle && there(dest + "/Many Files/sce_sys") &&
+                          !there(dest + "/Many Files.exfat") && !there(dest + "/.nasbridge-incoming"),
+                      "a game that can't be an image is copied as a folder instead", q.message);
+                check(noted(notes(), "Many Files can't be an exFAT image (it needs the copy helper"),
+                      "and NASBridge says why");
+            }
+            set_copy_as_image(false);
+            clean("Many Files");
             set_copy_helper("", 0, 0);
         }
     }
