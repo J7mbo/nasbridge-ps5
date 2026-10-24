@@ -336,7 +336,9 @@ namespace
 struct Mount
 {
     std::string point;
-    std::string path; // destinations only
+    std::string path;       // destinations only
+    std::string source;     // the device ("/dev/da0p2")
+    std::string filesystem; // "exfat", "msdosfs", ...
     std::uint64_t total = 0;
     std::uint64_t available = 0;
     bool read_only = false;
@@ -352,6 +354,8 @@ std::vector<Mount> json_mounts(const std::string &json, const char *key = "mount
                      Mount mount;
                      mount.point = json_text(from, to, "mount_point");
                      mount.path = json_text(from, to, "path");
+                     mount.source = json_text(from, to, "source");
+                     mount.filesystem = json_text(from, to, "filesystem");
                      mount.read_only = json_true(from, to, "read_only");
                      if (json_number(from, to, "total_bytes", &mount.total) &&
                          json_number(from, to, "available_bytes", &mount.available))
@@ -387,6 +391,19 @@ StorageSpace storage_from_json(const std::string &json)
         space.destinations.push_back(destination);
     }
     const std::vector<Mount> mounts = json_mounts(json);
+    // Every mount under /mnt, as it was listed (Debug info).
+    for (const Mount &mount : mounts)
+    {
+        if (mount.point.compare(0, 5, "/mnt/") != 0)
+            continue;
+        char line[256];
+        std::snprintf(line, sizeof(line), "%s  %s  %s  %.2f/%.2f GB%s", mount.point.c_str(),
+                      mount.filesystem.empty() ? "?" : mount.filesystem.c_str(),
+                      mount.source.empty() ? "?" : mount.source.c_str(),
+                      static_cast<double>(mount.available) / 1e9,
+                      static_cast<double>(mount.total) / 1e9, mount.read_only ? "  ro" : "");
+        space.mount_lines.push_back(line);
+    }
     // The drives: what is mounted on /mnt/usbN and /mnt/extN, and the
     // drives ShadowMountPlus lists folders on.
     space.drives_known = true;
@@ -754,6 +771,7 @@ void *watch(void *argument)
                 space.drives_known = true;
                 space.drives = answer.drives;
                 space.drive_space = answer.drive_space;
+                space.mount_lines = answer.mount_lines;
             }
             if (!space.known)
                 space.how = why + " | " + space.how;

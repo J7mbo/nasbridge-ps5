@@ -268,7 +268,7 @@ class Library final : public app::Concept
         tabs_.set_tabs({{"All", 0}, {"Not installed", 0}, {"Installed", 0}});
 
         // Where copies go: Internal storage, or a drive plugged into the PS5,
-        // as a list that opens from the "Copy to" button. Every launch starts
+        // as a list that opens from the "Destination" button. Every launch starts
         // on Internal storage.
         places_.style.theme = acrylic();
         places_.style.label = ui::SelectLabel::none;
@@ -467,6 +467,8 @@ class Library final : public app::Concept
         }
         press_.update(dt, 10.0f);
         refusal_.update(dt, 9.0f);
+        if (places_.is_open() && places_signature() != places_shown_)
+            fill_places(); // a drive came or went while the list is open
         places_.update(dt);
         confirm_.update(dt);
         if (page_open_ && page_game_ >= 0 && page_game_ < static_cast<int>(games_.size()))
@@ -1505,12 +1507,20 @@ class Library final : public app::Concept
     // The button that opens the list: what is chosen now.
     std::string destination_label() const
     {
-        return "Copy to: " + destination_name(destination_);
+        return "Destination: " + destination_name(destination_);
     }
 
     // Opens the list of places a copy can go, on the current one. Internal
     // storage is always there; a drive only while it's plugged in.
     void open_places(app::Feedback &feedback)
+    {
+        fill_places();
+        places_.open(feedback);
+    }
+
+    // Fills the list from the latest storage answer. Called again while it's
+    // open whenever that changes, so a drive plugged in or out shows at once.
+    void fill_places()
     {
         std::vector<Destination> places = space_.destinations;
         if (places.empty())
@@ -1544,11 +1554,22 @@ class Library final : public app::Concept
         }
         places_.set_options(std::move(options));
         places_.set_index(current);
-        // Anchored on the "Copy to" button.
+        // Anchored on the "Destination" button.
         const float x = kPanel.x + 40.0f;
         places_.set_bounds({x, kPanel.y + 206.0f + 92.0f, kPanel.w - 80.0f,
                             places_.preferred_height()});
-        places_.open(feedback);
+        places_shown_ = places_signature();
+    }
+
+    // Which places the list shows and whether each can be picked, to tell
+    // when it needs filling again (free space changing alone doesn't: the
+    // highlight would jump about during a copy).
+    std::string places_signature() const
+    {
+        std::string text = destination_;
+        for (const Destination &place : space_.destinations)
+            text += "|" + place.path + (place.writable == 0 ? "!" : "");
+        return text;
     }
 
     // The chosen place among those ShadowMountPlus lists; null when it isn't
@@ -2163,21 +2184,37 @@ class Library final : public app::Concept
                 list.rounded_rect({x, track.y, std::max(fill, 8.0f), track.h}, 4.0f,
                                   bar);
         }
+        std::vector<std::string> lines;
         if (show_diagnosis)
         {
-            float line_y = panel.y + panel.h + 30.0f;
             std::size_t start = 0;
             while (start < space_.how.size())
             {
                 std::size_t end = space_.how.find(" | ", start);
                 if (end == std::string::npos)
                     end = space_.how.size();
-                paint.body(ui::fit_label(paint, space_.how.substr(start, end - start), 17.0f,
-                                         panel.w),
-                           panel.x, line_y, 17, theme.text_muted);
-                line_y += 24.0f;
+                lines.push_back(space_.how.substr(start, end - start));
                 start = end + 3;
             }
+        }
+        if (debug_info())
+        {
+            // The drives as NASBridge sees them, and ShadowMountPlus's mounts.
+            std::string drives = space_.drives_known ? "Drives:" : "Drives (not known):";
+            for (const std::string &drive : space_.drives)
+                drives += " " + drive;
+            if (space_.drives.empty())
+                drives += " none";
+            lines.push_back(drives);
+            for (const std::string &line : space_.mount_lines)
+                lines.push_back(line);
+        }
+        float line_y = panel.y + panel.h + 30.0f;
+        for (const std::string &line : lines)
+        {
+            paint.body(ui::fit_label(paint, line, 17.0f, panel.w), panel.x, line_y, 17,
+                       theme.text_muted);
+            line_y += 24.0f;
         }
 
         PageAction actions[kActions];
@@ -2236,8 +2273,9 @@ class Library final : public app::Concept
     tween::Spring page_;
     int action_ = 0;
     tween::Spring action_focus_[kActions];
-    ui::Select places_;                     // where copies go (opens from "Copy to")
+    ui::Select places_;                     // where copies go (opens from "Destination")
     std::vector<std::string> place_paths_;  // the list's folders, in its order
+    std::string places_shown_;              // places_signature() when the list was filled
     std::string destination_;               // the chosen folder
     std::string drive_resumed_;             // the drive the queue was resumed for (follow_drives)
     Transfers transfers_;                   // the copy or delete, on its own thread

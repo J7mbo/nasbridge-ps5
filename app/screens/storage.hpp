@@ -74,6 +74,9 @@ struct StorageSpace
     bool drives_known = false;
     std::vector<std::string> drives;
     std::vector<DriveSpace> drive_space; // their mounts, when ShadowMountPlus listed them
+    // ShadowMountPlus's mounts under /mnt, one line each: point, filesystem,
+    // device, free/total (Debug info).
+    std::vector<std::string> mount_lines;
     // The games ShadowMountPlus knows (on the PS5 or a drive); games_known is
     // false until it has answered once.
     bool games_known = false;
