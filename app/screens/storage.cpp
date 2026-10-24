@@ -933,6 +933,13 @@ void *watch(void *argument)
             else if (destination.writable < 0 && !shared->stop.load())
             {
                 check_destination(&destination);
+                // Internal storage isn't refused on the check's word: copies
+                // there worked before it was checked at all, and on a PS5 it
+                // fails ("folder e2") where the sandbox doesn't show
+                // /data/homebrew to it. A copy that can't write says so itself.
+                // (`why` stays, for Debug info.)
+                if (destination.path == kInternalGames && destination.writable == 0)
+                    destination.writable = 1;
             }
             seen.push_back(destination);
         }

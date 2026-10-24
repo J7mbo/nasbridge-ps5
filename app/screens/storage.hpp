@@ -36,7 +36,8 @@ struct Destination
     // file there (-1: not checked yet). NASBridge runs sandboxed, so what
     // ShadowMountPlus can write isn't proof.
     int writable = -1;
-    std::string why; // the step that failed ("create e1"), when not writable
+    std::string why; // the step that failed ("create e1"); Internal storage
+                     // keeps writable 1 with it (see the storage watcher)
 };
 
 // "Internal storage", "Extended storage", "USB drive 1", or the path.

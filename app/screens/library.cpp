@@ -2208,6 +2208,10 @@ class Library final : public app::Concept
             lines.push_back(drives);
             for (const std::string &line : space_.mount_lines)
                 lines.push_back(line);
+            for (const Destination &place : space_.destinations)
+                if (place.writable == 1 && !place.why.empty())
+                    lines.push_back("Write check on " + place.path + " failed (" + place.why +
+                                    "), copying anyway");
         }
         float line_y = panel.y + panel.h + 30.0f;
         for (const std::string &line : lines)
