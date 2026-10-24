@@ -32,15 +32,10 @@ struct Destination
     std::uint64_t free = 0;  // bytes available for new files
     std::uint64_t total = 0; // bytes
     bool read_only = false;
-    // Whether NASBridge itself can create, write, reopen, rename and remove a
-    // file there (-1: not checked yet). NASBridge runs sandboxed, so what
-    // ShadowMountPlus can write isn't proof.
+    // Whether copies can go there: 1 unless its drive is mounted read-only,
+    // as ShadowMountPlus decides (-1: not known yet).
     int writable = -1;
-    std::string why; // the step that failed ("create e1"); Internal storage
-                     // keeps writable 1 with it (see the storage watcher)
-    // When the check failed: what NASBridge could see there, for Debug info
-    // ("stat e2  open e2  list e2  .nasbridge-incoming ok  /data ok").
-    std::string probe;
+    std::string why; // why not ("read-only")
 };
 
 // "Internal storage", "Extended storage", "USB drive 1", or the path.
@@ -98,11 +93,6 @@ struct StorageSpace
     bool games_known = false;
     std::vector<SmpGame> games;
 };
-
-// Checks that NASBridge can write in `folder` the way a copy does (a scratch
-// file is made and removed again). Sets writable and why. Blocks: worker
-// threads only.
-void check_destination(Destination *destination);
 
 // Asks NASBridge's own process (no ShadowMountPlus): system calls only.
 StorageSpace internal_storage();

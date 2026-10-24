@@ -22,7 +22,6 @@
 
 #include "concepts/connection.hpp"
 #include "concepts/copy_helper.hpp"
-#include "concepts/file_calls.hpp"
 #include "concepts/http.hpp"
 #include "concepts/json_scan.hpp"
 #include "concepts/smp.hpp"
@@ -669,152 +668,6 @@ std::string destination_name(const std::string &path)
     return name.empty() ? path : name;
 }
 
-namespace
-{
-
-// What NASBridge can see of `path` (ok, or the error number), each way it
-// could look.
-std::string look_at(const std::string &path)
-{
-    const auto result = [](bool ok) { return ok ? std::string("ok") : "e" + std::to_string(errno); };
-    struct stat info;
-    std::string text = "stat " + result(::stat(path.c_str(), &info) == 0);
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    text += "  open " + result(fd >= 0);
-    if (fd >= 0)
-        ::close(fd);
-    DIR *dir = ::opendir(path.c_str());
-    text += "  list " + result(dir != nullptr);
-    if (dir != nullptr)
-        ::closedir(dir);
-    return text;
-}
-
-// A failed check's report: the folder, NASBridge's copy folder in it, and
-// the folder above.
-std::string probe_destination(const std::string &path)
-{
-    struct stat info;
-    std::string text = look_at(path);
-    const std::string incoming = path + "/.nasbridge-incoming";
-    text += "  .nasbridge-incoming " +
-            (::stat(incoming.c_str(), &info) == 0 ? std::string("ok") : "e" + std::to_string(errno));
-    const std::size_t slash = path.rfind('/');
-    if (slash != std::string::npos && slash > 0)
-    {
-        const std::string parent = path.substr(0, slash);
-        text += "  " + parent + " " +
-                (::stat(parent.c_str(), &info) == 0 ? std::string("ok") : "e" + std::to_string(errno));
-    }
-    return text;
-}
-
-} // namespace
-
-void check_destination(Destination *destination)
-{
-    destination->writable = 0;
-    if (destination->read_only)
-    {
-        destination->why = "read-only";
-        return;
-    }
-    std::string missing;
-    if (!file_calls_available(&missing))
-    {
-        destination->why = "no " + missing;
-        return;
-    }
-    const auto fail = [&](const char *step)
-    {
-        char text[48];
-        std::snprintf(text, sizeof(text), "%s e%d", step, errno);
-        destination->why = text;
-        destination->probe = probe_destination(destination->path);
-    };
-    // Laid out like a copy: a folder of NASBridge's, a file written in
-    // pieces, reopened to carry on, renamed when done, then removed.
-    // A drive's homebrew folder may not be made yet (the first copy makes
-    // it): then the check runs on the drive itself. Only on a drive: the
-    // sandbox can say "no such folder" about Internal storage's own path.
-    const auto make = [](const std::string &path)
-    { return ::mkdir(path.c_str(), 0777) == 0 || errno == EEXIST; };
-    std::string folder = destination->path + "/.nasbridge-check";
-    if (!make(folder))
-    {
-        const int error = errno;
-        const std::string drive = drive_of(destination->path);
-        if (error != ENOENT || drive.empty() || drive == destination->path)
-        {
-            errno = error;
-            return fail("folder");
-        }
-        folder = drive + "/.nasbridge-check";
-        if (!make(folder))
-            return fail("folder");
-    }
-    const std::string part = folder + "/check.part";
-    const std::string done = folder + "/check.bin";
-    int fd = ::open(part.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0666);
-    if (fd < 0)
-    {
-        fail("create");
-        ::rmdir(folder.c_str());
-        return;
-    }
-    std::vector<unsigned char> block(256 * 1024);
-    for (std::size_t i = 0; i < block.size(); ++i)
-        block[i] = static_cast<unsigned char>(i * 31u + 7u);
-    bool ok = true;
-    const char *step = nullptr;
-    for (int i = 0; i < 4 && ok; ++i)
-        if (::write(fd, block.data(), block.size()) != static_cast<ssize_t>(block.size()))
-            ok = false, step = "write";
-    if (ok && ::fsync(fd) != 0)
-        ok = false, step = "sync";
-    ::close(fd);
-    // Reopened as a resumed copy would: its size says where to carry on.
-    if (ok)
-    {
-        fd = ::open(part.c_str(), O_RDWR);
-        if (fd < 0)
-            ok = false, step = "reopen";
-        else
-        {
-            const off_t size = ::lseek(fd, 0, SEEK_END);
-            std::vector<unsigned char> back(block.size());
-            if (size != static_cast<off_t>(4 * block.size()))
-                ok = false, step = "size";
-            else if (::pread(fd, back.data(), back.size(), static_cast<off_t>(block.size())) !=
-                         static_cast<ssize_t>(back.size()) ||
-                     back != block)
-                ok = false, step = "read";
-            ::close(fd);
-        }
-    }
-    if (ok && ::rename(part.c_str(), done.c_str()) != 0)
-        ok = false, step = "rename";
-    if (!ok)
-        fail(step);
-    // Cleaning up must work too: a cancelled copy removes what it wrote.
-    const bool removed = ::unlink(ok ? done.c_str() : part.c_str()) == 0;
-    if (ok && !removed)
-    {
-        fail("remove");
-        ok = false;
-    }
-    if (::rmdir(folder.c_str()) != 0 && ok)
-    {
-        fail("remove folder");
-        ok = false;
-    }
-    if (ok)
-    {
-        destination->writable = 1;
-        destination->why.clear();
-    }
-}
-
 struct StorageWatcher::Shared
 {
     std::mutex lock;
@@ -879,31 +732,6 @@ void read_partition_types(StorageSpace *space, std::map<std::string, PartitionAn
     *known = std::move(kept); // a device unplugged is asked again when it's back
 }
 
-// Runs check_destination on a thread of its own, made now. NASBridge's
-// rights can change after it starts (copies on a new thread write to
-// /data/homebrew while this long-lived thread can't even see /data): a new
-// thread gets them as they are now.
-void check_on_new_thread(Destination *destination)
-{
-    pthread_attr_t attributes;
-    pthread_attr_init(&attributes);
-    pthread_attr_setstacksize(&attributes, 512 * 1024);
-    pthread_t thread;
-    const int created = pthread_create(
-        &thread, &attributes,
-        [](void *argument) -> void *
-        {
-            check_destination(static_cast<Destination *>(argument));
-            return nullptr;
-        },
-        destination);
-    pthread_attr_destroy(&attributes);
-    if (created == 0)
-        pthread_join(thread, nullptr);
-    else
-        check_destination(destination);
-}
-
 void *watch(void *argument)
 {
     // The thread keeps the shared state alive by itself; the watcher may be
@@ -926,9 +754,7 @@ void *watch(void *argument)
         }
     }
 #endif
-    std::vector<Destination> checked;
     std::map<std::string, PartitionAnswer> partitions; // by device
-    std::map<std::string, std::uint64_t> checked_at; // when each folder was last checked
     while (!shared->stop.load())
     {
         StorageSpace space = shadowmount_storage();
@@ -986,42 +812,15 @@ void *watch(void *argument)
                 space.games = shared->latest.games;
             }
         }
-        // Each folder is checked once while it stays listed (a drive plugged
-        // in again is checked again). A failed check is tried again every
-        // few seconds: NASBridge's view of a drive (ShadowMountPlus's alias
-        // in its sandbox) can come a while after the drive is mounted.
-        constexpr std::uint64_t kRecheckMs = 10000;
-        std::vector<Destination> seen;
+        // A folder takes copies when its drive isn't mounted read-only, as
+        // ShadowMountPlus decides for its own destinations. No test write:
+        // on a PS5 NASBridge's own watcher can't see /data or the drives
+        // ("folder e2") while its copies write there fine.
         for (Destination &destination : space.destinations)
         {
-            const Destination *before = nullptr;
-            for (const Destination &old : checked)
-                if (old.path == destination.path && old.mount_point == destination.mount_point)
-                    before = &old;
-            const bool failed = before != nullptr && !before->why.empty();
-            if (before != nullptr &&
-                !(failed && now_ms() - checked_at[destination.path] >= kRecheckMs))
-            {
-                destination.writable = before->writable;
-                destination.why = before->why;
-                destination.probe = before->probe;
-            }
-            else if ((destination.writable < 0 || failed) && !shared->stop.load())
-            {
-                destination.writable = -1;
-                checked_at[destination.path] = now_ms();
-                check_on_new_thread(&destination);
-                // Internal storage isn't refused on the check's word: copies
-                // there worked before it was checked at all, and on a PS5 it
-                // fails ("folder e2") where the sandbox doesn't show
-                // /data/homebrew to it. A copy that can't write says so itself.
-                // (`why` stays, for Debug info.)
-                if (destination.path == kInternalGames && destination.writable == 0)
-                    destination.writable = 1;
-            }
-            seen.push_back(destination);
+            destination.writable = destination.read_only ? 0 : 1;
+            destination.why = destination.read_only ? "read-only" : "";
         }
-        checked = std::move(seen);
         {
             std::lock_guard<std::mutex> hold(shared->lock);
             shared->latest = space;
