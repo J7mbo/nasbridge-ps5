@@ -38,11 +38,6 @@ void forget_pictures(const std::string &entry);
 // NASBridge's own folder on the PS5 (/download0/nasbridge), made if needed.
 std::string data_root();
 
-// The folder games are copied to ("/data/homebrew", "/mnt/usb0/homebrew"),
-// as last chosen; empty when none was chosen yet.
-std::string load_destination();
-void save_destination(const std::string &path);
-
 // For tests: keep the cache somewhere else.
 void set_cache_root(const std::string &root);
 // For tests: the list as text and back.

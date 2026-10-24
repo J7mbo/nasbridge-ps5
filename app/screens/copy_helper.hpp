@@ -111,6 +111,20 @@ HelperBatch copy_smb_batch_with_helper(const std::string &ip, int port, int work
                                        const BatchProgress &progress,
                                        const std::function<bool()> &stopping);
 
+// A partition's type, from its disk's partition table (NASBridge can't read
+// a disk from its sandbox; the helper can): "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+// (GPT, lower case) or "mbr:ef". `device` is the partition ("/dev/da1p1").
+// "" with *why when it can't be read. Starts the helper if needed: blocks.
+std::string partition_type(const std::string &device, std::string *why);
+
+// One step on a drive's files, done by the helper: NASBridge can't see a USB
+// or extended drive from its sandbox. `step` is "mkdir", "stat", "rename"
+// (to `to`), "unlink" or "rmdir". 0, or the errno it failed with (EIO when
+// the helper can't be reached, ENOSYS from an older one). stat fills *size
+// and *folder. Starts the helper if needed: blocks.
+int helper_file_step(const char *step, const std::string &path, const std::string &to = "",
+                     std::uint64_t *size = nullptr, bool *folder = nullptr);
+
 bool copy_helper_enabled();
 
 // Tests: the helper file ("" turns the helper off), the loader's port and the
