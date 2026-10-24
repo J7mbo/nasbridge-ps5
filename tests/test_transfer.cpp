@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -1539,6 +1540,49 @@ int main(int argc, char **argv)
                 check(via_helper, "the copy helper did the copying (the panel says \"helper\")");
                 clean("Game One");
                 set_control("{}");
+                notes();
+            }
+
+            // a1. A drive, which NASBridge can't see from its sandbox: the
+            //     helper makes, checks, renames and removes things there.
+            {
+                const std::string steps = g_work + "/steps";
+                std::system(("rm -rf \"" + steps + "\"").c_str());
+                std::uint64_t size = 1;
+                bool folder = false;
+                check(helper_file_step("mkdir", steps) == 0 &&
+                          helper_file_step("mkdir", steps) == EEXIST &&
+                          helper_file_step("stat", steps, "", &size, &folder) == 0 && folder,
+                      "the helper makes a folder, and says when it's already there");
+                write_file(steps + "/a.bin", 1234, 5);
+                check(helper_file_step("stat", steps + "/a.bin", "", &size, &folder) == 0 &&
+                          size == 1234 && !folder &&
+                          helper_file_step("stat", steps + "/none") == ENOENT,
+                      "and tells a file's size, or that nothing is there",
+                      std::to_string(size));
+                check(helper_file_step("rename", steps + "/a.bin", steps + "/b.bin") == 0 &&
+                          there(steps + "/b.bin") && !there(steps + "/a.bin") &&
+                          helper_file_step("rmdir", steps) == ENOTEMPTY &&
+                          helper_file_step("unlink", steps + "/b.bin") == 0 &&
+                          helper_file_step("rmdir", steps) == 0 && !there(steps),
+                      "renames and removes files and folders");
+
+                set_drive_steps_everywhere(true);
+                clean("Game One");
+                Transfers transfers;
+                transfers.set_space_check(space);
+                transfers.enqueue(connection, folder_game("Game One", "Game One/sce_sys", one_size),
+                                  "Game One", dest, &why);
+                wait_for(transfers, stopped, 120);
+                const QueueStatus q = transfers.queue();
+                const std::string got = dest + "/Game One";
+                check(q.state == QueueState::idle && same(one + "/data/big.bin", got + "/data/big.bin") &&
+                          same(one + "/data/sub/tiny.txt", got + "/data/sub/tiny.txt") &&
+                          there(got + "/data/sub/empty.txt") && !there(dest + "/.nasbridge-incoming"),
+                      "a game copies identical to a drive, every step there through the helper",
+                      q.message);
+                clean("Game One");
+                set_drive_steps_everywhere(false);
                 notes();
             }
 

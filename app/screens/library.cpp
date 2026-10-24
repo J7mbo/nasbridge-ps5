@@ -1419,7 +1419,7 @@ class Library final : public app::Concept
 
     // Drives come and go: a chosen drive that was unplugged gives way to
     // Internal storage, and a queue paused for its drive carries on once the
-    // drive is back (and NASBridge has checked it can write there again).
+    // drive is back.
     void follow_drives()
     {
         if (destination_ != kInternalGames && !drive_connected(space_, destination_))
@@ -1538,10 +1538,7 @@ class Library final : public app::Concept
             ui::SelectOption option(destination_name(place.path));
             char line[160];
             if (place.writable == 0)
-                std::snprintf(line, sizeof(line), "NASBridge can't write here (%s)",
-                              place.why.c_str());
-            else if (place.total == 0)
-                std::snprintf(line, sizeof(line), "Free space unknown  ·  %s", place.path.c_str());
+                std::snprintf(line, sizeof(line), "Can't copy here (%s)", place.why.c_str());
             else
                 std::snprintf(line, sizeof(line), "%.1f GB free  ·  %s",
                               static_cast<double>(place.free) / 1e9, place.path.c_str());
@@ -1604,8 +1601,6 @@ class Library final : public app::Concept
                 return CopyCheck::not_writable;
             if (place->writable < 0)
                 return CopyCheck::checking;
-            if (place->total == 0)
-                return CopyCheck::space_unknown; // a drive ShadowMountPlus has no numbers for
             free = place->free;
         }
         else if (!space_.destinations.empty())

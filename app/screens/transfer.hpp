@@ -271,6 +271,9 @@ void set_transfer_root(const std::string &root);
 // How many connections a copy uses (clamped 1..4). Default 1, best for a single
 // spinning HDD on the NAS. Tests raise it to exercise the parallel path.
 void set_copy_streams(int streams);
+// Tests: every destination's folders and files go through the copy helper,
+// as a drive's do on the PS5.
+void set_drive_steps_everywhere(bool everywhere);
 // How many files the delete helper deletes at once for a folder game (1..32).
 void set_delete_threads(int threads);
 // How long a deep listing may stay silent before listing folder by folder

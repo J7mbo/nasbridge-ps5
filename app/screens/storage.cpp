@@ -27,7 +27,6 @@
 #include "concepts/smp.hpp"
 
 #include <algorithm>
-#include <dirent.h>
 #include <atomic>
 #include <map>
 #include <cerrno>
@@ -620,32 +619,6 @@ void merge_destinations(StorageSpace *space)
     space->destinations = std::move(merged);
 }
 
-bool probe_drives(std::vector<std::string> *drives)
-{
-    drives->clear();
-#if defined(__PROSPERO__)
-    // An empty /mnt/usbN belongs to /mnt; a mounted drive is another device
-    // (how ShadowMountPlus tells too).
-    struct stat parent;
-    if (::stat("/mnt", &parent) != 0)
-        return false;
-    bool any = false;
-    for (const char *drive : {"/mnt/usb0", "/mnt/usb1", "/mnt/usb2", "/mnt/usb3", "/mnt/usb4",
-                              "/mnt/usb5", "/mnt/usb6", "/mnt/usb7", "/mnt/ext0", "/mnt/ext1"})
-    {
-        struct stat info;
-        if (::stat(drive, &info) != 0)
-            continue;
-        any = true;
-        if (info.st_dev != parent.st_dev)
-            drives->push_back(drive);
-    }
-    return any;
-#else
-    return false; // the PC preview: its fixed list
-#endif
-}
-
 std::string destination_name(const std::string &path)
 {
     if (path == "/data/homebrew" || path.rfind("/data/", 0) == 0 || path == "/data")
@@ -776,15 +749,8 @@ void *watch(void *argument)
             if (!space.known)
                 space.how = why + " | " + space.how;
         }
-        // The drives plugged in: ShadowMountPlus's mount table, or (when it
-        // doesn't answer, or lists none) what NASBridge sees itself.
-        std::vector<std::string> seen_drives;
-        if (space.drives.empty() && probe_drives(&seen_drives))
-        {
-            space.drives = seen_drives;
-            space.drives_known = true;
-        }
-        else if (!space.drives_known)
+        // The drives plugged in: ShadowMountPlus's mount table.
+        if (!space.drives_known)
         {
             // Nobody could tell this time: the last answer stands, so a
             // drive doesn't seem unplugged while ShadowMountPlus is busy.

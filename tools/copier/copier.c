@@ -50,6 +50,13 @@
  *   NASBridge -> "NBP1\t<partition device>\n"   ("/dev/da1p1", "/dev/da1s1")
  *   helper  -> "T <type GUID>" (GPT, lower case) | "T mbr:<type, 2 hex digits>"
  *              | "ERR <why>"
+ *
+ * One step on a drive's files (NASBridge can't see a USB or extended drive
+ * from its sandbox, so a copy there makes, checks, renames and removes its
+ * folders and files through these):
+ *   NASBridge -> "NBF1\t<step>\t<path>[\t<new path>]\n"
+ *   helper  -> "OK" | "OK <size> <d|f>" (stat) | "ERR <errno>"
+ * Steps: mkdir (mode FILE_MODE), stat, rename, unlink, rmdir.
  */
 
 #include <arpa/inet.h>
@@ -2083,6 +2090,45 @@ static void run_partition(int ctl, char *line) {
   close(fd);
 }
 
+/* ------------------------------------------------- a step on a drive */
+
+#define FILE_STEP_PROTO "NBF1"
+
+static void run_file_step(int ctl, char *line) {
+  char *save = NULL, *step, *path, *to;
+  struct stat st;
+  int rc = -1;
+  (void)strtok_r(line, "\t", &save);
+  step = strtok_r(NULL, "\t", &save);
+  path = strtok_r(NULL, "\t", &save);
+  to = strtok_r(NULL, "\t", &save);
+  errno = EINVAL;
+  if (!step || !path || path[0] != '/') {
+    send_line(ctl, "ERR %d", EINVAL);
+    return;
+  }
+  if (strcmp(step, "mkdir") == 0) {
+    rc = mkdir(path, FILE_MODE);
+    if (rc == 0) (void)chmod(path, FILE_MODE); /* mkdir's mode is reduced by the umask */
+  } else if (strcmp(step, "stat") == 0) {
+    rc = stat(path, &st);
+    if (rc == 0) {
+      send_line(ctl, "OK %llu %c", (unsigned long long)st.st_size, S_ISDIR(st.st_mode) ? 'd' : 'f');
+      return;
+    }
+  } else if (strcmp(step, "rename") == 0 && to && to[0] == '/') {
+    rc = rename(path, to);
+  } else if (strcmp(step, "unlink") == 0) {
+    rc = unlink(path);
+  } else if (strcmp(step, "rmdir") == 0) {
+    rc = rmdir(path);
+  }
+  if (rc == 0)
+    send_line(ctl, "OK");
+  else
+    send_line(ctl, "ERR %d", errno);
+}
+
 /* Copies one file. Every path out sends its final line. */
 static void run_job(int ctl) {
   char line[MAX_FILE + 128], *field[7], *save = NULL, *request = NULL;
@@ -2122,6 +2168,10 @@ static void run_job(int ctl) {
   }
   if (strncmp(line, PART_PROTO "\t", sizeof PART_PROTO) == 0) {
     run_partition(ctl, line);
+    goto out;
+  }
+  if (strncmp(line, FILE_STEP_PROTO "\t", sizeof FILE_STEP_PROTO) == 0) {
+    run_file_step(ctl, line);
     goto out;
   }
   field[0] = strtok_r(line, "\t", &save);

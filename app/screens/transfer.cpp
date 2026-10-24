@@ -234,6 +234,59 @@ std::string parent_of(const std::string &path)
     return slash == std::string::npos ? std::string() : path.substr(0, slash);
 }
 
+// A USB or extended drive is out of NASBridge's sight in its sandbox (its
+// calls there fail with "no such file"), so steps on a drive's folders and
+// files go through the copy helper, outside it. These do what the system
+// calls do, there or here: -1 and errno on failure.
+std::atomic<bool> g_steps_everywhere{false};
+
+bool on_drive(const std::string &path)
+{
+    return copy_helper_enabled() && (g_steps_everywhere.load() || !drive_of(path).empty());
+}
+
+int helper_step(const char *step, const std::string &path, const std::string &to = "")
+{
+    const int error = helper_file_step(step, path, to);
+    errno = error;
+    return error == 0 ? 0 : -1;
+}
+
+int make_folder(const std::string &path)
+{
+    return on_drive(path) ? helper_step("mkdir", path) : ::mkdir(path.c_str(), 0777);
+}
+
+int rename_path(const std::string &from, const std::string &to)
+{
+    return on_drive(from) ? helper_step("rename", from, to) : ::rename(from.c_str(), to.c_str());
+}
+
+int remove_file(const std::string &path)
+{
+    return on_drive(path) ? helper_step("unlink", path) : ::unlink(path.c_str());
+}
+
+int remove_folder(const std::string &path)
+{
+    return on_drive(path) ? helper_step("rmdir", path) : ::rmdir(path.c_str());
+}
+
+// The size of the file at `path`; false when there's none (or it can't be told).
+bool file_size(const std::string &path, std::uint64_t *size)
+{
+    if (on_drive(path))
+    {
+        bool folder = false;
+        return helper_file_step("stat", path, "", size, &folder) == 0 && !folder;
+    }
+    struct stat info;
+    if (::stat(path.c_str(), &info) != 0 || S_ISDIR(info.st_mode))
+        return false;
+    *size = static_cast<std::uint64_t>(info.st_size);
+    return true;
+}
+
 // Makes `path` and its parents under `base` (which exists). False with errno.
 bool make_folders(const std::string &base, const std::string &relative)
 {
@@ -244,7 +297,7 @@ bool make_folders(const std::string &base, const std::string &relative)
         if (end == std::string::npos)
             end = relative.size();
         const std::string folder = base + "/" + relative.substr(0, end);
-        if (::mkdir(folder.c_str(), 0777) != 0 && errno != EEXIST)
+        if (make_folder(folder) != 0 && errno != EEXIST)
             return false;
         at = end + 1;
     }
@@ -255,6 +308,8 @@ bool make_folders(const std::string &base, const std::string &relative)
 // tries to open it, then to make a folder there.
 bool exists(const std::string &path)
 {
+    if (on_drive(path))
+        return helper_file_step("stat", path) == 0;
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd >= 0)
     {
@@ -347,6 +402,11 @@ void set_deep_listing_wait(int seconds)
     g_shallow.clear();
 }
 
+
+void set_drive_steps_everywhere(bool everywhere)
+{
+    g_steps_everywhere.store(everywhere);
+}
 
 void set_copy_streams(int streams)
 {
@@ -957,11 +1017,11 @@ class Copier
         // A drive's homebrew folder is made by its first copy (Internal
         // storage's is ShadowMountPlus's).
         if (!drive_of(plan.destination).empty() &&
-            ::mkdir(plan.destination.c_str(), 0777) != 0 && errno != EEXIST)
+            make_folder(plan.destination) != 0 && errno != EEXIST)
             return fail(errno_text("Couldn't write to the drive", errno), why);
-        if (::mkdir(incoming.c_str(), 0777) != 0 && errno != EEXIST)
+        if (make_folder(incoming) != 0 && errno != EEXIST)
             return fail(errno_text("Couldn't write to the drive", errno), why);
-        if (!plan.image && ::mkdir(staging_.c_str(), 0777) != 0 && errno != EEXIST)
+        if (!plan.image && make_folder(staging_) != 0 && errno != EEXIST)
             return fail(errno_text("Couldn't write to the drive", errno), why);
         {
             // From here it has files on the drive: removing it deletes them.
@@ -1035,7 +1095,7 @@ class Copier
                 item->plan = plan;
             shared_->save();
         }
-        if (::rename(staging_.c_str(), final_path.c_str()) != 0)
+        if (rename_path(staging_, final_path) != 0)
             return fail(errno_text("Couldn't move the game into place", errno), why);
         return finish(incoming, why);
     }
@@ -1052,7 +1112,7 @@ class Copier
     // The game is in place: tidy up and have ShadowMountPlus look for it.
     Outcome finish(const std::string &incoming, std::string *why)
     {
-        ::rmdir(incoming.c_str()); // only when nothing else is in it
+        remove_folder(incoming); // only when nothing else is in it
         // From 1.7beta6, ShadowMountPlus scans while a homebrew app (a LAPY
         // title ID, as NASBridge has) is open: this adds the game, or, if
         // its files are too fresh for this scan (it waits stability_wait_s,
@@ -1143,6 +1203,13 @@ class Copier
             if (result != Result::fallback)
                 return result;
         }
+        // NASBridge itself can't see a drive: only the helper copies there.
+        if (on_drive(local))
+        {
+            *why = helper_unavailable_ ? "The copy helper couldn't be started, and copies to a drive need it"
+                                       : "The copy helper can't copy this file to the drive";
+            return Result::failed;
+        }
         if (size >= kParallelMin && !smb())
         {
             const Result result = copy_pieces(remote, local, size, before, path, why);
@@ -1189,10 +1256,8 @@ class Copier
         {
             const CopyFile &file = plan.files[i];
             const std::string local = staging_ + "/" + file.path;
-            struct stat info;
-            if (::stat(local.c_str(), &info) == 0 &&
-                static_cast<std::uint64_t>(info.st_size) == file.size &&
-                !exists(local + kPartSuffix))
+            std::uint64_t size = 0;
+            if (file_size(local, &size) && size == file.size && !exists(local + kPartSuffix))
             {
                 *done += file.size;
                 ++*files_done;
@@ -1217,7 +1282,7 @@ class Copier
                 // Pieces of it from an in-app copy: the helper writes it whole.
                 if (exists(item.local + kPartSuffix))
                 {
-                    ::unlink((item.local + kPartSuffix).c_str());
+                    remove_file(item.local + kPartSuffix);
                     forget_part(entry_);
                 }
                 if (smb())
@@ -1368,7 +1433,7 @@ class Copier
         const std::string part = local + kPartSuffix;
         if (exists(part))
         {
-            ::unlink(part.c_str());
+            remove_file(part);
             forget_part(entry_);
         }
         const std::string request = smb() ? "" : build_request(connection_, "GET", remote, "", "");
@@ -2567,8 +2632,8 @@ std::string discard_files(const CopyPlan &plan, const std::function<void(float)>
     {
         step();
         const std::string local = plan.image ? staging : staging + "/" + file.path;
-        ::unlink((local + kPartSuffix).c_str()); // a big file still coming in
-        if (::unlink(local.c_str()) != 0 && errno != ENOENT && problem.empty())
+        remove_file(local + kPartSuffix); // a big file still coming in
+        if (remove_file(local) != 0 && errno != ENOENT && problem.empty())
             problem = errno_text(("Couldn't delete " + (file.path.empty() ? plan.name : file.path))
                                      .c_str(),
                                  errno);
@@ -2585,12 +2650,12 @@ std::string discard_files(const CopyPlan &plan, const std::function<void(float)>
     for (const std::string &folder : folders)
     {
         step();
-        if (::rmdir((staging + "/" + folder).c_str()) != 0 && errno != ENOENT && problem.empty())
+        if (remove_folder(staging + "/" + folder) != 0 && errno != ENOENT && problem.empty())
             problem = errno_text(("Couldn't delete the folder " + folder).c_str(), errno);
     }
-    if (!plan.image && ::rmdir(staging.c_str()) != 0 && errno != ENOENT && problem.empty())
+    if (!plan.image && remove_folder(staging) != 0 && errno != ENOENT && problem.empty())
         problem = errno_text("Couldn't delete the game's folder", errno);
-    ::rmdir(incoming.c_str()); // only when nothing else is in it
+    remove_folder(incoming); // only when nothing else is in it
     forget_part(plan.entry);
     return problem;
 }
@@ -3025,17 +3090,10 @@ bool start_worker(const SharedPtr &shared)
     return true;
 }
 
-// The drives plugged in now: ShadowMountPlus's mounts, or what NASBridge
-// sees itself.
+// The drives plugged in now: ShadowMountPlus's mounts.
 StorageSpace ask_drives()
 {
     StorageSpace space = shadowmount_storage();
-    std::vector<std::string> seen;
-    if (space.drives.empty() && probe_drives(&seen))
-    {
-        space.drives = seen;
-        space.drives_known = true;
-    }
     merge_destinations(&space);
     return space;
 }

@@ -121,10 +121,6 @@ bool drive_connected(const StorageSpace &space, const std::string &path);
 // mounts as a drive of its own.
 void merge_destinations(StorageSpace *space);
 
-// The drives NASBridge sees mounted itself: a drive's folder belongs to
-// another device than /mnt. False when it can't tell (stat refused).
-bool probe_drives(std::vector<std::string> *drives);
-
 // Keeps asking (ShadowMountPlus, then NASBridge itself) on its own thread,
 // every `seconds`, for the free space, the destinations and the game list. The thread ends on its own after the watcher is gone, so
 // nothing is left behind and destroying the watcher never waits.
