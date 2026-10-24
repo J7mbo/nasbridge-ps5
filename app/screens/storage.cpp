@@ -879,6 +879,31 @@ void read_partition_types(StorageSpace *space, std::map<std::string, PartitionAn
     *known = std::move(kept); // a device unplugged is asked again when it's back
 }
 
+// Runs check_destination on a thread of its own, made now. NASBridge's
+// rights can change after it starts (copies on a new thread write to
+// /data/homebrew while this long-lived thread can't even see /data): a new
+// thread gets them as they are now.
+void check_on_new_thread(Destination *destination)
+{
+    pthread_attr_t attributes;
+    pthread_attr_init(&attributes);
+    pthread_attr_setstacksize(&attributes, 512 * 1024);
+    pthread_t thread;
+    const int created = pthread_create(
+        &thread, &attributes,
+        [](void *argument) -> void *
+        {
+            check_destination(static_cast<Destination *>(argument));
+            return nullptr;
+        },
+        destination);
+    pthread_attr_destroy(&attributes);
+    if (created == 0)
+        pthread_join(thread, nullptr);
+    else
+        check_destination(destination);
+}
+
 void *watch(void *argument)
 {
     // The thread keeps the shared state alive by itself; the watcher may be
@@ -985,7 +1010,7 @@ void *watch(void *argument)
             {
                 destination.writable = -1;
                 checked_at[destination.path] = now_ms();
-                check_destination(&destination);
+                check_on_new_thread(&destination);
                 // Internal storage isn't refused on the check's word: copies
                 // there worked before it was checked at all, and on a PS5 it
                 // fails ("folder e2") where the sandbox doesn't show
