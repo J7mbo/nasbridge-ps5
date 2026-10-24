@@ -1401,6 +1401,21 @@ int main(int argc, char **argv)
                       !drive_connected(space_now, "/mnt/usb0/homebrew") &&
                       drive_connected(space_now, "/data/homebrew"),
                   "a drive is connected while it is listed; Internal storage always is");
+            // A Mac-formatted drive: its ~200 MB EFI partition is mounted too.
+            const std::string efi_reply =
+                "{\"mounts\": [{\"mount_point\": \"/user\", \"total_bytes\": 900000000000, "
+                "\"available_bytes\": 500000000000},"
+                "{\"mount_point\": \"/mnt/usb0\", \"total_bytes\": 209715200, "
+                "\"available_bytes\": 200000000},"
+                "{\"mount_point\": \"/mnt/usb1\", \"total_bytes\": 128000000000, "
+                "\"available_bytes\": 100300000000}]}";
+            space_now = storage_from_json(efi_reply);
+            merge_destinations(&space_now);
+            paths.clear();
+            for (const Destination &place : space_now.destinations)
+                paths += place.path + ";";
+            check(paths == "/data/homebrew;/mnt/usb1/homebrew;",
+                  "a drive's small EFI partition isn't offered", paths);
             // Nothing listed at all: Internal storage is still a choice.
             space_now = storage_from_json("{}");
             merge_destinations(&space_now);

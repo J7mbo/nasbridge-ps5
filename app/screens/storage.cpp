@@ -491,6 +491,7 @@ bool drive_connected(const StorageSpace &space, const std::string &path)
 
 void merge_destinations(StorageSpace *space)
 {
+    constexpr std::uint64_t kSmallestDrive = 2ull * 1000 * 1000 * 1000; // bytes
     std::vector<Destination> merged;
     // Internal storage: ShadowMountPlus's numbers for it, or the console's.
     Destination internal;
@@ -546,6 +547,11 @@ void merge_destinations(StorageSpace *space)
                 if (!listed.mount_point.empty())
                     place.mount_point = listed.mount_point;
             }
+        // A partition too small for any game isn't a choice: the ~200 MB EFI
+        // partition a Mac (or Windows, on GPT) puts on a drive, which the
+        // PS5 mounts as a drive of its own.
+        if (place.total > 0 && place.total < kSmallestDrive)
+            continue;
         merged.push_back(place);
     }
     space->destinations = std::move(merged);

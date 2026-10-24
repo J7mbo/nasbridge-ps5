@@ -107,6 +107,7 @@ bool drive_connected(const StorageSpace &space, const std::string &path);
 // first, even when ShadowMountPlus listed nothing, then <drive>/homebrew for
 // each drive, once per drive. A drive ShadowMountPlus has no folder for gets
 // its mount's numbers (space->drive_space), or total 0 (free space unknown).
+// Partitions under 2 GB (a drive's EFI partition) are left out.
 void merge_destinations(StorageSpace *space);
 
 // The drives NASBridge sees mounted itself: a drive's folder belongs to
