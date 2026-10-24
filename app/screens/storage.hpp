@@ -38,6 +38,9 @@ struct Destination
     int writable = -1;
     std::string why; // the step that failed ("create e1"); Internal storage
                      // keeps writable 1 with it (see the storage watcher)
+    // When the check failed: what NASBridge could see there, for Debug info
+    // ("stat e2  open e2  list e2  .nasbridge-incoming ok  /data ok").
+    std::string probe;
 };
 
 // "Internal storage", "Extended storage", "USB drive 1", or the path.

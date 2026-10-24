@@ -28,6 +28,7 @@
 #include "concepts/smp.hpp"
 
 #include <algorithm>
+#include <dirent.h>
 #include <atomic>
 #include <map>
 #include <cerrno>
@@ -668,6 +669,48 @@ std::string destination_name(const std::string &path)
     return name.empty() ? path : name;
 }
 
+namespace
+{
+
+// What NASBridge can see of `path` (ok, or the error number), each way it
+// could look.
+std::string look_at(const std::string &path)
+{
+    const auto result = [](bool ok) { return ok ? std::string("ok") : "e" + std::to_string(errno); };
+    struct stat info;
+    std::string text = "stat " + result(::stat(path.c_str(), &info) == 0);
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    text += "  open " + result(fd >= 0);
+    if (fd >= 0)
+        ::close(fd);
+    DIR *dir = ::opendir(path.c_str());
+    text += "  list " + result(dir != nullptr);
+    if (dir != nullptr)
+        ::closedir(dir);
+    return text;
+}
+
+// A failed check's report: the folder, NASBridge's copy folder in it, and
+// the folder above.
+std::string probe_destination(const std::string &path)
+{
+    struct stat info;
+    std::string text = look_at(path);
+    const std::string incoming = path + "/.nasbridge-incoming";
+    text += "  .nasbridge-incoming " +
+            (::stat(incoming.c_str(), &info) == 0 ? std::string("ok") : "e" + std::to_string(errno));
+    const std::size_t slash = path.rfind('/');
+    if (slash != std::string::npos && slash > 0)
+    {
+        const std::string parent = path.substr(0, slash);
+        text += "  " + parent + " " +
+                (::stat(parent.c_str(), &info) == 0 ? std::string("ok") : "e" + std::to_string(errno));
+    }
+    return text;
+}
+
+} // namespace
+
 void check_destination(Destination *destination)
 {
     destination->writable = 0;
@@ -687,6 +730,7 @@ void check_destination(Destination *destination)
         char text[48];
         std::snprintf(text, sizeof(text), "%s e%d", step, errno);
         destination->why = text;
+        destination->probe = probe_destination(destination->path);
     };
     // Laid out like a copy: a folder of NASBridge's, a file written in
     // pieces, reopened to carry on, renamed when done, then removed.
@@ -935,6 +979,7 @@ void *watch(void *argument)
             {
                 destination.writable = before->writable;
                 destination.why = before->why;
+                destination.probe = before->probe;
             }
             else if ((destination.writable < 0 || failed) && !shared->stop.load())
             {
