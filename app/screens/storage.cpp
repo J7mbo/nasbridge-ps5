@@ -859,6 +859,7 @@ void *watch(void *argument)
 #endif
     std::vector<Destination> checked;
     std::map<std::string, PartitionAnswer> partitions; // by device
+    std::map<std::string, std::uint64_t> checked_at; // when each folder was last checked
     while (!shared->stop.load())
     {
         StorageSpace space = shadowmount_storage();
@@ -917,7 +918,10 @@ void *watch(void *argument)
             }
         }
         // Each folder is checked once while it stays listed (a drive plugged
-        // in again is checked again).
+        // in again is checked again). A failed check is tried again every
+        // few seconds: NASBridge's view of a drive (ShadowMountPlus's alias
+        // in its sandbox) can come a while after the drive is mounted.
+        constexpr std::uint64_t kRecheckMs = 10000;
         std::vector<Destination> seen;
         for (Destination &destination : space.destinations)
         {
@@ -925,13 +929,17 @@ void *watch(void *argument)
             for (const Destination &old : checked)
                 if (old.path == destination.path && old.mount_point == destination.mount_point)
                     before = &old;
-            if (before != nullptr)
+            const bool failed = before != nullptr && !before->why.empty();
+            if (before != nullptr &&
+                !(failed && now_ms() - checked_at[destination.path] >= kRecheckMs))
             {
                 destination.writable = before->writable;
                 destination.why = before->why;
             }
-            else if (destination.writable < 0 && !shared->stop.load())
+            else if ((destination.writable < 0 || failed) && !shared->stop.load())
             {
+                destination.writable = -1;
+                checked_at[destination.path] = now_ms();
                 check_destination(&destination);
                 // Internal storage isn't refused on the check's word: copies
                 // there worked before it was checked at all, and on a PS5 it
