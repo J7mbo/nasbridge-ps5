@@ -21,6 +21,7 @@
 #include "concepts/storage.hpp"
 
 #include "concepts/connection.hpp"
+#include "concepts/copy_helper.hpp"
 #include "concepts/file_calls.hpp"
 #include "concepts/http.hpp"
 #include "concepts/json_scan.hpp"
@@ -28,6 +29,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <map>
 #include <cerrno>
 #include <cstdlib>
 #include <fcntl.h>
@@ -414,7 +416,13 @@ StorageSpace storage_from_json(const std::string &json)
         if (std::find(space.drives.begin(), space.drives.end(), mount.point) != space.drives.end())
             continue;
         space.drives.push_back(mount.point);
-        space.drive_space.push_back({mount.point, mount.available, mount.total, mount.read_only});
+        DriveSpace drive;
+        drive.mount_point = mount.point;
+        drive.free = mount.available;
+        drive.total = mount.total;
+        drive.read_only = mount.read_only;
+        drive.source = mount.source;
+        space.drive_space.push_back(drive);
     }
     for (const Destination &destination : space.destinations)
     {
@@ -506,9 +514,50 @@ bool drive_connected(const StorageSpace &space, const std::string &path)
     return std::find(space.drives.begin(), space.drives.end(), drive) != space.drives.end();
 }
 
+bool efi_type(const std::string &type)
+{
+    return type == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" || type == "mbr:ef";
+}
+
+std::string disk_of(const std::string &device)
+{
+    // da1p2 (GPT), da1s1 (MBR), da1s1a (a BSD slice): drop the partition part.
+    const auto digit = [](char c) { return c >= '0' && c <= '9'; };
+    std::size_t end = device.size();
+    if (end >= 2 && device[end - 1] >= 'a' && device[end - 1] <= 'h' && digit(device[end - 2]))
+        --end;
+    std::size_t start = end;
+    while (start > 0 && digit(device[start - 1]))
+        --start;
+    if (start == end || start < 2 || (device[start - 1] != 'p' && device[start - 1] != 's') ||
+        !digit(device[start - 2]))
+        return device;
+    return device.substr(0, start - 1);
+}
+
+namespace
+{
+
+// The drive's mount, as ShadowMountPlus listed it; null when it didn't.
+const DriveSpace *mount_of(const StorageSpace &space, const std::string &drive)
+{
+    for (const DriveSpace &mount : space.drive_space)
+        if (mount.mount_point == drive)
+            return &mount;
+    return nullptr;
+}
+
+// A drive whose partition table says it's an EFI System partition.
+bool efi_like(const StorageSpace &space, const std::string &drive)
+{
+    const DriveSpace *mount = mount_of(space, drive);
+    return mount != nullptr && mount->efi == 1;
+}
+
+} // namespace
+
 void merge_destinations(StorageSpace *space)
 {
-    constexpr std::uint64_t kSmallestDrive = 2ull * 1000 * 1000 * 1000; // bytes
     std::vector<Destination> merged;
     // Internal storage: ShadowMountPlus's numbers for it, or the console's.
     Destination internal;
@@ -564,10 +613,7 @@ void merge_destinations(StorageSpace *space)
                 if (!listed.mount_point.empty())
                     place.mount_point = listed.mount_point;
             }
-        // A partition too small for any game isn't a choice: the ~200 MB EFI
-        // partition a Mac (or Windows, on GPT) puts on a drive, which the
-        // PS5 mounts as a drive of its own.
-        if (place.total > 0 && place.total < kSmallestDrive)
+        if (efi_like(*space, drive))
             continue;
         merged.push_back(place);
     }
@@ -644,21 +690,27 @@ void check_destination(Destination *destination)
     };
     // Laid out like a copy: a folder of NASBridge's, a file written in
     // pieces, reopened to carry on, renamed when done, then removed.
-    // A folder not made yet (a drive's homebrew before its first copy):
-    // where the copy will make it.
-    std::string where = destination->path;
-    struct stat info;
-    if (::stat(where.c_str(), &info) != 0 && errno == ENOENT)
+    // A drive's homebrew folder may not be made yet (the first copy makes
+    // it): then the check runs on the drive itself. Only on a drive: the
+    // sandbox can say "no such folder" about Internal storage's own path.
+    const auto make = [](const std::string &path)
+    { return ::mkdir(path.c_str(), 0777) == 0 || errno == EEXIST; };
+    std::string folder = destination->path + "/.nasbridge-check";
+    if (!make(folder))
     {
-        const std::size_t slash = where.rfind('/');
-        if (slash != std::string::npos && slash > 0)
-            where.resize(slash);
+        const int error = errno;
+        const std::string drive = drive_of(destination->path);
+        if (error != ENOENT || drive.empty() || drive == destination->path)
+        {
+            errno = error;
+            return fail("folder");
+        }
+        folder = drive + "/.nasbridge-check";
+        if (!make(folder))
+            return fail("folder");
     }
-    const std::string folder = where + "/.nasbridge-check";
     const std::string part = folder + "/check.part";
     const std::string done = folder + "/check.bin";
-    if (::mkdir(folder.c_str(), 0777) != 0 && errno != EEXIST)
-        return fail("folder");
     int fd = ::open(part.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0666);
     if (fd < 0)
     {
@@ -732,6 +784,57 @@ struct StorageWatcher::Shared
 namespace
 {
 
+// What the copy helper said about a partition, and when it was asked.
+struct PartitionAnswer
+{
+    int efi = -1; // 1 EFI System, 0 another type, -1 couldn't tell
+    std::uint64_t asked_ms = 0;
+};
+
+// Asks the copy helper for the partition type of each drive that shares its
+// disk with another mounted partition (an EFI partition always does): once
+// per device while it stays mounted, or again after a minute when the helper
+// couldn't tell (busy with a copy, not started). Notes the answer on the
+// drive's Debug info line.
+void read_partition_types(StorageSpace *space, std::map<std::string, PartitionAnswer> *known)
+{
+    constexpr std::uint64_t kRetryMs = 60000;
+    std::map<std::string, PartitionAnswer> kept;
+    for (DriveSpace &mount : space->drive_space)
+    {
+        if (mount.source.empty() || disk_of(mount.source) == mount.source)
+            continue;
+        bool shared = false;
+        for (const DriveSpace &other : space->drive_space)
+            if (&other != &mount && !other.source.empty() &&
+                disk_of(other.source) == disk_of(mount.source))
+                shared = true;
+        if (!shared)
+            continue;
+        PartitionAnswer answer;
+        const auto found = known->find(mount.source);
+        if (found != known->end())
+            answer = found->second;
+        std::string note;
+        if (found == known->end() || (answer.efi < 0 && now_ms() - answer.asked_ms >= kRetryMs))
+        {
+            std::string why;
+            const std::string type = partition_type(mount.source, &why);
+            answer.efi = type.empty() ? -1 : efi_type(type) ? 1 : 0;
+            answer.asked_ms = now_ms();
+            note = type.empty() ? "type ? (" + why + ")" : "type " + type;
+        }
+        mount.efi = answer.efi;
+        kept[mount.source] = answer;
+        if (note.empty())
+            note = answer.efi == 1 ? "EFI System" : answer.efi == 0 ? "not EFI" : "type ?";
+        for (std::string &line : space->mount_lines)
+            if (line.compare(0, mount.mount_point.size() + 1, mount.mount_point + " ") == 0)
+                line += "  " + (answer.efi == 1 ? "EFI System (hidden)" : note);
+    }
+    *known = std::move(kept); // a device unplugged is asked again when it's back
+}
+
 void *watch(void *argument)
 {
     // The thread keeps the shared state alive by itself; the watcher may be
@@ -755,6 +858,7 @@ void *watch(void *argument)
     }
 #endif
     std::vector<Destination> checked;
+    std::map<std::string, PartitionAnswer> partitions; // by device
     while (!shared->stop.load())
     {
         StorageSpace space = shadowmount_storage();
@@ -793,6 +897,7 @@ void *watch(void *argument)
             space.drives = shared->latest.drives;
             space.drive_space = shared->latest.drive_space;
         }
+        read_partition_types(&space, &partitions);
         merge_destinations(&space);
         // The games ShadowMountPlus knows. Kept from the last round when it
         // doesn't answer this time, so "On PS5" doesn't flicker.

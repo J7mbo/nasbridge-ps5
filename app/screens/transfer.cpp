@@ -954,8 +954,10 @@ class Copier
             *why = "There's already a \"" + plan.name + "\" on this drive";
             return stopped_or(Outcome::failed);
         }
-        // A drive's homebrew folder is made by its first copy.
-        if (::mkdir(plan.destination.c_str(), 0777) != 0 && errno != EEXIST)
+        // A drive's homebrew folder is made by its first copy (Internal
+        // storage's is ShadowMountPlus's).
+        if (!drive_of(plan.destination).empty() &&
+            ::mkdir(plan.destination.c_str(), 0777) != 0 && errno != EEXIST)
             return fail(errno_text("Couldn't write to the drive", errno), why);
         if (::mkdir(incoming.c_str(), 0777) != 0 && errno != EEXIST)
             return fail(errno_text("Couldn't write to the drive", errno), why);

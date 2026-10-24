@@ -43,6 +43,13 @@
  * and the replies are as above (no "S" line). The file comes over <streams>
  * sign-ins (1 when left out), each fetching the next CHUNK in turn as over
  * HTTP, with several reads in flight (SMB_IN_FLIGHT) for each chunk.
+ *
+ * A partition's type, from its disk's partition table (NASBridge can't read
+ * a disk from its sandbox; it leaves a drive's EFI partition out of its
+ * destinations):
+ *   NASBridge -> "NBP1\t<partition device>\n"   ("/dev/da1p1", "/dev/da1s1")
+ *   helper  -> "T <type GUID>" (GPT, lower case) | "T mbr:<type, 2 hex digits>"
+ *              | "ERR <why>"
  */
 
 #include <arpa/inet.h>
@@ -1979,6 +1986,103 @@ out:
   free(b);
 }
 
+/* ------------------------------------------------- a partition's type */
+
+#define PART_PROTO "NBP1"
+
+/* The disk and the partition number of "/dev/da1p2" (GPT, 'p') or
+ * "/dev/da1s1" (MBR, 's'); 0 when it isn't one. */
+static int split_partition(const char *device, char *disk, size_t size, char *kind) {
+  size_t end = strlen(device), start = end;
+  int number;
+  while (start > 0 && device[start - 1] >= '0' && device[start - 1] <= '9') --start;
+  if (start == end || start < 2 || (device[start - 1] != 'p' && device[start - 1] != 's') ||
+      device[start - 2] < '0' || device[start - 2] > '9' || start - 1 >= size)
+    return 0;
+  number = atoi(device + start);
+  memcpy(disk, device, start - 1);
+  disk[start - 1] = '\0';
+  *kind = device[start - 1];
+  return number;
+}
+
+static uint32_t le32(const unsigned char *p) {
+  return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static uint64_t le64(const unsigned char *p) {
+  return (uint64_t)le32(p) | (uint64_t)le32(p + 4) << 32;
+}
+
+/* Reads `len` bytes at `offset`, in whole 4 KiB blocks (a disk device only
+ * reads whole sectors). */
+static int read_disk(int fd, uint64_t offset, unsigned char *out, size_t len) {
+  static unsigned char block[4096];
+  while (len > 0) {
+    const uint64_t at = offset / sizeof block * sizeof block;
+    const size_t skip = (size_t)(offset - at);
+    const size_t take = len < sizeof block - skip ? len : sizeof block - skip;
+    if (pread(fd, block, sizeof block, (off_t)at) < (ssize_t)(skip + take)) return -1;
+    memcpy(out, block + skip, take);
+    out += take;
+    offset += take;
+    len -= take;
+  }
+  return 0;
+}
+
+static void run_partition(int ctl, char *line) {
+  char *device = line + sizeof PART_PROTO, disk[256], kind = 0;
+  unsigned char head[512], entry[128];
+  const int number = split_partition(device, disk, sizeof disk, &kind);
+  int fd;
+  if (number < 1) {
+    send_line(ctl, "ERR not a partition: %s", device);
+    return;
+  }
+  fd = open(disk, O_RDONLY);
+  if (fd < 0) {
+    send_line(ctl, "ERR %s: %s", disk, strerror(errno));
+    return;
+  }
+  if (kind == 's') { /* MBR: the type byte of entry `number` (1..4) */
+    if (number > 4 || read_disk(fd, 0, head, sizeof head) != 0 || head[510] != 0x55 ||
+        head[511] != 0xaa)
+      send_line(ctl, "ERR no MBR on %s", disk);
+    else
+      send_line(ctl, "T mbr:%02x", head[446 + 16 * (number - 1) + 4]);
+    close(fd);
+    return;
+  }
+  /* GPT: the header is in the second sector (512 or 4096 bytes). */
+  {
+    static const unsigned sectors[] = {512, 4096};
+    unsigned i;
+    for (i = 0; i < 2; ++i) {
+      uint64_t table;
+      uint32_t count, size;
+      const unsigned char *g = entry;
+      if (read_disk(fd, sectors[i], head, sizeof head) != 0 || memcmp(head, "EFI PART", 8) != 0)
+        continue;
+      table = le64(head + 72);
+      count = le32(head + 80);
+      size = le32(head + 84);
+      if ((uint32_t)number > count || size < 128 ||
+          read_disk(fd, table * sectors[i] + (uint64_t)(number - 1) * size, entry, sizeof entry) != 0)
+        break;
+      /* The first three fields are little-endian. */
+      send_line(ctl,
+                "T %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10], g[11], g[12],
+                g[13], g[14], g[15]);
+      close(fd);
+      return;
+    }
+  }
+  send_line(ctl, "ERR no GPT entry %d on %s", number, disk);
+  close(fd);
+}
+
 /* Copies one file. Every path out sends its final line. */
 static void run_job(int ctl) {
   char line[MAX_FILE + 128], *field[7], *save = NULL, *request = NULL;
@@ -2014,6 +2118,10 @@ static void run_job(int ctl) {
   }
   if (strncmp(line, PROTO_SMB "\t", sizeof PROTO_SMB) == 0) {
     run_smb_job(&j, line);
+    goto out;
+  }
+  if (strncmp(line, PART_PROTO "\t", sizeof PART_PROTO) == 0) {
+    run_partition(ctl, line);
     goto out;
   }
   field[0] = strtok_r(line, "\t", &save);

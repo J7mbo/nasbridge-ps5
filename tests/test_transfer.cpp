@@ -1401,21 +1401,43 @@ int main(int argc, char **argv)
                       !drive_connected(space_now, "/mnt/usb0/homebrew") &&
                       drive_connected(space_now, "/data/homebrew"),
                   "a drive is connected while it is listed; Internal storage always is");
-            // A Mac-formatted drive: its ~200 MB EFI partition is mounted too.
+            // A GPT drive (as a Mac formats it): its EFI partition is mounted
+            // too, as /mnt/usb0 beside the real /mnt/usb1.
+            check(disk_of("/dev/da1p2") == "/dev/da1" && disk_of("/dev/da1s1") == "/dev/da1" &&
+                      disk_of("/dev/da12p1") == "/dev/da12" && disk_of("/dev/da1s1a") == "/dev/da1" &&
+                      disk_of("/dev/da1") == "/dev/da1" && disk_of("/dev/lvd0") == "/dev/lvd0",
+                  "a partition's device names its disk");
             const std::string efi_reply =
                 "{\"mounts\": [{\"mount_point\": \"/user\", \"total_bytes\": 900000000000, "
                 "\"available_bytes\": 500000000000},"
-                "{\"mount_point\": \"/mnt/usb0\", \"total_bytes\": 209715200, "
-                "\"available_bytes\": 200000000},"
-                "{\"mount_point\": \"/mnt/usb1\", \"total_bytes\": 128000000000, "
-                "\"available_bytes\": 100300000000}]}";
-            space_now = storage_from_json(efi_reply);
-            merge_destinations(&space_now);
-            paths.clear();
-            for (const Destination &place : space_now.destinations)
-                paths += place.path + ";";
+                "{\"mount_point\": \"/mnt/usb0\", \"source\": \"/dev/da1p1\", "
+                "\"filesystem\": \"exfatfs\", \"total_bytes\": 209715200, "
+                "\"available_bytes\": 209000000},"
+                "{\"mount_point\": \"/mnt/usb1\", \"source\": \"/dev/da1p2\", "
+                "\"filesystem\": \"exfatfs\", \"total_bytes\": 239840000000, "
+                "\"available_bytes\": 100330000000}]}";
+            const auto choices = [](StorageSpace space, int usb0_efi)
+            {
+                space.drive_space[0].efi = usb0_efi;
+                merge_destinations(&space);
+                std::string out;
+                for (const Destination &place : space.destinations)
+                    out += place.path + ";";
+                return out;
+            };
+            const StorageSpace efi = storage_from_json(efi_reply);
+            check(efi.drive_space.size() == 2 && efi.drive_space[0].source == "/dev/da1p1" &&
+                      efi.mount_lines.size() == 2,
+                  "the mounts' devices are read", efi.mount_lines.empty() ? "" : efi.mount_lines[0]);
+            paths = choices(efi, 1);
             check(paths == "/data/homebrew;/mnt/usb1/homebrew;",
-                  "a drive's small EFI partition isn't offered", paths);
+                  "an EFI System partition isn't offered", paths);
+            paths = choices(efi, 0);
+            check(paths == "/data/homebrew;/mnt/usb0/homebrew;/mnt/usb1/homebrew;",
+                  "a partition of another type is, whatever its size", paths);
+            paths = choices(efi, -1);
+            check(paths == "/data/homebrew;/mnt/usb0/homebrew;/mnt/usb1/homebrew;",
+                  "and so is one whose type couldn't be read", paths);
             // Nothing listed at all: Internal storage is still a choice.
             space_now = storage_from_json("{}");
             merge_destinations(&space_now);
@@ -1451,6 +1473,46 @@ int main(int argc, char **argv)
             wait_for_port(copy_loader_port);
             set_copy_helper(copier, copy_loader_port, copier_port);
             set_copy_streams(1);
+
+            // A drive's partition types, read by the helper: a GPT disk as a
+            // Mac formats it (EFI System, then the data partition) and an
+            // MBR one.
+            {
+                const std::string disks = g_work + "/disks";
+                std::system(("mkdir -p \"" + disks + "\"").c_str());
+                std::vector<unsigned char> gpt(64 * 1024, 0);
+                std::memcpy(&gpt[512], "EFI PART", 8);
+                gpt[512 + 72] = 2;   // the entries start at sector 2
+                gpt[512 + 80] = 128; // 128 entries
+                gpt[512 + 84] = 128; // of 128 bytes
+                const unsigned char efi[16] = {0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11,
+                                               0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b};
+                const unsigned char data[16] = {0xa2, 0xa0, 0xd0, 0xeb, 0xe5, 0xb9, 0x33, 0x44,
+                                                0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7};
+                std::memcpy(&gpt[1024], efi, 16);
+                std::memcpy(&gpt[1024 + 128], data, 16);
+                std::ofstream(disks + "/da1", std::ios::binary)
+                    .write(reinterpret_cast<const char *>(gpt.data()), static_cast<long>(gpt.size()));
+                std::vector<unsigned char> mbr(8192, 0);
+                mbr[446 + 4] = 0x07; // exFAT/NTFS
+                mbr[446 + 16 + 4] = 0xef;
+                mbr[510] = 0x55;
+                mbr[511] = 0xaa;
+                std::ofstream(disks + "/da2", std::ios::binary)
+                    .write(reinterpret_cast<const char *>(mbr.data()), static_cast<long>(mbr.size()));
+                std::string type = partition_type(disks + "/da1p1", &why);
+                check(type == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" && efi_type(type),
+                      "the helper reads a GPT EFI System partition's type", type + why);
+                type = partition_type(disks + "/da1p2", &why);
+                check(type == "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7" && !efi_type(type),
+                      "and the data partition's", type + why);
+                type = partition_type(disks + "/da2s1", &why);
+                const std::string second = partition_type(disks + "/da2s2", &why);
+                check(type == "mbr:07" && second == "mbr:ef" && efi_type(second),
+                      "and an MBR disk's", type + " " + second);
+                check(partition_type(disks + "/da3p1", &why).empty() && !why.empty(),
+                      "a disk that isn't there says why", why);
+            }
 
             // a. A folder game: every file through the helper, identical.
             clean("Game One");

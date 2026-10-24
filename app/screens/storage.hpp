@@ -56,7 +56,19 @@ struct DriveSpace
     std::uint64_t free = 0;  // bytes
     std::uint64_t total = 0; // bytes
     bool read_only = false;
+    std::string source; // the device ("/dev/da1p2")
+    // Whether the partition table says it's an EFI System partition: 1 yes,
+    // 0 no, -1 not known (the watcher asks the copy helper; see
+    // merge_destinations).
+    int efi = -1;
 };
+
+// The disk a partition's device is on: "/dev/da1" for "/dev/da1p2" or
+// "/dev/da1s1"; the device itself when it has no partition number.
+std::string disk_of(const std::string &device);
+
+// Whether a partition type (as partition_type() gives it) is EFI System.
+bool efi_type(const std::string &type);
 
 struct StorageSpace
 {
@@ -110,7 +122,9 @@ bool drive_connected(const StorageSpace &space, const std::string &path);
 // first, even when ShadowMountPlus listed nothing, then <drive>/homebrew for
 // each drive, once per drive. A drive ShadowMountPlus has no folder for gets
 // its mount's numbers (space->drive_space), or total 0 (free space unknown).
-// Partitions under 2 GB (a drive's EFI partition) are left out.
+// A drive whose partition is an EFI System partition is left out: the one a
+// GPT format adds (a Mac puts one on every drive it formats), which the PS5
+// mounts as a drive of its own.
 void merge_destinations(StorageSpace *space);
 
 // The drives NASBridge sees mounted itself: a drive's folder belongs to
