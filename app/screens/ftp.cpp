@@ -825,8 +825,8 @@ void FtpSession::abandon(int data)
     int code = 0;
     std::string text;
     FtpFailure ignored;
-    if (control_.load() >= 0 && !reply(&code, &text, &ignored))
-        disconnect();
+    if (control_.load() >= 0 && (!reply(&code, &text, &ignored) || code == 421))
+        disconnect(); // 421: the NAS is closing it
 }
 
 bool FtpSession::list(const std::string &folder, std::vector<FtpEntry> *entries, FtpFailure *why)

@@ -2366,6 +2366,12 @@ static int batch_one_ftp(batch_t *b, int w, const bfile_t *f, char *buf) {
       close(fd);
       return batch_fail(b, f->index, "write", strerror(err));
     }
+    if (got < f->size && code != 226 && code != 250) {
+      /* Cut short, and the NAS doesn't say the file was all sent: again. */
+      if (tries + 1 < BATCH_TRIES) continue;
+      close(fd);
+      return batch_fail(b, f->index, "drop", "the NAS ended the connection early");
+    }
     if (got != f->size) {
       close(fd);
       return batch_fail(b, f->index, "changed", "the file on the NAS is a different size now");
