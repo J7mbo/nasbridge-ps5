@@ -85,6 +85,12 @@ GPL-3.0-or-later), by way of the kit, whose source includes this code:
   GPL-3.0-or-later. It was converted by `tools/make_music.sh` with
   BlackBearReloaded's ps5-at9-converter (GPL-3.0-or-later), which isn't part
   of what is installed.
+- **Reading `.ffpfsc` images** (`app/screens/pfs.cpp`, `ufs2.cpp`,
+  `ffpfsc.cpp`) is NASBridge's own code. The PFS and PFSC layouts were learned
+  from [MkPFS](https://github.com/PSBrew/MkPFS) (PSBrew) and
+  [Dump Forge](https://github.com/quer3q/ps5-dump-forge) (quer3q), both
+  GPL-3.0-or-later; UFS2's comes from FreeBSD's public headers. No code was
+  copied from them. Its zlib blocks are inflated by stb_image's zlib decoder.
 - **Home-screen artwork** (`app/sce_sys/icon0.png`, `pic0.dds`, `pic1.dds`) is
   NASBridge's own. The backgrounds are rendered by `tools/make_background.py`.
 
@@ -124,6 +130,9 @@ tests also build libsmb2 for the computer they run on, and run
 [Samba](https://www.samba.org/)'s `smbd` (GPL-3.0-or-later) with
 [nss_wrapper](https://cwrap.org/nss_wrapper.html) (BSD-3-Clause) from the
 toolchain image as their test NAS.
+The `.ffpfsc` test images (`tests/fixtures/*.ffpfsc.gz`) were made with
+MkPFS 1.1.0 and Dump Forge 0.4.0 by `tests/fixtures/make_ffpfsc.sh`, from a
+made-up game that script writes. Neither tool is part of the build.
 
 ## Disclaimer
 

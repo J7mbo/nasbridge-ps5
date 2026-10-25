@@ -4,6 +4,7 @@
 
 #include "concepts/nas_library.hpp"
 
+#include "concepts/ffpfsc.hpp"
 #include "concepts/library_cache.hpp"
 #include "concepts/nas.hpp"
 #include "concepts/nas_probe.hpp"
@@ -13,6 +14,7 @@
 #include <atomic>
 #include <deque>
 #include <map>
+#include <memory>
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
@@ -384,6 +386,8 @@ struct LibraryLoader::Job
     std::vector<NasGame> saved; // what the cache held
     bool key_art_only = false;  // a start_key_art() request
     NasGame target;             // ... for this game
+    std::unique_ptr<FfpfscReader> compressed_; // the .ffpfsc opened last (open_compressed)
+    std::string compressed_path_;
     int ui_cpu = -1;
     std::atomic<bool> cancelled{false};
     std::atomic<int> owners{2}; // the loader and the thread; the last one deletes
@@ -458,7 +462,7 @@ struct LibraryLoader::Job
         return nas->list(url, entries, problem);
     }
 
-    // Reads parts of an image file on the NAS (for ExfatReader).
+    // Reads parts of an image file on the NAS (for ExfatReader and FfpfscReader).
     ExfatReader::ReadAt image_reader(const std::string &path)
     {
         return [this, path](std::uint64_t offset, std::size_t length, std::string *out)
@@ -520,9 +524,10 @@ struct LibraryLoader::Job
     }
 
     // Finds a game folder's sce_sys, breadth first, up to kDepth folders
-    // down ("Game/PPSA01234-app/sce_sys"). A folder holding an .exfat image
-    // instead becomes an image game. False when the folder holds no game at
-    // all (a backport or patch folder, or an empty one): it isn't listed.
+    // down ("Game/PPSA01234-app/sce_sys"). A folder holding an image (.exfat
+    // or .ffpfsc) instead becomes an image game. False when the folder holds
+    // no game at all (a backport or patch folder, or an empty one): it isn't
+    // listed.
     bool read_folder(const std::string &root, NasGame *game)
     {
         struct Folder
@@ -559,7 +564,7 @@ struct LibraryLoader::Job
             {
                 if (!entry.folder)
                 {
-                    if (image_path.empty() && ends_with_nocase(entry.name, ".exfat"))
+                    if (image_path.empty() && is_image_name(entry.name))
                     {
                         image = entry;
                         image_path = folder.path + "/" + entry.name;
@@ -629,6 +634,11 @@ struct LibraryLoader::Job
     // cover and the key art. On failure game->note says why.
     void read_image(const std::string &root, NasGame *game)
     {
+        if (is_compressed_image_name(game->image_path))
+        {
+            read_compressed_image(root, game);
+            return;
+        }
         ExfatReader reader(image_reader(root + game->image_path));
         std::string why;
         std::vector<ExfatFile> sce_sys;
@@ -663,6 +673,64 @@ struct LibraryLoader::Job
             game->note = "the image's sce_sys has no cover picture";
     }
 
+    // A .ffpfsc, opened through its layers (ffpfsc.hpp). The one opened last
+    // is kept, so its pictures are read without opening it again; the cache
+    // keeps only their names, and a later fetch opens the image again.
+    FfpfscReader *open_compressed(const std::string &root, const std::string &image_path,
+                                  std::string *why)
+    {
+        if (compressed_ && compressed_path_ == image_path)
+            return compressed_.get();
+        compressed_.reset();
+        auto reader = std::make_unique<FfpfscReader>(image_reader(root + image_path));
+        if (!reader->open(why))
+            return nullptr;
+        compressed_ = std::move(reader);
+        compressed_path_ = image_path;
+        return compressed_.get();
+    }
+
+    // A .ffpfsc: the same as read_image, through its layers.
+    void read_compressed_image(const std::string &root, NasGame *game)
+    {
+        std::string why;
+        FfpfscReader *opened = open_compressed(root, game->image_path, &why);
+        if (opened == nullptr)
+        {
+            if (!cancelled)
+                game->note = "couldn't look inside the compressed image: " + why;
+            return;
+        }
+        FfpfscReader &reader = *opened;
+        game->inside = true;
+        std::string cover;
+        std::string art;
+        bool param = false;
+        for (const std::string &name : reader.sce_sys())
+        {
+            const std::string low = lowered(name);
+            param = param || low == "param.json";
+            if (is_cover_name(name) && (cover.empty() || low == "icon0.png"))
+                cover = name;
+            if (low == "pic0.png")
+                art = name;
+        }
+        if (param)
+        {
+            std::string json;
+            if (reader.read("param.json", kMaxParam, &json, &why))
+                read_param_json(json, game);
+            else
+                game->note = "param.json in the image: " + why;
+        }
+        if (cover.empty())
+            cover = art;
+        game->cover_file.name = cover;
+        game->art_file.name = art;
+        if (cover.empty() && game->note.empty())
+            game->note = "the image's sce_sys has no cover picture";
+    }
+
     // ---- pictures ----
 
     // One of a game's sce_sys pictures, from the NAS.
@@ -671,6 +739,18 @@ struct LibraryLoader::Job
     {
         if (file.name.empty())
             return false;
+        if (game.image && is_compressed_image_name(game.image_path))
+        {
+            if (!game.inside)
+                return false;
+            FfpfscReader *reader = open_compressed(root, game.image_path, why);
+            if (reader == nullptr || !reader->read(file.name, kMaxIcon, data, why))
+            {
+                *why = file.name + " in the image: " + *why;
+                return false;
+            }
+            return true;
+        }
         if (game.image)
         {
             if (!game.inside)
@@ -885,7 +965,7 @@ struct LibraryLoader::Job
         }
         std::vector<const DavEntry *> candidates;
         for (const DavEntry &entry : entries)
-            if (entry.folder || ends_with_nocase(entry.name, ".exfat"))
+            if (entry.folder || is_image_name(entry.name))
                 candidates.push_back(&entry);
 
         // 3. Each game: unchanged ones come from the cache, the rest are read.
@@ -1095,6 +1175,7 @@ struct LibraryLoader::Job
                 job->run_key_art();
             else
                 job->run();
+            job->compressed_.reset(); // it reads through `nas`
             job->nas = nullptr;
         }
         LibraryEvent done;
