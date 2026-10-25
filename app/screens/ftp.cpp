@@ -621,7 +621,21 @@ bool FtpSession::command(const std::string &line, int *code, std::string *text, 
     return true;
 }
 
-bool FtpSession::sign_in(FtpFailure *why)
+bool FtpSession::sign_in(FtpFailure *why, int tries)
+{
+    // A NAS that limits connections can still be counting ones just closed
+    // (a walk's, a copy's), so a turn-away is tried again a little later.
+    for (int attempt = 1;; ++attempt)
+    {
+        if (sign_in_once(why))
+            return true;
+        if (why->kind != FtpFailure::Kind::busy || attempt >= tries)
+            return false;
+        ::usleep(300000u * static_cast<unsigned>(attempt));
+    }
+}
+
+bool FtpSession::sign_in_once(FtpFailure *why)
 {
     *why = FtpFailure{};
     if (control_.load() >= 0)
@@ -1110,7 +1124,7 @@ void *lane_main(void *argument)
     Walk *walk = lane->walk;
     FtpFailure why;
     // A lane the NAS turns away (too many connections) just isn't used.
-    if (lane->own && !lane->session->sign_in(&why))
+    if (lane->own && !lane->session->sign_in(&why, 1))
     {
         std::lock_guard<std::mutex> hold(walk->lock);
         lane->done = true;

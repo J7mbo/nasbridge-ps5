@@ -97,8 +97,9 @@ class FtpSession
     FtpSession(const FtpSession &) = delete;
     FtpSession &operator=(const FtpSession &) = delete;
 
-    // Signs in, if not already.
-    bool sign_in(FtpFailure *why);
+    // Signs in, if not already. A NAS that turns the connection away (too
+    // many) is asked again, up to `tries` times in all, a little later.
+    bool sign_in(FtpFailure *why, int tries = 3);
     // A folder's entries ("/Games/PS5/"), without ftp_skipped_name ones.
     bool list(const std::string &folder, std::vector<FtpEntry> *entries, FtpFailure *why);
     // Exactly `length` bytes at `offset` of a file. A little more is read and
@@ -133,6 +134,7 @@ class FtpSession
     void cut();
 
   private:
+    bool sign_in_once(FtpFailure *why);
     void disconnect();
     bool read_line(std::string *line, FtpFailure *why);
     bool reply(int *code, std::string *text, FtpFailure *why);
