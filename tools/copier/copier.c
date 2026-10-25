@@ -842,7 +842,7 @@ static void *fetcher_main(void *arg) {
     if (rc == 0) {
       ++m->ftp_up;
     } else if (rc != 6 && !(rc == 8 && m->ftp_up > 0) && !m->net_err) {
-      m->net_err = rc == 8 ? 7 : rc;
+      m->net_err = rc == 8 ? 1 : rc;
       snprintf(m->why, sizeof m->why, "%s", why);
     }
     pthread_mutex_unlock(&j->mu);
@@ -1488,7 +1488,8 @@ static int mentions(const char *text, const char *word) {
 
 /* What a failure was, as an ERR kind and a few words: code 0 (the
  * connection failed), or a reply that says no. "busy" is the NAS turning a
- * connection away (too many); the others are as over HTTP and SMB. */
+ * connection away (too many), sent to the app as "drop" so the copy waits
+ * and tries again; the others are as over HTTP and SMB. */
 static const char *ftp_failure(int code, const char *text, char *why, size_t size) {
   if (code == 0) {
     int err = errno;
@@ -1780,7 +1781,7 @@ static void ftp_single_pass(job_t *j, const ftp_sign_in_t *in) {
   ftp_init(&f);
   if (ftp_login_patiently(&f, j->ip, j->port, in, &kind, why, sizeof why) != 0 ||
       ftp_size(&f, in->path, &size, &kind, why, sizeof why) != 0) {
-    send_line(j->ctl, "ERR %s %s", strcmp(kind, "busy") == 0 ? "ftp" : kind, why);
+    send_line(j->ctl, "ERR %s %s", strcmp(kind, "busy") == 0 ? "drop" : kind, why);
     goto out;
   }
   if (size != UNKNOWN_LEN && size != j->size) {
@@ -1789,7 +1790,7 @@ static void ftp_single_pass(job_t *j, const ftp_sign_in_t *in) {
   }
   data = ftp_retr(&f, j->ip, in->path, j->start, &kind, why, sizeof why);
   if (data < 0) {
-    send_line(j->ctl, "ERR %s %s", strcmp(kind, "busy") == 0 ? "ftp" : kind, why);
+    send_line(j->ctl, "ERR %s %s", strcmp(kind, "busy") == 0 ? "drop" : kind, why);
     goto out;
   }
   s.expected = j->size - j->start;
@@ -2282,7 +2283,7 @@ static int batch_ftp_login(batch_t *b, int w) {
       up = b->ftp_up;
       pthread_mutex_unlock(&b->mu);
       if (strcmp(kind, "busy") == 0 && up > 0) return 1;
-      return batch_fail(b, -1, strcmp(kind, "busy") == 0 ? "ftp" : kind, why);
+      return batch_fail(b, -1, strcmp(kind, "busy") == 0 ? "drop" : kind, why);
     }
     sleep_ms(500u * (unsigned)(tries + 1));
   }
@@ -2317,7 +2318,7 @@ static int batch_one_ftp(batch_t *b, int w, const bfile_t *f, char *buf) {
       if (ftp_login(c, b->ip, b->port, &b->ftp_in, &kind, why, sizeof why) != 0) {
         if (strcmp(kind, "ftp") != 0 && tries + 1 < BATCH_TRIES) continue;
         close(fd);
-        return batch_fail(b, f->index, strcmp(kind, "busy") == 0 ? "ftp" : kind, why);
+        return batch_fail(b, f->index, strcmp(kind, "busy") == 0 ? "drop" : kind, why);
       }
       ftp_watch(b, w, c->ctl);
     }
@@ -2330,7 +2331,7 @@ static int batch_one_ftp(batch_t *b, int w, const bfile_t *f, char *buf) {
       if (batch_aborted(b)) goto stopped;
       if (tries + 1 < BATCH_TRIES) continue;
       close(fd);
-      return batch_fail(b, f->index, strcmp(kind, "busy") == 0 ? "ftp" : kind, why);
+      return batch_fail(b, f->index, strcmp(kind, "busy") == 0 ? "drop" : kind, why);
     }
     ftp_watch(b, w, data);
     while (!err) {
