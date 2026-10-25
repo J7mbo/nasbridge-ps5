@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Where the NAS is and how to sign in: connection type (a dropdown: WebDAV,
-// or SMB while it's being built), server address, port, folder, user name
-// and password. Each text
+// FTP or SMB), server address, port, folder, user name and password. Each text
 // opens the kit's on-screen keyboard (InputPrompt); the folder can also be
 // picked by browsing the NAS (the button beside it, folder_picker.cpp).
 // Every change is saved at once. "Test connection" asks the NAS for the folder's contents in the

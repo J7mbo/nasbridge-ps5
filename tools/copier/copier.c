@@ -44,6 +44,15 @@
  * sign-ins (1 when left out), each fetching the next CHUNK in turn as over
  * HTTP, with several reads in flight (SMB_IN_FLIGHT) for each chunk.
  *
+ * Over FTP the helper signs in itself too:
+ *   NASBridge -> "NBG1\t<ip>\t<port>\t<size>\t<file>\t<sign-in length>[\t<streams>]\n"
+ *                then the path on the NAS, the user and the password, each
+ *                ended by a NUL
+ * and the replies are as over SMB ("ERR ftp <why>" when the NAS refuses).
+ * Over several sign-ins each fetches the next CHUNK in turn (REST to its
+ * start, RETR, the data connection closed at its end); over one, the file
+ * streams in on a single RETR.
+ *
  * A partition's type, from its disk's partition table (NASBridge can't read
  * a disk from its sandbox; it leaves a drive's EFI partition out of its
  * destinations):
@@ -60,6 +69,7 @@
  */
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -115,6 +125,8 @@
  * (issue #4), and NASBridge, as another user, moves and deletes them later. */
 #define FILE_MODE 0777
 #define PROTO_SMB "NBS1"
+#define PROTO_FTP "NBG1"
+#define FTP_TRIES 3 /* a sign-in turned away (too many connections) is tried this often */
 #define SMB_READ (1u << 20) /* one SMB read (the NAS may allow less) */
 #define SMB_IN_FLIGHT 8     /* SMB reads asked for before the first answers */
 #define UNKNOWN_LEN UINT64_MAX
@@ -667,6 +679,16 @@ out:
   pthread_mutex_unlock(&j->mu);
 }
 
+/* ------------------------------------------------- an FTP sign-in (below) */
+
+/* One FTP control connection, and what's been read from it past the last line. */
+typedef struct ftp {
+  int ctl;
+  char in[4096];
+  size_t inlen;
+  int epsv; /* the NAS takes EPSV (until it refuses it) */
+} ftp_t;
+
 /* ---------------------------------------------------- over two connections */
 
 /* Each connection asks for the next CHUNK of the file; finished chunks wait
@@ -685,8 +707,10 @@ typedef struct multi {
   int nready;
   int fetchers_left, writer_done;
   int no_ranges;  /* the NAS answered a range with the whole file */
-  int net_err;    /* 1 drop, 2 timeout, 3 http, 4 changed, 7 smb (refused) */
+  int net_err;    /* 1 drop, 2 timeout, 3 http, 4 changed, 7 smb or ftp (refused) */
   const struct smb_sign_in *smb; /* over SMB: each connection signs in with this */
+  const struct ftp_sign_in *ftp; /* over FTP: the same */
+  int ftp_up;                    /* ... connections signed in */
   int http_status;
   char why[160];
 } multi_t;
@@ -794,16 +818,39 @@ typedef struct fetcher {
   int slot;
   struct smb2_context *smb2; /* over SMB: this connection's sign-in, kept chunk to chunk */
   struct smb2fh *fh;
+  ftp_t ftp; /* over FTP: the same */
 } fetcher_t;
 
 static int smb_fetch_chunk(fetcher_t *f, uint64_t chunk, char *buf, size_t *got, char *why,
                            size_t why_size);
 static void smb_fetcher_end(fetcher_t *f);
+static int ftp_fetcher_start(fetcher_t *f, char *why, size_t why_size);
+static int ftp_fetch_chunk(fetcher_t *f, uint64_t chunk, char *buf, size_t *got, char *why,
+                           size_t why_size);
+static void ftp_fetcher_end(fetcher_t *f);
 
 static void *fetcher_main(void *arg) {
   fetcher_t *f = arg;
   multi_t *m = f->m;
   job_t *j = m->j;
+  if (m->ftp) {
+    /* Signed in before taking a chunk: one the NAS turns away (too many
+     * connections) leaves the chunks to the others. */
+    char why[160] = "";
+    int rc = ftp_fetcher_start(f, why, sizeof why);
+    pthread_mutex_lock(&j->mu);
+    if (rc == 0) {
+      ++m->ftp_up;
+    } else if (rc != 6 && !(rc == 8 && m->ftp_up > 0) && !m->net_err) {
+      m->net_err = rc == 8 ? 7 : rc;
+      snprintf(m->why, sizeof m->why, "%s", why);
+    }
+    pthread_mutex_unlock(&j->mu);
+    if (rc != 0) {
+      if (rc != 8 || m->net_err) stop_all(j);
+      goto out;
+    }
+  }
   for (;;) {
     uint64_t chunk;
     char *buf;
@@ -824,8 +871,9 @@ static void *fetcher_main(void *arg) {
     ++j->active;
     pthread_mutex_unlock(&j->mu);
     for (tries = 0; tries < CHUNK_TRIES; ++tries) {
-      rc = m->smb ? smb_fetch_chunk(f, chunk, buf, &got, why, sizeof why)
-                  : fetch_chunk(m, f->slot, chunk, buf, &got, &status, why, sizeof why);
+      rc = m->smb   ? smb_fetch_chunk(f, chunk, buf, &got, why, sizeof why)
+           : m->ftp ? ftp_fetch_chunk(f, chunk, buf, &got, why, sizeof why)
+                    : fetch_chunk(m, f->slot, chunk, buf, &got, &status, why, sizeof why);
       if (rc != 1 && rc != 2) break; /* only the network's hiccups are retried */
       sleep_ms(500u * (unsigned)(tries + 1));
     }
@@ -855,7 +903,9 @@ static void *fetcher_main(void *arg) {
       break;
     }
   }
+out:
   if (m->smb) smb_fetcher_end(f);
+  if (m->ftp) ftp_fetcher_end(f);
   pthread_mutex_lock(&j->mu);
   --m->fetchers_left;
   pthread_cond_broadcast(&j->cv);
@@ -917,7 +967,8 @@ static void *multi_writer(void *arg) {
  * with several reads in flight; a NAS can serve each sign-in slowly but
  * several side by side (an Unraid NAS: about 17 MB/s over one, 40 over four
  * by WebDAV). */
-static int multi_pass(job_t *j, int streams, const struct smb_sign_in *smb) {
+static int multi_pass(job_t *j, int streams, const struct smb_sign_in *smb,
+                      const struct ftp_sign_in *ftp) {
   multi_t m;
   fetcher_t f[MAX_STREAMS];
   pthread_t ft[MAX_STREAMS], writer;
@@ -927,6 +978,7 @@ static int multi_pass(job_t *j, int streams, const struct smb_sign_in *smb) {
   m.j = j;
   m.streams = streams;
   m.smb = smb;
+  m.ftp = ftp;
   m.chunks = (j->size - j->start + CHUNK - 1) / CHUNK;
   for (i = 0; i < WINDOW; ++i) {
     m.pool[i] = malloc(CHUNK);
@@ -936,11 +988,13 @@ static int multi_pass(job_t *j, int streams, const struct smb_sign_in *smb) {
     }
     m.pool_free[m.nfree++] = i;
   }
-  if (!smb) send_line(j->ctl, "S 206");
+  if (!smb && !ftp) send_line(j->ctl, "S 206");
   memset(f, 0, sizeof f);
   for (i = 0; i < streams; ++i) {
     f[i].m = &m;
     f[i].slot = i;
+    f[i].ftp.ctl = -1;
+    f[i].ftp.epsv = 1;
     pthread_mutex_lock(&j->mu);
     ++m.fetchers_left;
     pthread_mutex_unlock(&j->mu);
@@ -971,7 +1025,7 @@ static int multi_pass(job_t *j, int streams, const struct smb_sign_in *smb) {
   } else if (m.net_err == 4) {
     send_line(j->ctl, "ERR changed %s", m.why);
   } else if (m.net_err == 7) {
-    send_line(j->ctl, "ERR smb %s", m.why);
+    send_line(j->ctl, "ERR %s %s", ftp ? "ftp" : "smb", m.why);
   } else if (m.net_err) {
     send_line(j->ctl, "ERR %s %s", m.net_err == 2 ? "timeout" : "drop", m.why);
   } else if (j->abort) {
@@ -1326,7 +1380,488 @@ static void run_smb_job(job_t *j, char *line) {
     if (j->start == j->size)
       send_line(j->ctl, "OK");
     else
-      multi_pass(j, streams, &in);
+      multi_pass(j, streams, &in, NULL);
+  }
+  memset(bytes, 0, len); /* the password */
+  free(bytes);
+}
+
+/* ------------------------------------------------------------ over FTP */
+
+/* The sign-in NASBridge sends: NUL-ended fields (path unused in a batch). */
+typedef struct ftp_sign_in {
+  char *path, *user, *password;
+} ftp_sign_in_t;
+
+static void ftp_init(ftp_t *f) {
+  memset(f, 0, sizeof *f);
+  f->ctl = -1;
+  f->epsv = 1;
+}
+
+static void ftp_close(ftp_t *f) {
+  if (f->ctl >= 0) close(f->ctl);
+  f->ctl = -1;
+  f->inlen = 0;
+}
+
+/* One line from the control connection, without its "\r\n". 0, or -1 (errno
+ * says why; 0 when the NAS closed it). */
+static int ftp_line(ftp_t *f, char *line, size_t size) {
+  for (;;) {
+    char *nl = memchr(f->in, '\n', f->inlen);
+    size_t len, take;
+    ssize_t n;
+    if (nl || f->inlen == sizeof f->in) {
+      len = nl ? (size_t)(nl - f->in) : f->inlen;
+      take = len < size - 1 ? len : size - 1;
+      memcpy(line, f->in, take);
+      line[take] = '\0';
+      if (take > 0 && line[take - 1] == '\r') line[take - 1] = '\0';
+      if (nl) ++len;
+      memmove(f->in, f->in + len, f->inlen - len);
+      f->inlen -= len;
+      return 0;
+    }
+    n = recv(f->ctl, f->in + f->inlen, sizeof f->in - f->inlen, 0);
+    if (n > 0) {
+      f->inlen += (size_t)n;
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    if (n == 0) errno = 0;
+    return -1;
+  }
+}
+
+/* One reply: its code, its first line's text in `text`; 0 when the
+ * connection failed (errno says why). */
+static int ftp_reply(ftp_t *f, char *text, size_t size) {
+  char line[1024], code[4];
+  for (;;) {
+    if (ftp_line(f, line, sizeof line) != 0) return 0;
+    if (isdigit((unsigned char)line[0]) && isdigit((unsigned char)line[1]) &&
+        isdigit((unsigned char)line[2]))
+      break; /* lines before a reply that don't start with one are skipped */
+  }
+  memcpy(code, line, 3);
+  code[3] = '\0';
+  snprintf(text, size, "%s", strlen(line) > 4 ? line + 4 : "");
+  if (line[3] == '-') { /* several lines, up to "<code> " */
+    for (;;) {
+      if (ftp_line(f, line, sizeof line) != 0) return 0;
+      if (strncmp(line, code, 3) == 0 && line[3] == ' ') break;
+    }
+  }
+  return atoi(code);
+}
+
+/* Sends a command and reads its reply: the code, or 0 (errno says why). */
+static int ftp_cmd(ftp_t *f, char *text, size_t size, const char *fmt, ...) {
+  char line[MAX_FILE + 32];
+  va_list ap;
+  size_t len;
+  va_start(ap, fmt);
+  vsnprintf(line, sizeof line - 2, fmt, ap);
+  va_end(ap);
+  len = strlen(line);
+  line[len++] = '\r';
+  line[len++] = '\n';
+  if (send_all(f->ctl, line, len) != 0) return 0;
+  /* A transfer cut off early may get a second last word from some servers
+   * ("426", then "226"): one left over is skipped, as no other command
+   * answers with those. */
+  for (;;) {
+    int code = ftp_reply(f, text, size);
+    if (strncmp(fmt, "RETR", 4) == 0 || (code != 225 && code != 226 && code != 426)) return code;
+  }
+}
+
+static int mentions(const char *text, const char *word) {
+  char low[512];
+  size_t i;
+  for (i = 0; text[i] && i < sizeof low - 1; ++i)
+    low[i] = (char)tolower((unsigned char)text[i]);
+  low[i] = '\0';
+  return strstr(low, word) != NULL;
+}
+
+/* What a failure was, as an ERR kind and a few words: code 0 (the
+ * connection failed), or a reply that says no. "busy" is the NAS turning a
+ * connection away (too many); the others are as over HTTP and SMB. */
+static const char *ftp_failure(int code, const char *text, char *why, size_t size) {
+  if (code == 0) {
+    int err = errno;
+    if (err == EAGAIN || err == EWOULDBLOCK || err == ETIMEDOUT) {
+      snprintf(why, size, "the NAS went quiet");
+      return "timeout";
+    }
+    snprintf(why, size, "%s", err ? strerror(err) : "the NAS closed the connection");
+    return "drop";
+  }
+  if ((code == 530 || code == 534 || code == 550 || code == 521) &&
+      (mentions(text, "tls") || mentions(text, "ssl") || mentions(text, "encrypt"))) {
+    snprintf(why, size, "the NAS only allows FTPS");
+    return "ftp";
+  }
+  if (code == 530 || code == 332) {
+    snprintf(why, size, "sign-in refused");
+    return "ftp";
+  }
+  if (code == 421) {
+    if (mentions(text, "many") || mentions(text, "limit") || mentions(text, "max")) {
+      snprintf(why, size, "too many connections");
+      return "busy";
+    }
+    snprintf(why, size, "the NAS closed the connection");
+    return "drop";
+  }
+  if (code == 550 || code == 450 || code == 553) {
+    snprintf(why, size, "%s",
+             mentions(text, "denied") || mentions(text, "ermission") ? "access denied" : "not found");
+    return "ftp";
+  }
+  if (code == 425 || code == 426) {
+    snprintf(why, size, "%s", code == 425 ? "no data connection" : "the transfer was cut off");
+    return "drop";
+  }
+  snprintf(why, size, "FTP %d %.120s", code, text);
+  return "ftp";
+}
+
+/* Signs in on f (closed first if open). 0, or -1 with *kind and why set. */
+static int ftp_login(ftp_t *f, const char *ip, int port, const ftp_sign_in_t *in, const char **kind,
+                     char *why, size_t size) {
+  char text[512];
+  int code;
+  ftp_close(f);
+  f->ctl = connect_nas(ip, port);
+  if (f->ctl < 0) {
+    *kind = "connect";
+    snprintf(why, size, "couldn't reach the NAS");
+    return -1;
+  }
+  do code = ftp_reply(f, text, sizeof text);
+  while (code == 120); /* "ready in a few minutes", then the real greeting */
+  if (code == 220) code = ftp_cmd(f, text, sizeof text, "USER %s", in->user);
+  if (code == 331) code = ftp_cmd(f, text, sizeof text, "PASS %s", in->password);
+  if (code == 230 || code == 202) {
+    code = ftp_cmd(f, text, sizeof text, "TYPE I");
+    if (code == 200) return 0;
+  }
+  *kind = ftp_failure(code, text, why, size);
+  ftp_close(f);
+  return -1;
+}
+
+/* ftp_login, trying again a little later when the NAS turns it away (too
+ * many connections: another copy's, or the app's own, may be closing). */
+static int ftp_login_patiently(ftp_t *f, const char *ip, int port, const ftp_sign_in_t *in,
+                               const char **kind, char *why, size_t size) {
+  int tries;
+  for (tries = 0;; ++tries) {
+    if (ftp_login(f, ip, port, in, kind, why, size) == 0) return 0;
+    if (strcmp(*kind, "busy") != 0 || tries + 1 >= FTP_TRIES) return -1;
+    sleep_ms(1000u * (unsigned)(tries + 1));
+  }
+}
+
+/* A passive data connection. -1 with *kind and why set. The address is the
+ * one signed in to: a NAS behind a router may name one the PS5 can't reach. */
+static int ftp_data(ftp_t *f, const char *ip, const char **kind, char *why, size_t size) {
+  char text[512];
+  int code, port = 0, fd;
+  if (f->epsv) { /* "229 Entering Extended Passive Mode (|||6446|)" */
+    code = ftp_cmd(f, text, sizeof text, "EPSV");
+    if (code == 229 && strstr(text, "|||")) {
+      port = atoi(strstr(text, "|||") + 3);
+    } else if (code >= 500 && code <= 504) {
+      f->epsv = 0; /* PASV from here on */
+    } else {
+      *kind = ftp_failure(code, text, why, size);
+      return -1;
+    }
+  }
+  if (port == 0) { /* "227 Entering Passive Mode (192,168,1,20,25,46)" */
+    int n[6], k = 0;
+    const char *p;
+    code = ftp_cmd(f, text, sizeof text, "PASV");
+    if (code != 227) {
+      *kind = ftp_failure(code, text, why, size);
+      return -1;
+    }
+    for (p = text; *p && k < 6;) {
+      if (isdigit((unsigned char)*p)) {
+        n[k++] = atoi(p);
+        while (isdigit((unsigned char)*p)) ++p;
+      } else {
+        ++p;
+      }
+    }
+    if (k == 6) port = n[4] * 256 + n[5];
+  }
+  if (port <= 0 || port > 65535 || (fd = connect_nas(ip, port)) < 0) {
+    *kind = "drop";
+    snprintf(why, size, "couldn't open a data connection (port %d)", port);
+    return -1;
+  }
+  return fd;
+}
+
+/* Starts a file from `offset` on a data connection of its own: the socket,
+ * or -1 with *kind and why set. */
+static int ftp_retr(ftp_t *f, const char *ip, const char *path, uint64_t offset, const char **kind,
+                    char *why, size_t size) {
+  char text[512];
+  int code, fd = ftp_data(f, ip, kind, why, size);
+  if (fd < 0) return -1;
+  if (offset > 0) { /* just before RETR: some servers forget it after another command */
+    code = ftp_cmd(f, text, sizeof text, "REST %llu", (unsigned long long)offset);
+    if (code != 350) {
+      close(fd);
+      *kind = ftp_failure(code, text, why, size);
+      if (code != 0) snprintf(why, size, "the NAS can't start a file part way");
+      return -1;
+    }
+  }
+  code = ftp_cmd(f, text, sizeof text, "RETR %s", path);
+  if (code != 150 && code != 125) {
+    close(fd);
+    *kind = ftp_failure(code, text, why, size);
+    return -1;
+  }
+  return fd;
+}
+
+/* Closes a file's data connection, cut off or done, and takes the NAS's
+ * last word on it ("226" done, "426" cut off). Returns that code, or 0 when
+ * the control connection went too (it's closed: the next use signs in). */
+static int ftp_end(ftp_t *f, int data) {
+  char text[256];
+  int code;
+  if (data >= 0) close(data);
+  if (f->ctl < 0) return 0;
+  code = ftp_reply(f, text, sizeof text);
+  if (code == 0 || code == 421) {
+    ftp_close(f);
+    return 0;
+  }
+  return code;
+}
+
+/* The file's size (SIZE), or UNKNOWN_LEN when the NAS won't say; -1 into
+ * *kind/why when it refuses (not found, denied) or the connection fails. */
+static int ftp_size(ftp_t *f, const char *path, uint64_t *size, const char **kind, char *why,
+                    size_t why_size) {
+  char text[512];
+  int code = ftp_cmd(f, text, sizeof text, "SIZE %s", path);
+  if (code == 213) {
+    *size = strtoull(text, NULL, 10);
+    return 0;
+  }
+  if (code == 0 || code == 550 || code == 450 || code == 530 || code == 421) {
+    *kind = ftp_failure(code, text, why, why_size);
+    return -1;
+  }
+  *size = UNKNOWN_LEN;
+  return 0;
+}
+
+/* multi's codes for an ERR kind: 7 refused, 8 turned away, 2 timeout, 1 drop. */
+static int ftp_rc(const char *kind) {
+  return strcmp(kind, "ftp") == 0 ? 7 : strcmp(kind, "busy") == 0 ? 8
+         : strcmp(kind, "timeout") == 0 ? 2 : 1;
+}
+
+/* This connection's sign-in, and the file's size checked: 0, or multi's
+ * codes (8: turned away, the others may carry on). */
+static int ftp_fetcher_start(fetcher_t *f, char *why, size_t why_size) {
+  multi_t *m = f->m;
+  job_t *j = m->j;
+  const char *kind = "drop";
+  uint64_t size = 0;
+  int rc;
+  if (ftp_login_patiently(&f->ftp, j->ip, j->port, m->ftp, &kind, why, why_size) != 0)
+    return ftp_rc(kind);
+  if (ftp_size(&f->ftp, m->ftp->path, &size, &kind, why, why_size) != 0) {
+    ftp_close(&f->ftp);
+    return ftp_rc(kind);
+  }
+  if (size != UNKNOWN_LEN && size != j->size) {
+    ftp_close(&f->ftp);
+    snprintf(why, why_size, "the file on the NAS is a different size now");
+    return 4;
+  }
+  pthread_mutex_lock(&j->mu);
+  j->nas[f->slot] = f->ftp.ctl; /* a stop cuts it off */
+  rc = j->abort;
+  pthread_mutex_unlock(&j->mu);
+  return rc ? 6 : 0;
+}
+
+/* One chunk of the file over this connection's sign-in (made again after a
+ * failure): REST to its start, RETR, and the data connection closed once it's
+ * in. 0, or multi's codes: 1 drop and 2 timeout (tried again), 4 changed, 6
+ * stopped, 7 refused. */
+static int ftp_fetch_chunk(fetcher_t *f, uint64_t chunk, char *buf, size_t *got, char *why,
+                           size_t why_size) {
+  multi_t *m = f->m;
+  job_t *j = m->j;
+  uint64_t from = j->start + chunk * CHUNK, to = from + CHUNK;
+  const char *kind = "drop";
+  size_t have = 0, want;
+  int data, rc = 0;
+  *got = 0;
+  if (to > j->size) to = j->size;
+  want = (size_t)(to - from);
+  if (f->ftp.ctl < 0) {
+    rc = ftp_fetcher_start(f, why, why_size);
+    if (rc != 0) return rc == 8 ? 1 : rc;
+  }
+  data = ftp_retr(&f->ftp, j->ip, m->ftp->path, from, &kind, why, why_size);
+  if (data < 0) {
+    rc = ftp_rc(kind);
+    ftp_fetcher_end(f); /* the next try signs in again */
+    return rc == 8 ? 1 : rc;
+  }
+  pthread_mutex_lock(&j->mu);
+  j->nas[f->slot] = data;
+  rc = j->abort;
+  pthread_mutex_unlock(&j->mu);
+  while (!rc && have < want) {
+    ssize_t n = recv(data, buf + have, want - have, 0);
+    if (n > 0) {
+      have += (size_t)n;
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      snprintf(why, why_size, "the NAS went quiet");
+      rc = 2;
+    } else {
+      snprintf(why, why_size, "the NAS ended the connection early");
+      rc = 1;
+    }
+  }
+  pthread_mutex_lock(&j->mu);
+  j->nas[f->slot] = f->ftp.ctl;
+  if (j->abort) rc = 6;
+  pthread_mutex_unlock(&j->mu);
+  /* Done with this part: whether the NAS says 226 or 426 doesn't matter. */
+  if (rc != 0) {
+    close(data);
+    ftp_fetcher_end(f);
+    return rc;
+  }
+  if (ftp_end(&f->ftp, data) == 0) ftp_fetcher_end(f);
+  *got = have;
+  return 0;
+}
+
+static void ftp_fetcher_end(fetcher_t *f) {
+  job_t *j = f->m->j;
+  pthread_mutex_lock(&j->mu);
+  j->nas[f->slot] = -1;
+  pthread_mutex_unlock(&j->mu);
+  ftp_close(&f->ftp);
+}
+
+/* The rest of the file from j->start over one sign-in and one RETR,
+ * received and written on two threads as over HTTP. Sends the last line. */
+static void ftp_single_pass(job_t *j, const ftp_sign_in_t *in) {
+  char why[200];
+  const char *kind = "drop";
+  uint64_t size = 0;
+  int i, data = -1;
+  single_t s;
+  ftp_t f;
+  memset(&s, 0, sizeof s);
+  s.j = j;
+  ftp_init(&f);
+  if (ftp_login_patiently(&f, j->ip, j->port, in, &kind, why, sizeof why) != 0 ||
+      ftp_size(&f, in->path, &size, &kind, why, sizeof why) != 0) {
+    send_line(j->ctl, "ERR %s %s", strcmp(kind, "busy") == 0 ? "ftp" : kind, why);
+    goto out;
+  }
+  if (size != UNKNOWN_LEN && size != j->size) {
+    send_line(j->ctl, "ERR changed the file on the NAS is a different size now");
+    goto out;
+  }
+  data = ftp_retr(&f, j->ip, in->path, j->start, &kind, why, sizeof why);
+  if (data < 0) {
+    send_line(j->ctl, "ERR %s %s", strcmp(kind, "busy") == 0 ? "ftp" : kind, why);
+    goto out;
+  }
+  s.expected = j->size - j->start;
+  pthread_mutex_lock(&j->mu);
+  j->nas[0] = data;
+  pthread_mutex_unlock(&j->mu);
+  if (single_buffers(j, &s) != 0) goto out;
+  single_pump(j, &s, single_reader);
+
+out:
+  for (i = 0; i < NBUF; ++i) free(s.buf[i]);
+  pthread_mutex_lock(&j->mu);
+  j->nas[0] = -1;
+  pthread_mutex_unlock(&j->mu);
+  if (data >= 0) (void)ftp_end(&f, data);
+  ftp_close(&f);
+}
+
+/* Copies one file over FTP (the NBG1 line, then the sign-in). Every path out
+ * sends its final line. */
+static void run_ftp_job(job_t *j, char *line) {
+  char *field[7], *save = NULL, *bytes = NULL, *sign[3], ip[64], path[MAX_FILE];
+  ftp_sign_in_t in;
+  size_t len;
+  int k, err, streams;
+  field[0] = strtok_r(line, "\t", &save);
+  for (k = 1; k < 7; ++k) field[k] = strtok_r(NULL, "\t", &save);
+  if (!field[5]) {
+    send_line(j->ctl, "ERR request not a NASBridge copy request");
+    return;
+  }
+  snprintf(ip, sizeof ip, "%s", field[1]);
+  j->ip = ip;
+  j->port = atoi(field[2]);
+  j->size = strtoull(field[3], NULL, 10);
+  snprintf(path, sizeof path, "%s", field[4]);
+  len = (size_t)strtoull(field[5], NULL, 10);
+  streams = field[6] ? atoi(field[6]) : 1;
+  if (streams < 1) streams = 1;
+  if (streams > MAX_STREAMS) streams = MAX_STREAMS;
+  if (len < 4 || len > MAX_SIGN_IN || path[0] != '/') {
+    send_line(j->ctl, "ERR request bad request");
+    return;
+  }
+  bytes = malloc(len);
+  if (!bytes || recv_exact(j->ctl, bytes, len) != 0 || smb_fields(bytes, len, sign, 3) != 0 ||
+      strlen(sign[0]) + 16 > MAX_FILE) {
+    send_line(j->ctl, "ERR request bad sign-in");
+    free(bytes);
+    return;
+  }
+  in.path = sign[0];
+  in.user = sign[1];
+  in.password = sign[2];
+  j->fd = open(path, O_RDWR | O_CREAT, FILE_MODE);
+  if (j->fd < 0) {
+    send_line(j->ctl, "ERR file %s", strerror(errno));
+    free(bytes);
+    return;
+  }
+  (void)fchmod(j->fd, FILE_MODE); /* open's mode is reduced by the umask */
+  if ((err = resume_point(j)) != 0) {
+    send_line(j->ctl, "ERR file %s", strerror(err));
+  } else {
+    send_line(j->ctl, "P %llu 0 0 0", (unsigned long long)j->start);
+    j->last_sync = now_ms();
+    if (j->start == j->size)
+      send_line(j->ctl, "OK");
+    else if (streams > 1 && j->size - j->start >= 2 * CHUNK)
+      multi_pass(j, streams, NULL, &in);
+    else
+      ftp_single_pass(j, &in);
   }
   memset(bytes, 0, len); /* the password */
   free(bytes);
@@ -1355,9 +1890,16 @@ static void run_smb_job(job_t *j, char *line) {
  * Over SMB the same, with "NBT1\t<ip>\t<port>\t<workers>\t<sign-in length>\n"
  * and the sign-in (share, user, domain, password, each ended by a NUL) first,
  * and each file's path in the share where the GET request would be. Each
- * worker signs in once and keeps that connection. */
+ * worker signs in once and keeps that connection.
+ *
+ * Over FTP the same, with "NBH1\t<ip>\t<port>\t<workers>\t<sign-in length>\n",
+ * the user and password (each ended by a NUL) first, and each file's path on
+ * the NAS where the GET request would be. Each worker signs in before taking
+ * a file; one the NAS turns away (too many connections) while others are
+ * signed in just isn't used. */
 #define BATCH_PROTO "NBB1"
 #define BATCH_PROTO_SMB "NBT1"
+#define BATCH_PROTO_FTP "NBH1"
 #define BATCH_WORKERS 16 /* the Settings screen: 1..16 (a NAS with one disk answered fastest at 16) */
 #define BATCH_QUEUE 64
 #define BATCH_BUF (512u << 10) /* per worker: 16 of them stay within the payload's few MB */
@@ -1394,6 +1936,10 @@ typedef struct batch {
   int smb;                                /* NBT1: over SMB */
   smb_sign_in_t sign_in;                  /* ... with this (path unused) */
   struct smb2_context *smb2[BATCH_WORKERS]; /* ... each worker's sign-in */
+  int ftp;                                /* NBH1: over FTP */
+  ftp_sign_in_t ftp_in;                   /* ... with this (path unused) */
+  ftp_t ftpc[BATCH_WORKERS];              /* ... each worker's sign-in */
+  int ftp_up;                             /* ... how many are signed in */
 } batch_t;
 
 typedef struct bworker {
@@ -1707,6 +2253,144 @@ stopped:
   return -1;
 }
 
+/* Worker w's FTP connection: a stop cuts `fd` off (the control connection,
+ * or a file's data connection while it comes in). */
+static void ftp_watch(batch_t *b, int w, int fd) {
+  pthread_mutex_lock(&b->mu);
+  b->nas[w] = fd;
+  if (b->abort && fd >= 0) shutdown(fd, SHUT_RDWR);
+  pthread_mutex_unlock(&b->mu);
+}
+
+static void ftp_drop(batch_t *b, int w) {
+  ftp_watch(b, w, -1);
+  ftp_close(&b->ftpc[w]);
+}
+
+/* Signs worker w in. 0; 1 when the NAS turned it away while others are
+ * signed in (the worker isn't needed); -1 once the batch has failed. */
+static int batch_ftp_login(batch_t *b, int w) {
+  char why[200];
+  const char *kind = "drop";
+  int tries, up;
+  for (tries = 0;; ++tries) {
+    if (batch_aborted(b)) return -1;
+    if (ftp_login(&b->ftpc[w], b->ip, b->port, &b->ftp_in, &kind, why, sizeof why) == 0) break;
+    if (strcmp(kind, "ftp") == 0) return batch_fail(b, -1, kind, why);
+    if (tries + 1 >= (strcmp(kind, "busy") == 0 ? FTP_TRIES : BATCH_TRIES)) {
+      pthread_mutex_lock(&b->mu);
+      up = b->ftp_up;
+      pthread_mutex_unlock(&b->mu);
+      if (strcmp(kind, "busy") == 0 && up > 0) return 1;
+      return batch_fail(b, -1, strcmp(kind, "busy") == 0 ? "ftp" : kind, why);
+    }
+    sleep_ms(500u * (unsigned)(tries + 1));
+  }
+  ftp_watch(b, w, b->ftpc[w].ctl);
+  return 0;
+}
+
+/* One file over FTP, as batch_one: a RETR on worker w's sign-in, read to
+ * the end of its data connection. */
+static int batch_one_ftp(batch_t *b, int w, const bfile_t *f, char *buf) {
+  char why[200];
+  int fd, tries;
+  fd = open(f->path, O_WRONLY | O_CREAT | O_TRUNC, FILE_MODE);
+  if (fd < 0) return batch_fail(b, f->index, "file", strerror(errno));
+  (void)fchmod(fd, FILE_MODE); /* open's mode is reduced by the umask */
+  if (f->size == 0) goto done;
+  for (tries = 0;; ++tries) {
+    ftp_t *c = &b->ftpc[w];
+    const char *kind = "drop";
+    uint64_t got = 0;
+    int data, err = 0, net = 0, code;
+    if (batch_aborted(b)) goto stopped;
+    if (tries > 0) {
+      ftp_drop(b, w);
+      if (ftruncate(fd, 0) != 0 || lseek(fd, 0, SEEK_SET) != 0) {
+        close(fd);
+        return batch_fail(b, f->index, "file", strerror(errno));
+      }
+      sleep_ms(500u * (unsigned)tries);
+    }
+    if (c->ctl < 0) {
+      if (ftp_login(c, b->ip, b->port, &b->ftp_in, &kind, why, sizeof why) != 0) {
+        if (strcmp(kind, "ftp") != 0 && tries + 1 < BATCH_TRIES) continue;
+        close(fd);
+        return batch_fail(b, f->index, strcmp(kind, "busy") == 0 ? "ftp" : kind, why);
+      }
+      ftp_watch(b, w, c->ctl);
+    }
+    data = ftp_retr(c, b->ip, f->request, 0, &kind, why, sizeof why);
+    if (data < 0) {
+      if (strcmp(kind, "ftp") == 0) {
+        close(fd);
+        return batch_fail(b, f->index, kind, why);
+      }
+      if (batch_aborted(b)) goto stopped;
+      if (tries + 1 < BATCH_TRIES) continue;
+      close(fd);
+      return batch_fail(b, f->index, strcmp(kind, "busy") == 0 ? "ftp" : kind, why);
+    }
+    ftp_watch(b, w, data);
+    while (!err) {
+      ssize_t n = recv(data, buf, BATCH_BUF, 0);
+      if (n > 0) {
+        got += (uint64_t)n;
+        if (got > f->size) break; /* longer than listed */
+        err = write_all(fd, buf, (size_t)n);
+        pthread_mutex_lock(&b->mu);
+        b->bytes += (uint64_t)n;
+        pthread_mutex_unlock(&b->mu);
+        continue;
+      }
+      if (n < 0 && errno == EINTR) continue;
+      if (n < 0) net = errno == EAGAIN || errno == EWOULDBLOCK ? 2 : 1;
+      break; /* 0: the whole file is in */
+    }
+    ftp_watch(b, w, c->ctl);
+    if (batch_aborted(b)) {
+      close(data);
+      goto stopped;
+    }
+    if (net) {
+      close(data);
+      if (tries + 1 < BATCH_TRIES) continue;
+      close(fd);
+      return batch_fail(b, f->index, net == 2 ? "timeout" : "drop",
+                        net == 2 ? "the NAS went quiet" : "the NAS ended the connection early");
+    }
+    code = ftp_end(c, data);
+    if (err) {
+      close(fd);
+      return batch_fail(b, f->index, "write", strerror(err));
+    }
+    if (got != f->size) {
+      close(fd);
+      return batch_fail(b, f->index, "changed", "the file on the NAS is a different size now");
+    }
+    if (code != 0 && code != 226 && code != 250) {
+      /* All of it came, but the NAS says the transfer failed: again. */
+      if (tries + 1 < BATCH_TRIES) continue;
+      close(fd);
+      snprintf(why, sizeof why, "the NAS ended the transfer with %d", code);
+      return batch_fail(b, f->index, "drop", why);
+    }
+    if (c->ctl < 0) ftp_watch(b, w, -1);
+    break;
+  }
+done:
+  if (close(fd) != 0) return batch_fail(b, f->index, "write", strerror(errno));
+  pthread_mutex_lock(&b->mu);
+  b->files++;
+  pthread_mutex_unlock(&b->mu);
+  bsend(b, "D %lld", f->index);
+  return 0;
+stopped:
+  close(fd);
+  return -1;
+}
+
 static void free_bfile(bfile_t *f) {
   free(f->path);
   free(f->request);
@@ -1720,6 +2404,13 @@ static void *batch_worker(void *arg) {
   if (!buf || !head) {
     batch_fail(b, -1, "request", "out of memory");
     goto out;
+  }
+  if (b->ftp) {
+    int rc = batch_ftp_login(b, me->w);
+    if (rc != 0) goto out; /* turned away (1) or failed (-1) */
+    pthread_mutex_lock(&b->mu);
+    b->ftp_up++;
+    pthread_mutex_unlock(&b->mu);
   }
   for (;;) {
     bfile_t f;
@@ -1736,7 +2427,9 @@ static void *batch_worker(void *arg) {
     b->busy++;
     pthread_cond_broadcast(&b->cv);
     pthread_mutex_unlock(&b->mu);
-    rc = b->smb ? batch_one_smb(b, me->w, &f, buf) : batch_one(b, me->w, &f, buf, head);
+    rc = b->smb   ? batch_one_smb(b, me->w, &f, buf)
+         : b->ftp ? batch_one_ftp(b, me->w, &f, buf)
+                  : batch_one(b, me->w, &f, buf, head);
     free_bfile(&f);
     pthread_mutex_lock(&b->mu);
     b->busy--;
@@ -1749,6 +2442,8 @@ out:
   free(head);
   if (b->smb)
     smb_drop(b, me->w);
+  else if (b->ftp)
+    ftp_drop(b, me->w);
   else
     set_nas(b, me->w, -1);
   return NULL;
@@ -1839,8 +2534,9 @@ static void *batch_reader(void *arg) {
     f.size = strtoull(field[2], NULL, 10);
     f.reqlen = (size_t)strtoull(field[4], NULL, 10);
     f.path = strdup(field[3]);
-    f.request = f.reqlen >= (b->smb ? 1u : 4u) && f.reqlen <= MAX_REQUEST ? malloc(f.reqlen + 1)
-                                                                          : NULL;
+    f.request = f.reqlen >= (b->smb || b->ftp ? 1u : 4u) && f.reqlen <= MAX_REQUEST
+                    ? malloc(f.reqlen + 1)
+                    : NULL;
     if (!f.path || !f.request) {
       free_bfile(&f);
       batch_fail(b, f.index, "request", "bad request");
@@ -1887,7 +2583,9 @@ static void run_batch(int ctl, char *line) {
   field[0] = strtok_r(line, "\t", &save);
   for (k = 1; k < 5; ++k) field[k] = strtok_r(NULL, "\t", &save);
   b->smb = strcmp(field[0], BATCH_PROTO_SMB) == 0;
-  if (!field[3] || (b->smb && !field[4])) {
+  b->ftp = strcmp(field[0], BATCH_PROTO_FTP) == 0;
+  for (k = 0; k < BATCH_WORKERS; ++k) ftp_init(&b->ftpc[k]);
+  if (!field[3] || ((b->smb || b->ftp) && !field[4])) {
     send_line(ctl, "ERR -1 request not a NASBridge batch request");
     free(b);
     return;
@@ -1907,6 +2605,19 @@ static void run_batch(int ctl, char *line) {
     b->sign_in.user = sign[1];
     b->sign_in.domain = sign[2];
     b->sign_in.password = sign[3];
+  }
+  if (b->ftp) {
+    sign_len = (size_t)strtoull(field[4], NULL, 10);
+    bytes = sign_len >= 2 && sign_len <= MAX_SIGN_IN ? malloc(sign_len) : NULL;
+    if (!bytes || recv_exact(ctl, bytes, sign_len) != 0 || smb_fields(bytes, sign_len, sign, 2) != 0) {
+      send_line(ctl, "ERR -1 request bad sign-in");
+      free(bytes);
+      free(b);
+      return;
+    }
+    b->ftp_in.path = NULL;
+    b->ftp_in.user = sign[0];
+    b->ftp_in.password = sign[1];
   }
   snprintf(ip, sizeof ip, "%s", field[1]);
   b->ctl = ctl;
@@ -2158,12 +2869,17 @@ static void run_job(int ctl) {
   }
 #endif
   if (strncmp(line, BATCH_PROTO "\t", sizeof BATCH_PROTO) == 0 ||
-      strncmp(line, BATCH_PROTO_SMB "\t", sizeof BATCH_PROTO_SMB) == 0) {
+      strncmp(line, BATCH_PROTO_SMB "\t", sizeof BATCH_PROTO_SMB) == 0 ||
+      strncmp(line, BATCH_PROTO_FTP "\t", sizeof BATCH_PROTO_FTP) == 0) {
     run_batch(ctl, line);
     goto out;
   }
   if (strncmp(line, PROTO_SMB "\t", sizeof PROTO_SMB) == 0) {
     run_smb_job(&j, line);
+    goto out;
+  }
+  if (strncmp(line, PROTO_FTP "\t", sizeof PROTO_FTP) == 0) {
+    run_ftp_job(&j, line);
     goto out;
   }
   if (strncmp(line, PART_PROTO "\t", sizeof PART_PROTO) == 0) {
@@ -2232,7 +2948,7 @@ static void run_job(int ctl) {
 #endif
   /* Two connections pay off on a big rest; a small one goes in one. */
   if (streams > 1 && j.size - j.start >= 2 * CHUNK) {
-    if (multi_pass(&j, streams, NULL) == 0) goto out;
+    if (multi_pass(&j, streams, NULL, NULL) == 0) goto out;
     /* The NAS doesn't take ranges: over one connection, from where it got. */
     j.abort = 0;
     if ((err = resume_point(&j)) != 0) {

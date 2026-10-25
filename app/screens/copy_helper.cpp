@@ -40,6 +40,8 @@ constexpr const char *kProto = "NBC1";
 constexpr const char *kBatchProto = "NBB1";
 constexpr const char *kSmbProto = "NBS1";      // one file over SMB
 constexpr const char *kSmbBatchProto = "NBT1"; // small files over SMB
+constexpr const char *kFtpProto = "NBG1";      // one file over FTP
+constexpr const char *kFtpBatchProto = "NBH1"; // small files over FTP
 constexpr const char *kPartitionProto = "NBP1"; // a partition's type
 constexpr const char *kFileStepProto = "NBF1";  // a step on a drive's files
 constexpr int kStartMs = 20000;   // the loader can take a while to run it
@@ -178,6 +180,16 @@ std::string sign_in_bytes(const SmbSignIn &sign_in, const std::string *path)
     return bytes;
 }
 
+// FTP's: the path (for one file), the user and the password, each ended by a NUL.
+std::string sign_in_bytes(const FtpSignIn &sign_in, const std::string *path)
+{
+    std::string bytes;
+    if (path != nullptr)
+        bytes += *path + '\0';
+    bytes += sign_in.user + '\0' + sign_in.password + '\0';
+    return bytes;
+}
+
 using Progress = std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, int)>;
 
 // One file: sends the job line and what follows it, then follows the helper
@@ -269,7 +281,7 @@ HelperCopy run_copy(const std::string &job, const std::string &payload, const Pr
                 result.end = End::refused;
                 result.status = std::atoi(result.why.c_str());
             }
-            else if (kind == "smb")
+            else if (kind == "smb" || kind == "ftp")
                 result.end = End::refused; // the NAS said no: `why` says what
             else if (kind == "chunked")
                 result.end = End::unsupported;
@@ -436,7 +448,7 @@ HelperBatch run_batch(const std::string &opening, const std::vector<BatchFile> &
                     result.status = std::atoi(result.why.c_str());
                     return finish(End::refused);
                 }
-                if (kind == "smb")
+                if (kind == "smb" || kind == "ftp")
                     return finish(End::refused);
                 if (kind == "changed")
                     return finish(End::changed);
@@ -500,6 +512,32 @@ HelperBatch copy_smb_batch_with_helper(const std::string &ip, int port, int work
 {
     const std::string bytes = sign_in_bytes(sign_in, nullptr);
     return run_batch(std::string(kSmbBatchProto) + "\t" + ip + "\t" + std::to_string(port) +
+                         "\t" + std::to_string(workers) + "\t" + std::to_string(bytes.size()) +
+                         "\n" + bytes,
+                     files, done, synced, progress, stopping);
+}
+
+HelperCopy copy_ftp_with_helper(const std::string &ip, int port, std::uint64_t size,
+                                const std::string &local, const FtpSignIn &sign_in,
+                                const std::string &path, int streams, const Progress &progress,
+                                const std::function<bool()> &stopping)
+{
+    const std::string bytes = sign_in_bytes(sign_in, &path);
+    const std::string job = std::string(kFtpProto) + "\t" + ip + "\t" + std::to_string(port) +
+                            "\t" + std::to_string(size) + "\t" + local + "\t" +
+                            std::to_string(bytes.size()) + "\t" + std::to_string(streams) + "\n";
+    return run_copy(job, bytes, progress, stopping);
+}
+
+HelperBatch copy_ftp_batch_with_helper(const std::string &ip, int port, int workers,
+                                       const FtpSignIn &sign_in, const std::vector<BatchFile> &files,
+                                       const std::function<void(std::size_t)> &done,
+                                       const std::function<void()> &synced,
+                                       const BatchProgress &progress,
+                                       const std::function<bool()> &stopping)
+{
+    const std::string bytes = sign_in_bytes(sign_in, nullptr);
+    return run_batch(std::string(kFtpBatchProto) + "\t" + ip + "\t" + std::to_string(port) +
                          "\t" + std::to_string(workers) + "\t" + std::to_string(bytes.size()) +
                          "\n" + bytes,
                      files, done, synced, progress, stopping);

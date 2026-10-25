@@ -9,8 +9,9 @@
 // only lists folders and only chooses one: Cross opens the focused folder,
 // Square chooses the folder being shown, Circle goes up (and closes at the
 // top). Listings come from the NAS on a worker thread (WebDAV: PROPFIND,
-// Depth 1; SMB: the NAS's shares at the top, then the folders in them), with
-// the connection as it is being edited.
+// Depth 1; SMB: the NAS's shares at the top, then the folders in them; FTP:
+// the folders the signed-in user sees from "/"), with the connection as it is
+// being edited.
 
 #pragma once
 

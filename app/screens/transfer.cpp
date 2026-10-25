@@ -362,7 +362,9 @@ std::string nas_identity(const Connection &connection)
     // WebDAV keeps its old form, so copies saved by earlier versions still match.
     const std::string where = connection.host + ":" +
                               std::to_string(connection.effective_port()) + folder_path(connection);
-    return connection.type == ConnectionType::smb ? "smb:" + where : where;
+    return connection.type == ConnectionType::smb   ? "smb:" + where
+           : connection.type == ConnectionType::ftp ? "ftp:" + where
+                                                    : where;
 }
 
 std::string copy_source(const Connection &connection, const NasGame &game)
@@ -718,9 +720,9 @@ class Lister
         plan->folders.clear();
         plan->files.clear();
         // A NAS that didn't list deeply once isn't asked again (it can cost
-        // the whole wait each time). SMB has no deep listing.
+        // the whole wait each time). SMB and FTP have no deep listing.
         const std::string nas = nas_identity(connection_);
-        const bool try_deep = !nas_.smb() && !shallow_nas(nas);
+        const bool try_deep = !nas_.walks() && !shallow_nas(nas);
         if (!try_deep || !deep(plan))
         {
             if (try_deep && !stopping())
@@ -849,12 +851,12 @@ class Lister
         return true;
     }
 
-    // One folder at a time, when the NAS won't list deeply. Over SMB, several
-    // folders at once.
+    // One folder at a time, when the NAS won't list deeply. Over SMB and
+    // FTP, several folders at once.
     bool walk(CopyPlan *plan, std::string *why)
     {
-        if (nas_.smb())
-            return walk_smb(plan, why);
+        if (nas_.walks())
+            return walk_several(plan, why);
         std::vector<std::string> queue{root_ + "/"};
         for (std::size_t next = 0; next < queue.size(); ++next)
         {
@@ -885,12 +887,12 @@ class Lister
         return true;
     }
 
-    bool walk_smb(CopyPlan *plan, std::string *why)
+    bool walk_several(CopyPlan *plan, std::string *why)
     {
         int folders = 0;
         bool too_many = false;
         NasProblem problem;
-        const bool ok = nas_.walk_smb(
+        const bool ok = nas_.walk(
             root_ + "/",
             [&](const std::string &, const std::vector<DavEntry> &entries)
             {
@@ -1210,7 +1212,7 @@ class Copier
                                        : "The copy helper can't copy this file to the drive";
             return Result::failed;
         }
-        if (size >= kParallelMin && !smb())
+        if (size >= kParallelMin && !smb() && !ftp())
         {
             const Result result = copy_pieces(remote, local, size, before, path, why);
             if (result != Result::fallback)
@@ -1223,8 +1225,9 @@ class Copier
             *why = errno_text("Couldn't create a file on the drive", errno);
             return Result::failed;
         }
-        const Result result = smb() ? fill_smb(fd, remote, size, before, why)
-                                    : fill(fd, remote, size, before, why);
+        const Result result = smb()   ? fill_smb(fd, remote, size, before, why)
+                              : ftp() ? fill_ftp(fd, remote, size, before, why)
+                                      : fill(fd, remote, size, before, why);
         if (result == Result::ok && ::fsync(fd) != 0)
         {
             *why = errno_text("Couldn't finish writing a file", errno);
@@ -1289,6 +1292,10 @@ class Copier
                 {
                     item.request = smb_location(plan.source + file.path).path;
                 }
+                else if (ftp())
+                {
+                    item.request = ftp_path(plan.source + file.path);
+                }
                 else
                 {
                     item.request = build_request(connection_, "GET", plan.source + file.path, "", "");
@@ -1334,12 +1341,16 @@ class Copier
                 };
             const auto batch_stopping = [this] { return stopping(); };
             const HelperBatch batch =
-                smb() ? copy_smb_batch_with_helper(connection_.host, connection_.effective_port(),
-                                                   batch_workers(), sign_in(), files, file_done,
-                                                   nullptr, batch_progress, batch_stopping)
-                      : copy_batch_with_helper(connection_.host, connection_.effective_port(),
-                                               batch_workers(), files, file_done, nullptr,
-                                               batch_progress, batch_stopping);
+                smb()   ? copy_smb_batch_with_helper(connection_.host, connection_.effective_port(),
+                                                     batch_workers(), sign_in(), files, file_done,
+                                                     nullptr, batch_progress, batch_stopping)
+                : ftp() ? copy_ftp_batch_with_helper(connection_.host, connection_.effective_port(),
+                                                     batch_workers(), ftp_sign_in(), files,
+                                                     file_done, nullptr, batch_progress,
+                                                     batch_stopping)
+                        : copy_batch_with_helper(connection_.host, connection_.effective_port(),
+                                                 batch_workers(), files, file_done, nullptr,
+                                                 batch_progress, batch_stopping);
             {
                 std::lock_guard<std::mutex> hold(shared_->lock);
                 shared_->connections = 0;
@@ -1378,7 +1389,8 @@ class Copier
             {
                 char text[64];
                 std::snprintf(text, sizeof(text), " (HTTP %d)", batch.status);
-                *why = "The NAS refused " + failed_path +
+                *why = "The NAS refused " +
+                       (failed_path.empty() ? std::string("a file") : failed_path) +
                        (batch.status != 0 ? std::string(text) : " (" + batch.why + ")");
                 return Result::failed;
             }
@@ -1436,7 +1448,8 @@ class Copier
             remove_file(part);
             forget_part(entry_);
         }
-        const std::string request = smb() ? "" : build_request(connection_, "GET", remote, "", "");
+        const std::string request =
+            smb() || ftp() ? "" : build_request(connection_, "GET", remote, "", "");
         int failures = 0;
         while (true)
         {
@@ -1469,12 +1482,15 @@ class Copier
                 };
             const auto copy_stopping = [this] { return stopping(); };
             const HelperCopy copy =
-                smb() ? copy_smb_with_helper(connection_.host, connection_.effective_port(), size,
-                                             local, sign_in(), smb_location(remote).path,
-                                             helper_streams_, copy_progress, copy_stopping)
-                      : copy_with_helper(connection_.host, connection_.effective_port(), size,
-                                         local, request, helper_streams_, copy_progress,
-                                         copy_stopping);
+                smb()   ? copy_smb_with_helper(connection_.host, connection_.effective_port(), size,
+                                               local, sign_in(), smb_location(remote).path,
+                                               helper_streams_, copy_progress, copy_stopping)
+                : ftp() ? copy_ftp_with_helper(connection_.host, connection_.effective_port(), size,
+                                               local, ftp_sign_in(), ftp_path(remote),
+                                               helper_streams_, copy_progress, copy_stopping)
+                        : copy_with_helper(connection_.host, connection_.effective_port(), size,
+                                           local, request, helper_streams_, copy_progress,
+                                           copy_stopping);
             {
                 std::lock_guard<std::mutex> hold(shared_->lock);
                 shared_->connections = 0;
@@ -2434,6 +2450,108 @@ class Copier
         }
     }
 
+    // fill() over FTP: the rest of the file, over the copy's one sign-in.
+    Result fill_ftp(int fd, const std::string &remote, std::uint64_t size, std::uint64_t before,
+                    std::string *why)
+    {
+        if (!ftp_)
+            ftp_ = std::make_unique<FtpSession>(connection_, kReplySeconds);
+        int failures = 0;
+        while (true)
+        {
+            std::uint64_t offset = 0;
+            bool whole = false;
+            if (!resume_at(fd, size, &offset, &whole, why))
+                return Result::failed;
+            if (whole)
+                return Result::ok;
+            if (stopping())
+                return Result::stopped;
+
+            std::uint64_t position = offset;
+            std::uint64_t actual = size; // left as it is when the NAS won't say (no SIZE)
+            bool write_failed = false;
+            int write_error = 0;
+            buffer_.clear();
+            window_start_ = now_ms();
+            window_bytes_ = 0;
+            bool counted = false;
+            bool longer = false; // more came than the file had
+            FtpFailure failure;
+            const bool complete = ftp_->stream(
+                remote, offset, &actual,
+                [&](const char *data, std::size_t length)
+                {
+                    longer = position + length > size;
+                    if (stopping() || actual != size || longer)
+                        return false;
+                    buffer_.insert(buffer_.end(), data, data + length);
+                    position += length;
+                    if (buffer_.size() >= kWriteBlock && !flush(fd))
+                    {
+                        write_failed = true;
+                        write_error = errno;
+                        return false;
+                    }
+                    if (!counted)
+                    {
+                        // One connection, for the speed tile.
+                        std::lock_guard<std::mutex> hold(shared_->lock);
+                        shared_->connections = 1;
+                        counted = true;
+                    }
+                    measure(before + position, length);
+                    return true;
+                },
+                &failure);
+            if (counted)
+            {
+                std::lock_guard<std::mutex> hold(shared_->lock);
+                shared_->connections = 0;
+            }
+            if (!write_failed && !buffer_.empty() && !flush(fd))
+            {
+                write_failed = true;
+                write_error = errno;
+            }
+            if (write_failed)
+            {
+                *why = errno_text("Couldn't write to the drive", write_error);
+                return Result::failed;
+            }
+            if (actual != size || longer || (complete && position != size))
+            {
+                *why = "A file changed on the NAS since the library was read: refresh it and try again";
+                return Result::failed;
+            }
+            if (complete)
+            {
+                if (::ftruncate(fd, static_cast<off_t>(size)) != 0)
+                {
+                    *why = errno_text("Couldn't finish a file", errno);
+                    return Result::failed;
+                }
+                return Result::ok;
+            }
+            if (stopping())
+                return Result::stopped;
+            using Kind = FtpFailure::Kind;
+            if (failure.kind == Kind::sign_in || failure.kind == Kind::not_found ||
+                failure.kind == Kind::denied || failure.kind == Kind::tls ||
+                failure.kind == Kind::address || failure.kind == Kind::other)
+            {
+                *why = "The NAS refused a file (" + ftp_failure_brief(failure) + ")";
+                return Result::failed;
+            }
+            if (!retry_after(&failures, position > offset + kRefetch,
+                             failure.kind == Kind::timeout ? "The NAS keeps going quiet"
+                             : failure.kind == Kind::busy  ? "The NAS keeps turning connections away"
+                                                           : "Lost the connection to the NAS",
+                             why))
+                return Result::failed;
+        }
+    }
+
     // Progress and speed (smoothed over about two seconds).
     void measure(std::uint64_t done, std::size_t length)
     {
@@ -2458,6 +2576,20 @@ class Copier
         return connection_.type == ConnectionType::smb;
     }
 
+    bool ftp() const
+    {
+        return connection_.type == ConnectionType::ftp;
+    }
+
+    // The helper's FTP sign-in ("anonymous" without a user name).
+    FtpSignIn ftp_sign_in() const
+    {
+        FtpSignIn result;
+        result.user = ftp_user(connection_);
+        result.password = ftp_password(connection_);
+        return result;
+    }
+
     // The helper's SMB sign-in: the share from the games folder, "guest"
     // without a user name.
     SmbSignIn sign_in() const
@@ -2476,6 +2608,7 @@ class Copier
     std::string entry_;
     std::string staging_;
     std::unique_ptr<SmbSession> smb_; // in-app copies over SMB: one sign-in for the game
+    std::unique_ptr<FtpSession> ftp_; // ... and over FTP
     std::vector<char> buffer_;
     bool helper_unavailable_ = false; // the copy helper couldn't start: in-app
     bool batch_ok_ = true;            // the copy helper takes batches of small files

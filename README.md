@@ -12,7 +12,7 @@ A native PS5 homebrew app to browse and install games from your NAS.
 
 ## What it does
 
-- **Browses your NAS over WebDAV or SMB**. Your games show up as a library with 
+- **Browses your NAS over WebDAV, SMB or FTP**. Your games show up as a library with 
   their names, covers and
   sizes, read from each game's `sce_sys` folder. Game folders are found up to
   four folders down, and `.exfat` images are read without downloading them.
@@ -45,7 +45,7 @@ A native PS5 homebrew app to browse and install games from your NAS.
     games can be deleted while it's open), use version 1.7beta6-fix2 or newer.
   - With older versions, copied games appear only once you close NASBridge, and
     a game you've just copied can only be deleted after restarting the PS5.
-- A NAS (or any computer) sharing your games over **WebDAV** or **SMB**.
+- A NAS (or any computer) sharing your games over **WebDAV**, **SMB** or **FTP**.
   - WebDAV: on a Synology, that's the WebDAV Server package (port 5005). On
     Unraid, that's likely a WebDAV docker container.
   - SMB is built into most NAS systems: turn it on, and give a user read 
@@ -56,6 +56,13 @@ A native PS5 homebrew app to browse and install games from your NAS.
     Unraid, a share set to Public (guest) is refused. Set the games share to
     Private, add a user for NASBridge under Users, and give it Read-only
     access to the share.
+  - FTP is built into most NAS systems too: turn it on (plain FTP with
+    passive mode; FTPS and SFTP aren't supported), and give a user read
+    access to the games folder. In NASBridge, enter the NAS's IP address,
+    that username and password (leave both empty to sign in as anonymous),
+    then pick your games folder with the folder button. NASBridge opens
+    several connections at once to copy quickly; if the NAS limits
+    connections per user or per address, it carries on with the ones it gets.
 - Only to build it yourself: a Mac or Linux machine with Docker (Docker
   Desktop or OrbStack) and `make`.
 
@@ -155,7 +162,7 @@ need.
 | `make install PS5_HOST=<ip>` | Build, then install to the PS5's home screen |
 | `make uninstall PS5_HOST=<ip>` | Remove NASBridge from the PS5 |
 | `make release` | Build `out/NASBridge-<version>.elf`, the single-file installer |
-| `make test` | Run the test suites (on your computer, against a fake WebDAV NAS, a Samba server and a fake PS5) |
+| `make test` | Run the test suites (on your computer, against a fake WebDAV NAS, a Samba server, an FTP server and a fake PS5) |
 | `make snapshots` | Render every screen to `out/snapshots/` |
 | `make shell` | Open a shell inside the toolchain container |
 | `make clean` | Delete build output |
@@ -168,7 +175,7 @@ exact commits, so two builds of the same commit produce the same files.
 app/      the app: screens, artwork and home-screen metadata (sce_sys)
 tools/    the installer, copy helper and delete helper payloads
 tests/    test suites, with a fake WebDAV NAS, a real Samba server for SMB,
-          and a fake PS5 loader
+          a real FTP server (pyftpdlib) for FTP, and a fake PS5 loader
 Dockerfile, Makefile, ps5.mk   the toolchain and build
 ```
 
