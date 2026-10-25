@@ -889,7 +889,7 @@ class Library final : public app::Concept
         Game game;
         game.title = found.title;
         game.format = !found.image                              ? "Game folder"
-                      : is_compressed_image_name(found.image_path) ? "Compressed image"
+                      : is_compressed_image_name(found.image_path) ? "ffpfsc image"
                                                                    : "exFAT image";
         game.label = game.format;
         game.title_id = found.title_id;
