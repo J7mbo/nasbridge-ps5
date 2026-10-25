@@ -10,7 +10,7 @@
 //
 // Copying one game. The game's files are listed on the NAS (a folder game: the folder
 // holding sce_sys, without .zip/.rar/.7z downloads; an image game: the .exfat
-// file), then streamed one file at a time, each in one long GET, into
+// or .ffpfsc file), then streamed one file at a time, each in one long GET, into
 //   <destination>/.nasbridge-incoming/<name>
 // ShadowMountPlus skips names starting with a dot, so a half-copied game is
 // never registered. When every file is in, that folder is renamed to

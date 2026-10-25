@@ -49,14 +49,20 @@ ProbeResult interpret_response(const Connection &connection, int status,
 // What a failed connect or read means (an errno value).
 ProbeResult interpret_socket_error(const Connection &connection, int error, bool connecting);
 
+// A game image the library reads: an .exfat, or a .ffpfsc (a compressed
+// image, see ffpfsc.hpp). Any case.
+bool is_image_name(const std::string &name);
+bool is_compressed_image_name(const std::string &name);
+
 // How many games the games folder holds, found the way the library finds
 // them: each folder is a game folder when it has an sce_sys (up to four
-// folders down), else an image game when it has an .exfat; .exfat files in
-// the games folder itself are image games too.
+// folders down), else an image game when it has an image (.exfat or
+// .ffpfsc); images in the games folder itself are image games too.
 struct GameCount
 {
     int folder_games = 0;
-    int image_games = 0;
+    int image_games = 0;      // .exfat and .ffpfsc
+    int compressed_games = 0; // ... of which .ffpfsc
     int other_folders = 0; // no game inside (patches, backports, downloads...)
     int unreadable = 0;    // couldn't be listed (the library shows them with a note)
 };
@@ -65,7 +71,8 @@ struct GameCount
 bool count_games(const Connection &connection, const std::vector<DavEntry> &top,
                  const std::function<bool()> &stop,
                  const std::function<void(int done, int total)> &progress, GameCount *count);
-// The test's line for a count ("Found 27 games: 12 folder games and 15 .exfat games").
+// The test's line for a count ("Found 27 games: 12 folder games and 15 .exfat games",
+// or "..., 10 .exfat games and 5 .ffpfsc games").
 std::string describe_count(const Connection &connection, const GameCount &count);
 
 class NasProbe
