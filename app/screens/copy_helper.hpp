@@ -29,7 +29,7 @@ struct HelperCopy
         unsupported, // the NAS answers in a way the helper doesn't take (chunked): copy in-app
         lost,        // the helper went away mid-file: try again
         network,     // the NAS couldn't be reached, dropped or went quiet: try again
-        refused,     // the NAS answered with an error (`status`; SMB: 0, and `why`)
+        refused,     // the NAS answered with an error (`status`; SMB and FTP: 0, and `why`)
         file,        // the file couldn't be made or opened (`why`)
         write,       // writing to the drive failed (`why`)
         changed,     // the file on the NAS is a different size than listed
@@ -61,7 +61,8 @@ struct BatchFile
 {
     std::string local;   // where it goes on the PS5
     std::uint64_t size = 0;
-    std::string request; // the GET (keep-alive), sign-in and all; SMB: the path in the share
+    std::string request; // the GET (keep-alive), sign-in and all; SMB: the path in the share;
+                         // FTP: the file's path ("/Games/PS5/Game/eboot.bin")
 };
 
 struct HelperBatch
@@ -106,6 +107,31 @@ HelperCopy copy_smb_with_helper(const std::string &ip, int port, std::uint64_t s
 // copy_batch_with_helper over SMB: each file's `request` is its path in the share.
 HelperBatch copy_smb_batch_with_helper(const std::string &ip, int port, int workers,
                                        const SmbSignIn &sign_in, const std::vector<BatchFile> &files,
+                                       const std::function<void(std::size_t)> &done,
+                                       const std::function<void()> &synced,
+                                       const BatchProgress &progress,
+                                       const std::function<bool()> &stopping);
+
+// Over FTP: the helper signs in itself with these.
+struct FtpSignIn
+{
+    std::string user; // "anonymous" when none was given (ftp_user)
+    std::string password;
+};
+
+// copy_with_helper over FTP: `path` is the file's path ("/Games/PS5/Game/eboot.bin").
+// Over `streams` sign-ins of its own (1 to 4), each fetching the next chunk
+// (from where it starts, cut off at its end), as over SMB.
+HelperCopy copy_ftp_with_helper(const std::string &ip, int port, std::uint64_t size,
+                                const std::string &local, const FtpSignIn &sign_in,
+                                const std::string &path, int streams,
+                                const std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, int)> &progress,
+                                const std::function<bool()> &stopping);
+
+// copy_batch_with_helper over FTP: each file's `request` is its path. Each
+// worker signs in once; one the NAS turns away (too many connections) isn't used.
+HelperBatch copy_ftp_batch_with_helper(const std::string &ip, int port, int workers,
+                                       const FtpSignIn &sign_in, const std::vector<BatchFile> &files,
                                        const std::function<void(std::size_t)> &done,
                                        const std::function<void()> &synced,
                                        const BatchProgress &progress,

@@ -152,7 +152,7 @@ std::string normalise_host(std::string *text)
     std::string host = *text;
     if (starts_with(host, "https://"))
         return "HTTPS isn't supported yet: use the http address";
-    if (starts_with(host, "http://") || starts_with(host, "smb://"))
+    if (starts_with(host, "http://") || starts_with(host, "smb://") || starts_with(host, "ftp://"))
         host.erase(0, host.find("//") + 2);
     // "\\192.168.1.20", as Windows writes a NAS's address.
     while (!host.empty() && host.front() == '\\')

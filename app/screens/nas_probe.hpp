@@ -1,10 +1,11 @@
-// NASBridge - "Test connection": one listing from the NAS (WebDAV or SMB), off the UI thread.
+// NASBridge - "Test connection": one listing from the NAS (WebDAV, SMB or FTP), off the UI thread.
 // Copyright (C) 2026 NASBridge contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
 // Asks the NAS for the games folder's contents the way the library will
 // (WebDAV: PROPFIND, Depth: 1; SMB: signing in and listing the folder, or the
-// shares when no folder is set yet), and turns the answer into words:
+// shares when no folder is set yet; FTP: signing in and listing the folder),
+// and turns the answer into words:
 // connected and what is there, or what went wrong and what to check.
 //
 // The request runs on a thread of its own with a 1 MiB stack (console

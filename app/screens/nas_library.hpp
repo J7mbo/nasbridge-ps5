@@ -13,7 +13,7 @@
 // on their own or alone in a folder, are looked inside by reading parts of
 // them (exfat.cpp) without copying them. Folders with no game inside
 // (backports, patches, empty folders) are left out. The NAS is read over
-// WebDAV or SMB, as the connection says (nas.hpp).
+// WebDAV, SMB or FTP, as the connection says (nas.hpp).
 //
 // Results arrive as events the library takes on the UI thread, which is the
 // only thread that touches OpenGL. A load can be abandoned at any time (the

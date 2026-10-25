@@ -166,12 +166,19 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends samba libnss-wrapper \
  && rm -rf /var/lib/apt/lists/*
 
+# For the FTP tests only: pyftpdlib as the test NAS (tests/ftp_server.py), run
+# as whoever runs the tests.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3-pyftpdlib \
+ && rm -rf /var/lib/apt/lists/*
+
 # Record exact tool versions inside the image (shown by `make toolchain-info`).
 RUN { echo "ps5-payload-sdk $PS5_SDK_TAG ($PS5_SDK_COMMIT)"; \
       echo "ps5-homebrew-ui $UI_KIT_COMMIT"; \
       echo "stb $STB_COMMIT"; \
       echo "libsmb2 $LIBSMB2_TAG ($LIBSMB2_COMMIT)"; \
       echo "samba $(smbd --version) (tests only)"; \
+      echo "pyftpdlib $(python3 -c 'import pyftpdlib; print(pyftpdlib.__ver__)') (tests only)"; \
       echo "compiler-rt builtins $LLVM_VERSION (x86-64, from source)"; \
       clang-18 --version | head -1; \
       ld.lld-18 --version; \

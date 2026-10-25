@@ -380,7 +380,7 @@ const NasGame *find_saved(const std::vector<NasGame> &saved, const std::string &
 struct LibraryLoader::Job
 {
     Connection connection;
-    NasReader *nas = nullptr;   // the thread's way to the NAS (WebDAV or SMB)
+    NasReader *nas = nullptr;   // the thread's way to the NAS (WebDAV, SMB or FTP)
     std::vector<NasGame> saved; // what the cache held
     bool key_art_only = false;  // a start_key_art() request
     NasGame target;             // ... for this game
@@ -749,25 +749,24 @@ struct LibraryLoader::Job
     // as it streams in (deep_size). A big game's listing is tens of megabytes
     // of XML: holding it whole ran the app out of memory, so only the entry
     // being read is kept. When the NAS refuses deep listings, the folder is
-    // listed one folder at a time instead, which is much slower. (SMB has no
-    // deep listing: several folders are listed at once instead, over the one
-    // sign-in.)
+    // listed one folder at a time instead, which is much slower. (SMB and FTP
+    // have no deep listing: several folders are listed at once instead, NasReader::walk.)
     bool measure(const std::string &url, std::uint64_t *total)
     {
         *total = 0;
-        if (nas->smb())
+        if (nas->walks())
         {
             int folders = 0;
-            return nas->walk_smb(url,
-                                 [&](const std::string &, const std::vector<DavEntry> &inside)
-                                 {
-                                     if (cancelled || ++folders > kSizeFolders)
-                                         return false;
-                                     for (const DavEntry &entry : inside)
-                                         if (!entry.folder && !is_archive(entry.name))
-                                             *total += entry.size;
-                                     return true;
-                                 });
+            return nas->walk(url,
+                             [&](const std::string &, const std::vector<DavEntry> &inside)
+                             {
+                                 if (cancelled || ++folders > kSizeFolders)
+                                     return false;
+                                 for (const DavEntry &entry : inside)
+                                     if (!entry.folder && !is_archive(entry.name))
+                                         *total += entry.size;
+                                 return true;
+                             });
         }
         if (deep_size(url, total))
             return true;

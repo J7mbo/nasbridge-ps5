@@ -1,9 +1,10 @@
-// NASBridge - "Test connection": one listing from the NAS (WebDAV or SMB), off the UI thread.
+// NASBridge - "Test connection": one listing from the NAS (WebDAV, SMB or FTP), off the UI thread.
 // Copyright (C) 2026 NASBridge contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "concepts/nas_probe.hpp"
 
+#include "concepts/ftp.hpp"
 #include "concepts/http.hpp"
 #include "concepts/smb.hpp"
 
@@ -150,6 +151,38 @@ ProbeResult probe_smb(const Connection &connection, bool count,
     return result;
 }
 
+// The test over FTP: sign in, list the games folder, and count the games in it.
+ProbeResult probe_ftp(const Connection &connection, bool count,
+                      const std::function<bool()> &stop,
+                      const std::function<void(int, int)> &progress)
+{
+    FtpSession session(connection);
+    FtpFailure failure;
+    std::vector<FtpEntry> top;
+    if (!session.list(folder_path(connection), &top, &failure))
+    {
+        ProbeResult result;
+        result.state = State::failed;
+        describe_ftp_failure(connection, failure, &result.headline, &result.detail);
+        return result;
+    }
+    ProbeResult result = describe_entries(connection, listed(top));
+    GameCount games;
+    const Lister list = [&](const std::string &path, std::vector<Listed> *entries)
+    {
+        std::vector<FtpEntry> inside;
+        FtpFailure why;
+        if (!session.list(path, &inside, &why))
+            return false;
+        *entries = listed(inside);
+        return true;
+    };
+    if (count && result.state == State::ok && !top.empty() &&
+        count_in(folder_path(connection), listed(top), list, stop, progress, &games))
+        result.detail = describe_count(connection, games);
+    return result;
+}
+
 // The whole test, start to finish, on the worker thread.
 ProbeResult probe(const Connection &connection, bool count,
                   const std::function<bool()> &stop,
@@ -161,6 +194,8 @@ ProbeResult probe(const Connection &connection, bool count,
                       "address is in its network settings, or your router's device list.");
     if (connection.type == ConnectionType::smb)
         return probe_smb(connection, count, stop, progress);
+    if (connection.type == ConnectionType::ftp)
+        return probe_ftp(connection, count, stop, progress);
     const HttpReply reply =
         http_request(connection, "PROPFIND", folder_path(connection),
                      "Depth: 1\r\nContent-Type: application/xml; charset=utf-8\r\n",

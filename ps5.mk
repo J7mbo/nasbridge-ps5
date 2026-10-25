@@ -26,7 +26,7 @@ HELPER_SRCS := tools/helper/helper.c
 # The copy helper: shipped inside the app (assets/copier.elf); NASBridge sends
 # it to the PS5's ELF loader and hands it each file to copy (see copier.c).
 # It copies over SMB with libsmb2 (below), built for it from the same sources
-# and config.h as the app's.
+# and config.h as the app's, and speaks FTP itself.
 COPIER_SRCS := tools/copier/copier.c
 
 SELFTEST_DIR := $(BUILD_DIR)/selftest/NASBSELFTEST
@@ -295,6 +295,10 @@ host_objs = $(patsubst %.c,$(HOST_OBJ)/%.o,$(patsubst %.cpp,$(HOST_OBJ)/%.o,$(1)
 LIBSMB2_HOST := $(APP_WORK)/src/concepts/smb.cpp $(addprefix $(APP_WORK)/$(LIBSMB2_DIR)/,$(LIBSMB2_OURS)) \
   $(addprefix $(APP_WORK)/$(LIBSMB2_DIR)/lib/,$(LIBSMB2_SRCS))
 
+# Our FTP layer (no library: FTP is simple enough to speak directly), linked
+# in beside it.
+LIBSMB2_HOST += $(APP_WORK)/src/concepts/ftp.cpp
+
 # Our code and the tests with warnings on; the kit's own files without.
 $(HOST_OBJ)/$(APP_WORK)/src/concepts/%.o: $(APP_WORK)/src/concepts/%.cpp | app-work
 	@mkdir -p $(@D)
@@ -389,6 +393,16 @@ SMB_NAS_SRCS := tests/test_smb_nas.cpp $(LIBSMB2_HOST) \
     file_calls.cpp smp.cpp json_scan.cpp notify.cpp storage.cpp) \
   $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
 
+# The library and the copy queue over FTP, against a real FTP server
+# (tests/ftp_server.py, pyftpdlib): one that lists with MLSD, and one that
+# only has LIST and turns away connections past a few, as NAS servers can.
+HOST_FTP_NAS := build/host/test_ftp_nas
+FTP_NAS_SRCS := tests/test_ftp_nas.cpp $(LIBSMB2_HOST) \
+  $(addprefix $(APP_WORK)/src/concepts/,nas.cpp nas_library.cpp library_cache.cpp exfat.cpp png.cpp \
+    nas_probe.cpp http.cpp connection.cpp transfer.cpp copy_helper.cpp delete_helper.cpp \
+    file_calls.cpp smp.cpp json_scan.cpp notify.cpp storage.cpp) \
+  $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
+
 HOST_DELETE := build/host/test_delete
 DELETE_SRCS := tests/test_delete.cpp \
   $(APP_WORK)/src/concepts/delete_helper.cpp $(APP_WORK)/src/core/save_file.cpp
@@ -401,8 +415,9 @@ $(HOST_QUEUE): $(call host_objs,$(QUEUE_SRCS))
 $(HOST_DELETE): $(call host_objs,$(DELETE_SRCS))
 $(HOST_SMB): $(call host_objs,$(SMB_SRCS))
 $(HOST_SMB_NAS): $(call host_objs,$(SMB_NAS_SRCS))
+$(HOST_FTP_NAS): $(call host_objs,$(FTP_NAS_SRCS))
 $(HOST_TRANSFER) $(HOST_PICKER) $(HOST_COUNT) $(HOST_LOCK) $(HOST_QUEUE) $(HOST_DELETE) $(HOST_SMB) \
-  $(HOST_SMB_NAS):
+  $(HOST_SMB_NAS) $(HOST_FTP_NAS):
 	@mkdir -p $(@D)
 	clang++-18 -o $@ $^ -lpthread
 
@@ -413,7 +428,7 @@ $(HOST_TRANSFER) $(HOST_PICKER) $(HOST_COUNT) $(HOST_LOCK) $(HOST_QUEUE) $(HOST_
 # and work folder each): run-transfer runs all three.
 TRANSFER_PARTS := run-transfer-1 run-transfer-2 run-transfer-3
 HOST_RUNS := run-installer run-release $(TRANSFER_PARTS) run-picker run-count run-lock run-queue run-delete \
-  run-smb run-smb-nas
+  run-smb run-smb-nas run-ftp-nas
 .PHONY: $(HOST_RUNS) run-transfer
 run-installer: selftest $(HOST_INSTALLER)
 	python3 -u tests/test_installer.py
@@ -436,6 +451,8 @@ run-smb: $(HOST_SMB)
 	$(HOST_SMB)
 run-smb-nas: $(HOST_SMB_NAS) $(HOST_COPIER)
 	$(HOST_SMB_NAS) build/host/smb-nas-test $(HOST_COPIER)
+run-ftp-nas: $(HOST_FTP_NAS) $(HOST_COPIER)
+	$(HOST_FTP_NAS) build/host/ftp-nas-test $(HOST_COPIER)
 
 # app-work goes first, in a make of its own: it copies our sources into the
 # kit, and a make that copied them while also building would judge the

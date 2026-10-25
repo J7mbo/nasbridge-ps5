@@ -17,7 +17,7 @@ namespace hui::concepts
 enum class ConnectionType : int
 {
     webdav = 0,
-    ftp = 1, // listed as "coming later"; not selectable yet
+    ftp = 1, // plain FTP (no FTPS), passive mode
     smb = 2, // SMB 2 and 3; the folder's first part is the share
 };
 
@@ -27,7 +27,8 @@ struct Connection
     std::string host;          // "192.168.1.20" or "nas.local"; empty: not set up
     int port = 0;              // 0: the type's default
     std::string folder = "/";  // where the games are, always starting with "/"
-    std::string username;      // empty: no sign-in (SMB: guest); SMB takes "DOMAIN\name" too
+    std::string username;      // empty: no sign-in (SMB: guest; FTP: anonymous); SMB takes
+                               // "DOMAIN\name" too
     std::string password;
 
     bool configured() const
@@ -42,8 +43,8 @@ struct Connection
     {
         return port > 0 ? port : default_port();
     }
-    // "http://nas.local:5005/games/" or "smb://192.168.1.20/Games/PS5/" (the user
-    // name, not the password, when set).
+    // "http://nas.local:5005/games/", "smb://192.168.1.20/Games/PS5/" or
+    // "ftp://192.168.1.20/Games/PS5/" (the user name, not the password, when set).
     std::string display_url() const;
 
     // Loads the saved connection; false (and defaults) when there is none.

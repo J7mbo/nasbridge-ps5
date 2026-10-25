@@ -104,11 +104,8 @@ ConnectionPage::ConnectionPage(const ui::Fonts &fonts) : fonts_(fonts), picker_(
     type_.set_label("Connection type");
     // In ConnectionType's order: the list's index is the type.
     type_.set_options({{"WebDAV", "Built into most NAS systems"},
-                       {"FTP", "Coming later"},
+                       {"FTP", "Plain FTP, as most NAS systems offer"},
                        {"SMB", "Also built into most NAS systems"}});
-    std::vector<ui::SelectOption> options = type_.options();
-    options[1].disabled = true;
-    type_.set_options(std::move(options));
     type_.set_index(static_cast<int>(connection_.type));
 
     struct Setup
@@ -561,6 +558,10 @@ void ConnectionPage::draw_panel(gfx::DrawList &list, ui::Painter &paint,
             ? "Turn on SMB in your NAS's settings, then enter the NAS's "
               "address and sign-in here, and pick the games folder: its first part is the share. "
               "NASBridge only reads from your NAS: NASBridge never changes or deletes anything there."
+        : connection_.type == ConnectionType::ftp
+            ? "Turn on FTP in your NAS's settings (plain FTP, with passive mode), then enter the "
+              "NAS's address and sign-in here, and pick the games folder. NASBridge only reads "
+              "from your NAS: NASBridge never changes or deletes anything there."
             : "Turn on WebDAV in your NAS's settings, then enter the NAS's address here. "
               "Synology's WebDAV Server uses port 5005. NASBridge only reads from your NAS: "
               "NASBridge never changes or deletes anything there.",

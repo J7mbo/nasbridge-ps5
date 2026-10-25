@@ -5,6 +5,7 @@
 #include "concepts/folder_picker.hpp"
 
 #include "concepts/http.hpp"
+#include "concepts/ftp.hpp"
 #include "concepts/smb.hpp"
 #include "concepts/nas_probe.hpp"
 
@@ -182,6 +183,31 @@ void *ask_main(void *argument)
 #endif
     FolderPicker::Shared::Answer answer;
     answer.path = ask->path;
+    if (ask->connection.type == ConnectionType::ftp)
+    {
+        FtpSession session(ask->connection);
+        std::vector<FtpEntry> entries;
+        FtpFailure failure;
+        if (session.list(ask->path, &entries, &failure))
+        {
+            for (const FtpEntry &entry : entries)
+                if (entry.folder)
+                    answer.listing.names.push_back(entry.name);
+            std::sort(answer.listing.names.begin(), answer.listing.names.end(),
+                      [](const std::string &a, const std::string &b)
+                      { return compare_names(a, b) < 0; });
+            answer.listing.ok = true;
+        }
+        else
+        {
+            describe_ftp_failure(ask->connection, failure, &answer.listing.headline,
+                                 &answer.listing.detail);
+        }
+        std::lock_guard<std::mutex> hold(ask->shared->lock);
+        ask->shared->answers.push_back(std::move(answer));
+        delete ask;
+        return nullptr;
+    }
     if (ask->connection.type == ConnectionType::smb)
     {
         // At "/", the NAS's shares; below, the folders in them.
