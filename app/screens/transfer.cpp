@@ -234,6 +234,59 @@ std::string parent_of(const std::string &path)
     return slash == std::string::npos ? std::string() : path.substr(0, slash);
 }
 
+// A USB or extended drive is out of NASBridge's sight in its sandbox (its
+// calls there fail with "no such file"), so steps on a drive's folders and
+// files go through the copy helper, outside it. These do what the system
+// calls do, there or here: -1 and errno on failure.
+std::atomic<bool> g_steps_everywhere{false};
+
+bool on_drive(const std::string &path)
+{
+    return copy_helper_enabled() && (g_steps_everywhere.load() || !drive_of(path).empty());
+}
+
+int helper_step(const char *step, const std::string &path, const std::string &to = "")
+{
+    const int error = helper_file_step(step, path, to);
+    errno = error;
+    return error == 0 ? 0 : -1;
+}
+
+int make_folder(const std::string &path)
+{
+    return on_drive(path) ? helper_step("mkdir", path) : ::mkdir(path.c_str(), 0777);
+}
+
+int rename_path(const std::string &from, const std::string &to)
+{
+    return on_drive(from) ? helper_step("rename", from, to) : ::rename(from.c_str(), to.c_str());
+}
+
+int remove_file(const std::string &path)
+{
+    return on_drive(path) ? helper_step("unlink", path) : ::unlink(path.c_str());
+}
+
+int remove_folder(const std::string &path)
+{
+    return on_drive(path) ? helper_step("rmdir", path) : ::rmdir(path.c_str());
+}
+
+// The size of the file at `path`; false when there's none (or it can't be told).
+bool file_size(const std::string &path, std::uint64_t *size)
+{
+    if (on_drive(path))
+    {
+        bool folder = false;
+        return helper_file_step("stat", path, "", size, &folder) == 0 && !folder;
+    }
+    struct stat info;
+    if (::stat(path.c_str(), &info) != 0 || S_ISDIR(info.st_mode))
+        return false;
+    *size = static_cast<std::uint64_t>(info.st_size);
+    return true;
+}
+
 // Makes `path` and its parents under `base` (which exists). False with errno.
 bool make_folders(const std::string &base, const std::string &relative)
 {
@@ -244,7 +297,7 @@ bool make_folders(const std::string &base, const std::string &relative)
         if (end == std::string::npos)
             end = relative.size();
         const std::string folder = base + "/" + relative.substr(0, end);
-        if (::mkdir(folder.c_str(), 0777) != 0 && errno != EEXIST)
+        if (make_folder(folder) != 0 && errno != EEXIST)
             return false;
         at = end + 1;
     }
@@ -255,6 +308,8 @@ bool make_folders(const std::string &base, const std::string &relative)
 // tries to open it, then to make a folder there.
 bool exists(const std::string &path)
 {
+    if (on_drive(path))
+        return helper_file_step("stat", path) == 0;
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd >= 0)
     {
@@ -347,6 +402,11 @@ void set_deep_listing_wait(int seconds)
     g_shallow.clear();
 }
 
+
+void set_drive_steps_everywhere(bool everywhere)
+{
+    g_steps_everywhere.store(everywhere);
+}
 
 void set_copy_streams(int streams)
 {
@@ -577,6 +637,10 @@ struct Transfers::Shared
         save_unfinished();
     }
     Transfers::SpaceCheck space;
+    Transfers::DriveCheck drive_gone;
+    // The front game's drive, while the queue is paused because it was
+    // unplugged (the screen resumes when it's back).
+    std::string drive_wait;
     std::atomic<bool> pause{false}; // the screen asked the queue to stop
     std::atomic<bool> stop{false};  // NASBridge is closing
     int ui_cpu = -1;
@@ -950,9 +1014,14 @@ class Copier
             *why = "There's already a \"" + plan.name + "\" on this drive";
             return stopped_or(Outcome::failed);
         }
-        if (::mkdir(incoming.c_str(), 0777) != 0 && errno != EEXIST)
+        // A drive's homebrew folder is made by its first copy (Internal
+        // storage's is ShadowMountPlus's).
+        if (!drive_of(plan.destination).empty() &&
+            make_folder(plan.destination) != 0 && errno != EEXIST)
             return fail(errno_text("Couldn't write to the drive", errno), why);
-        if (!plan.image && ::mkdir(staging_.c_str(), 0777) != 0 && errno != EEXIST)
+        if (make_folder(incoming) != 0 && errno != EEXIST)
+            return fail(errno_text("Couldn't write to the drive", errno), why);
+        if (!plan.image && make_folder(staging_) != 0 && errno != EEXIST)
             return fail(errno_text("Couldn't write to the drive", errno), why);
         {
             // From here it has files on the drive: removing it deletes them.
@@ -1026,7 +1095,7 @@ class Copier
                 item->plan = plan;
             shared_->save();
         }
-        if (::rename(staging_.c_str(), final_path.c_str()) != 0)
+        if (rename_path(staging_, final_path) != 0)
             return fail(errno_text("Couldn't move the game into place", errno), why);
         return finish(incoming, why);
     }
@@ -1043,7 +1112,7 @@ class Copier
     // The game is in place: tidy up and have ShadowMountPlus look for it.
     Outcome finish(const std::string &incoming, std::string *why)
     {
-        ::rmdir(incoming.c_str()); // only when nothing else is in it
+        remove_folder(incoming); // only when nothing else is in it
         // From 1.7beta6, ShadowMountPlus scans while a homebrew app (a LAPY
         // title ID, as NASBridge has) is open: this adds the game, or, if
         // its files are too fresh for this scan (it waits stability_wait_s,
@@ -1134,6 +1203,13 @@ class Copier
             if (result != Result::fallback)
                 return result;
         }
+        // NASBridge itself can't see a drive: only the helper copies there.
+        if (on_drive(local))
+        {
+            *why = helper_unavailable_ ? "The copy helper couldn't be started, and copies to a drive need it"
+                                       : "The copy helper can't copy this file to the drive";
+            return Result::failed;
+        }
         if (size >= kParallelMin && !smb())
         {
             const Result result = copy_pieces(remote, local, size, before, path, why);
@@ -1180,10 +1256,8 @@ class Copier
         {
             const CopyFile &file = plan.files[i];
             const std::string local = staging_ + "/" + file.path;
-            struct stat info;
-            if (::stat(local.c_str(), &info) == 0 &&
-                static_cast<std::uint64_t>(info.st_size) == file.size &&
-                !exists(local + kPartSuffix))
+            std::uint64_t size = 0;
+            if (file_size(local, &size) && size == file.size && !exists(local + kPartSuffix))
             {
                 *done += file.size;
                 ++*files_done;
@@ -1208,7 +1282,7 @@ class Copier
                 // Pieces of it from an in-app copy: the helper writes it whole.
                 if (exists(item.local + kPartSuffix))
                 {
-                    ::unlink((item.local + kPartSuffix).c_str());
+                    remove_file(item.local + kPartSuffix);
                     forget_part(entry_);
                 }
                 if (smb())
@@ -1359,7 +1433,7 @@ class Copier
         const std::string part = local + kPartSuffix;
         if (exists(part))
         {
-            ::unlink(part.c_str());
+            remove_file(part);
             forget_part(entry_);
         }
         const std::string request = smb() ? "" : build_request(connection_, "GET", remote, "", "");
@@ -2423,11 +2497,27 @@ void stop_queue(const SharedPtr &shared, QueueState state, const std::string &me
     std::lock_guard<std::mutex> hold(shared->lock);
     shared->state = shared->queue.empty() ? QueueState::idle : state;
     shared->message = shared->queue.empty() ? std::string() : message;
+    shared->drive_wait.clear();
     shared->phase = TransferState::idle;
     shared->detail.clear();
     shared->rate = 0.0;
     shared->worker = false;
     shared->save();
+}
+
+// The front game's drive was unplugged: the queue pauses until it's back.
+// What was copied stays on the drive, and the copy carries on from there.
+void wait_for_drive(const SharedPtr &shared, const Item &head)
+{
+    const std::string drive = destination_name(head.plan.destination);
+    stop_queue(shared, QueueState::paused, drive + " isn't connected. Plug it back in to carry on");
+    {
+        std::lock_guard<std::mutex> hold(shared->lock);
+        if (!shared->queue.empty())
+            shared->drive_wait = head.plan.destination;
+    }
+    ps5_notify("Copying " + head.plan.title + " paused: " + drive +
+               " isn't connected. It carries on when the drive is back.");
 }
 
 void run_queue(const SharedPtr &shared)
@@ -2454,6 +2544,8 @@ void run_queue(const SharedPtr &shared)
             return;
         if (shared->pause.load())
             return stop_queue(shared, QueueState::paused, "");
+        if (shared->drive_gone && shared->drive_gone(head.plan.destination))
+            return wait_for_drive(shared, head);
 
         // Before each game: is there still room for what it needs? (Something
         // else may have filled the drive since it was queued.)
@@ -2510,6 +2602,9 @@ void run_queue(const SharedPtr &shared)
         case Outcome::closing:
             return; // the saved queue comes back paused
         case Outcome::failed:
+            // Most likely the reason it failed: its drive was pulled out.
+            if (shared->drive_gone && shared->drive_gone(head.plan.destination))
+                return wait_for_drive(shared, head);
             stop_queue(shared, QueueState::failed, why);
             ps5_notify("Copying " + head.plan.title + " stopped: " + why);
             return;
@@ -2537,8 +2632,8 @@ std::string discard_files(const CopyPlan &plan, const std::function<void(float)>
     {
         step();
         const std::string local = plan.image ? staging : staging + "/" + file.path;
-        ::unlink((local + kPartSuffix).c_str()); // a big file still coming in
-        if (::unlink(local.c_str()) != 0 && errno != ENOENT && problem.empty())
+        remove_file(local + kPartSuffix); // a big file still coming in
+        if (remove_file(local) != 0 && errno != ENOENT && problem.empty())
             problem = errno_text(("Couldn't delete " + (file.path.empty() ? plan.name : file.path))
                                      .c_str(),
                                  errno);
@@ -2555,12 +2650,12 @@ std::string discard_files(const CopyPlan &plan, const std::function<void(float)>
     for (const std::string &folder : folders)
     {
         step();
-        if (::rmdir((staging + "/" + folder).c_str()) != 0 && errno != ENOENT && problem.empty())
+        if (remove_folder(staging + "/" + folder) != 0 && errno != ENOENT && problem.empty())
             problem = errno_text(("Couldn't delete the folder " + folder).c_str(), errno);
     }
-    if (!plan.image && ::rmdir(staging.c_str()) != 0 && errno != ENOENT && problem.empty())
+    if (!plan.image && remove_folder(staging) != 0 && errno != ENOENT && problem.empty())
         problem = errno_text("Couldn't delete the game's folder", errno);
-    ::rmdir(incoming.c_str()); // only when nothing else is in it
+    remove_folder(incoming); // only when nothing else is in it
     forget_part(plan.entry);
     return problem;
 }
@@ -2995,12 +3090,20 @@ bool start_worker(const SharedPtr &shared)
     return true;
 }
 
+// The drives plugged in now: ShadowMountPlus's mounts.
+StorageSpace ask_drives()
+{
+    StorageSpace space = shadowmount_storage();
+    merge_destinations(&space);
+    return space;
+}
+
 // Asks ShadowMountPlus how much room a destination has.
 bool ask_space(const std::string &destination, std::uint64_t *free)
 {
-    const StorageSpace space = shadowmount_storage();
+    const StorageSpace space = ask_drives();
     for (const Destination &place : space.destinations)
-        if (place.path == destination)
+        if (place.path == destination && place.total > 0)
         {
             *free = place.free;
             return true;
@@ -3013,6 +3116,14 @@ bool ask_space(const std::string &destination, std::uint64_t *free)
     return false; // can't tell: the copy goes ahead
 }
 
+// Whether the drive a destination is on is unplugged (Internal storage never is).
+bool ask_drive_gone(const std::string &destination)
+{
+    if (drive_of(destination).empty())
+        return false;
+    return !drive_connected(ask_drives(), destination);
+}
+
 } // namespace
 
 // ---- Transfers ----
@@ -3021,6 +3132,7 @@ Transfers::Transfers() : shared_(std::make_shared<Shared>())
 {
     shared_->ui_cpu = current_cpu();
     shared_->space = ask_space;
+    shared_->drive_gone = ask_drive_gone;
 }
 
 Transfers::~Transfers()
@@ -3032,6 +3144,12 @@ void Transfers::set_space_check(SpaceCheck check)
 {
     std::lock_guard<std::mutex> hold(shared_->lock);
     shared_->space = std::move(check);
+}
+
+void Transfers::set_drive_check(DriveCheck check)
+{
+    std::lock_guard<std::mutex> hold(shared_->lock);
+    shared_->drive_gone = std::move(check);
 }
 
 void Transfers::load()
@@ -3310,6 +3428,9 @@ QueueStatus Transfers::queue() const
     QueueStatus status;
     status.state = shared_->state;
     status.message = shared_->message;
+    if (status.state == QueueState::paused && !shared_->queue.empty() &&
+        shared_->queue.front().plan.destination == shared_->drive_wait)
+        status.drive_wait = shared_->drive_wait;
     for (const Item &item : shared_->queue)
     {
         QueueEntry entry;

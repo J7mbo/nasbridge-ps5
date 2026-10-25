@@ -19,6 +19,11 @@ A native PS5 homebrew app to browse and install games from your NAS.
 - **Copies games to the PS5.** Queue as many as you like. The queue can be
   reordered, paused and resumed, and it picks up where it left off if
   NASBridge or the PS5 restarts. Free space is checked before each game.
+- **Also supports external drives plugged into the PS5 as a destination.**
+  Games go in the drive's `homebrew` folder, where ShadowMountPlus finds them.
+  Games on a drive show as installed while it's plugged in and disappear when
+  it's unplugged. If the drive is unplugged mid-copy, the queue pauses and
+  carries on by itself when it's plugged back in.
 - **Copies quickly.** Big files are fetched over several connections at once.
   Folders of thousands of small files go through a helper payload that
   fetches many at a time.

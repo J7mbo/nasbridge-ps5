@@ -21,12 +21,14 @@
 #include "concepts/storage.hpp"
 
 #include "concepts/connection.hpp"
-#include "concepts/file_calls.hpp"
+#include "concepts/copy_helper.hpp"
 #include "concepts/http.hpp"
 #include "concepts/json_scan.hpp"
 #include "concepts/smp.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <map>
 #include <cerrno>
 #include <cstdlib>
 #include <fcntl.h>
@@ -321,6 +323,8 @@ StorageSpace internal_storage()
     usb.total = 2000ull * 1000ull * 1000ull * 1000ull;
     usb.writable = 1;
     space.destinations = {internal, usb};
+    space.drives_known = true;
+    space.drives = {"/mnt/usb0"};
 #endif
     return space;
 }
@@ -333,7 +337,9 @@ namespace
 struct Mount
 {
     std::string point;
-    std::string path; // destinations only
+    std::string path;       // destinations only
+    std::string source;     // the device ("/dev/da0p2")
+    std::string filesystem; // "exfat", "msdosfs", ...
     std::uint64_t total = 0;
     std::uint64_t available = 0;
     bool read_only = false;
@@ -349,6 +355,8 @@ std::vector<Mount> json_mounts(const std::string &json, const char *key = "mount
                      Mount mount;
                      mount.point = json_text(from, to, "mount_point");
                      mount.path = json_text(from, to, "path");
+                     mount.source = json_text(from, to, "source");
+                     mount.filesystem = json_text(from, to, "filesystem");
                      mount.read_only = json_true(from, to, "read_only");
                      if (json_number(from, to, "total_bytes", &mount.total) &&
                          json_number(from, to, "available_bytes", &mount.available))
@@ -384,6 +392,44 @@ StorageSpace storage_from_json(const std::string &json)
         space.destinations.push_back(destination);
     }
     const std::vector<Mount> mounts = json_mounts(json);
+    // Every mount under /mnt, as it was listed (Debug info).
+    for (const Mount &mount : mounts)
+    {
+        if (mount.point.compare(0, 5, "/mnt/") != 0)
+            continue;
+        char line[256];
+        std::snprintf(line, sizeof(line), "%s  %s  %s  %.2f/%.2f GB%s", mount.point.c_str(),
+                      mount.filesystem.empty() ? "?" : mount.filesystem.c_str(),
+                      mount.source.empty() ? "?" : mount.source.c_str(),
+                      static_cast<double>(mount.available) / 1e9,
+                      static_cast<double>(mount.total) / 1e9, mount.read_only ? "  ro" : "");
+        space.mount_lines.push_back(line);
+    }
+    // The drives: what is mounted on /mnt/usbN and /mnt/extN, and the
+    // drives ShadowMountPlus lists folders on.
+    space.drives_known = true;
+    for (const Mount &mount : mounts)
+    {
+        if (mount.point.empty() || drive_of(mount.point) != mount.point)
+            continue;
+        if (std::find(space.drives.begin(), space.drives.end(), mount.point) != space.drives.end())
+            continue;
+        space.drives.push_back(mount.point);
+        DriveSpace drive;
+        drive.mount_point = mount.point;
+        drive.free = mount.available;
+        drive.total = mount.total;
+        drive.read_only = mount.read_only;
+        drive.source = mount.source;
+        space.drive_space.push_back(drive);
+    }
+    for (const Destination &destination : space.destinations)
+    {
+        const std::string drive = drive_of(destination.path);
+        if (!drive.empty() &&
+            std::find(space.drives.begin(), space.drives.end(), drive) == space.drives.end())
+            space.drives.push_back(drive);
+    }
     // The console's own storage, by the names it is mounted under.
     for (const char *wanted : {"/user", "/data", "/system_data/priv", "/"})
     {
@@ -444,6 +490,135 @@ StorageSpace shadowmount_storage()
     return storage_from_json(reply.body);
 }
 
+std::string drive_of(const std::string &path)
+{
+    static const char *const kDrives[] = {"/mnt/usb0", "/mnt/usb1", "/mnt/usb2", "/mnt/usb3",
+                                          "/mnt/usb4", "/mnt/usb5", "/mnt/usb6", "/mnt/usb7",
+                                          "/mnt/ext0", "/mnt/ext1"};
+    for (const char *drive : kDrives)
+    {
+        const std::size_t length = std::strlen(drive);
+        if (path.compare(0, length, drive) == 0 &&
+            (path.size() == length || path[length] == '/'))
+            return drive;
+    }
+    return "";
+}
+
+bool drive_connected(const StorageSpace &space, const std::string &path)
+{
+    const std::string drive = drive_of(path);
+    if (drive.empty() || !space.drives_known)
+        return true;
+    return std::find(space.drives.begin(), space.drives.end(), drive) != space.drives.end();
+}
+
+bool efi_type(const std::string &type)
+{
+    return type == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" || type == "mbr:ef";
+}
+
+std::string disk_of(const std::string &device)
+{
+    // da1p2 (GPT), da1s1 (MBR), da1s1a (a BSD slice): drop the partition part.
+    const auto digit = [](char c) { return c >= '0' && c <= '9'; };
+    std::size_t end = device.size();
+    if (end >= 2 && device[end - 1] >= 'a' && device[end - 1] <= 'h' && digit(device[end - 2]))
+        --end;
+    std::size_t start = end;
+    while (start > 0 && digit(device[start - 1]))
+        --start;
+    if (start == end || start < 2 || (device[start - 1] != 'p' && device[start - 1] != 's') ||
+        !digit(device[start - 2]))
+        return device;
+    return device.substr(0, start - 1);
+}
+
+namespace
+{
+
+// The drive's mount, as ShadowMountPlus listed it; null when it didn't.
+const DriveSpace *mount_of(const StorageSpace &space, const std::string &drive)
+{
+    for (const DriveSpace &mount : space.drive_space)
+        if (mount.mount_point == drive)
+            return &mount;
+    return nullptr;
+}
+
+// A drive whose partition table says it's an EFI System partition.
+bool efi_like(const StorageSpace &space, const std::string &drive)
+{
+    const DriveSpace *mount = mount_of(space, drive);
+    return mount != nullptr && mount->efi == 1;
+}
+
+} // namespace
+
+void merge_destinations(StorageSpace *space)
+{
+    std::vector<Destination> merged;
+    // Internal storage: ShadowMountPlus's numbers for it, or the console's.
+    Destination internal;
+    internal.path = kInternalGames;
+    internal.mount_point = "/data";
+    internal.free = space->known ? space->free : 0;
+    internal.total = space->known ? space->total : 0;
+    for (const Destination &listed : space->destinations)
+        if (listed.path == kInternalGames)
+            internal = listed;
+    merged.push_back(internal);
+    // One folder per drive: <drive>/homebrew, a folder ShadowMountPlus scans
+    // (made by the first copy when it isn't there yet).
+    std::vector<std::string> drives = space->drives;
+    if (!space->drives_known)
+    {
+        // Not known this time: the drives ShadowMountPlus listed folders on.
+        for (const Destination &listed : space->destinations)
+        {
+            const std::string drive = drive_of(listed.path);
+            if (!drive.empty() && std::find(drives.begin(), drives.end(), drive) == drives.end())
+                drives.push_back(drive);
+        }
+    }
+    std::sort(drives.begin(), drives.end(),
+              [](const std::string &a, const std::string &b)
+              {
+                  // USB drives first, then extended storage, each by number.
+                  const bool a_usb = a.compare(0, 8, "/mnt/usb") == 0;
+                  const bool b_usb = b.compare(0, 8, "/mnt/usb") == 0;
+                  return a_usb != b_usb ? a_usb : a < b;
+              });
+    for (const std::string &drive : drives)
+    {
+        Destination place;
+        place.path = drive + "/homebrew";
+        place.mount_point = drive;
+        for (const DriveSpace &mount : space->drive_space)
+            if (mount.mount_point == drive)
+            {
+                place.free = mount.free;
+                place.total = mount.total;
+                place.read_only = mount.read_only;
+            }
+        // ShadowMountPlus's own listing of the drive (or its homebrew folder)
+        // wins over the mount's numbers.
+        for (const Destination &listed : space->destinations)
+            if (listed.path == drive || listed.path == place.path)
+            {
+                place.free = listed.free;
+                place.total = listed.total;
+                place.read_only = listed.read_only;
+                if (!listed.mount_point.empty())
+                    place.mount_point = listed.mount_point;
+            }
+        if (efi_like(*space, drive))
+            continue;
+        merged.push_back(place);
+    }
+    space->destinations = std::move(merged);
+}
+
 std::string destination_name(const std::string &path)
 {
     if (path == "/data/homebrew" || path.rfind("/data/", 0) == 0 || path == "/data")
@@ -466,93 +641,6 @@ std::string destination_name(const std::string &path)
     return name.empty() ? path : name;
 }
 
-void check_destination(Destination *destination)
-{
-    destination->writable = 0;
-    if (destination->read_only)
-    {
-        destination->why = "read-only";
-        return;
-    }
-    std::string missing;
-    if (!file_calls_available(&missing))
-    {
-        destination->why = "no " + missing;
-        return;
-    }
-    const auto fail = [&](const char *step)
-    {
-        char text[48];
-        std::snprintf(text, sizeof(text), "%s e%d", step, errno);
-        destination->why = text;
-    };
-    // Laid out like a copy: a folder of NASBridge's, a file written in
-    // pieces, reopened to carry on, renamed when done, then removed.
-    const std::string folder = destination->path + "/.nasbridge-check";
-    const std::string part = folder + "/check.part";
-    const std::string done = folder + "/check.bin";
-    if (::mkdir(folder.c_str(), 0777) != 0 && errno != EEXIST)
-        return fail("folder");
-    int fd = ::open(part.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0666);
-    if (fd < 0)
-    {
-        fail("create");
-        ::rmdir(folder.c_str());
-        return;
-    }
-    std::vector<unsigned char> block(256 * 1024);
-    for (std::size_t i = 0; i < block.size(); ++i)
-        block[i] = static_cast<unsigned char>(i * 31u + 7u);
-    bool ok = true;
-    const char *step = nullptr;
-    for (int i = 0; i < 4 && ok; ++i)
-        if (::write(fd, block.data(), block.size()) != static_cast<ssize_t>(block.size()))
-            ok = false, step = "write";
-    if (ok && ::fsync(fd) != 0)
-        ok = false, step = "sync";
-    ::close(fd);
-    // Reopened as a resumed copy would: its size says where to carry on.
-    if (ok)
-    {
-        fd = ::open(part.c_str(), O_RDWR);
-        if (fd < 0)
-            ok = false, step = "reopen";
-        else
-        {
-            const off_t size = ::lseek(fd, 0, SEEK_END);
-            std::vector<unsigned char> back(block.size());
-            if (size != static_cast<off_t>(4 * block.size()))
-                ok = false, step = "size";
-            else if (::pread(fd, back.data(), back.size(), static_cast<off_t>(block.size())) !=
-                         static_cast<ssize_t>(back.size()) ||
-                     back != block)
-                ok = false, step = "read";
-            ::close(fd);
-        }
-    }
-    if (ok && ::rename(part.c_str(), done.c_str()) != 0)
-        ok = false, step = "rename";
-    if (!ok)
-        fail(step);
-    // Cleaning up must work too: a cancelled copy removes what it wrote.
-    const bool removed = ::unlink(ok ? done.c_str() : part.c_str()) == 0;
-    if (ok && !removed)
-    {
-        fail("remove");
-        ok = false;
-    }
-    if (::rmdir(folder.c_str()) != 0 && ok)
-    {
-        fail("remove folder");
-        ok = false;
-    }
-    if (ok)
-    {
-        destination->writable = 1;
-        destination->why.clear();
-    }
-}
-
 struct StorageWatcher::Shared
 {
     std::mutex lock;
@@ -565,6 +653,57 @@ struct StorageWatcher::Shared
 
 namespace
 {
+
+// What the copy helper said about a partition, and when it was asked.
+struct PartitionAnswer
+{
+    int efi = -1; // 1 EFI System, 0 another type, -1 couldn't tell
+    std::uint64_t asked_ms = 0;
+};
+
+// Asks the copy helper for the partition type of each drive that shares its
+// disk with another mounted partition (an EFI partition always does): once
+// per device while it stays mounted, or again after a minute when the helper
+// couldn't tell (busy with a copy, not started). Notes the answer on the
+// drive's Debug info line.
+void read_partition_types(StorageSpace *space, std::map<std::string, PartitionAnswer> *known)
+{
+    constexpr std::uint64_t kRetryMs = 60000;
+    std::map<std::string, PartitionAnswer> kept;
+    for (DriveSpace &mount : space->drive_space)
+    {
+        if (mount.source.empty() || disk_of(mount.source) == mount.source)
+            continue;
+        bool shared = false;
+        for (const DriveSpace &other : space->drive_space)
+            if (&other != &mount && !other.source.empty() &&
+                disk_of(other.source) == disk_of(mount.source))
+                shared = true;
+        if (!shared)
+            continue;
+        PartitionAnswer answer;
+        const auto found = known->find(mount.source);
+        if (found != known->end())
+            answer = found->second;
+        std::string note;
+        if (found == known->end() || (answer.efi < 0 && now_ms() - answer.asked_ms >= kRetryMs))
+        {
+            std::string why;
+            const std::string type = partition_type(mount.source, &why);
+            answer.efi = type.empty() ? -1 : efi_type(type) ? 1 : 0;
+            answer.asked_ms = now_ms();
+            note = type.empty() ? "type ? (" + why + ")" : "type " + type;
+        }
+        mount.efi = answer.efi;
+        kept[mount.source] = answer;
+        if (note.empty())
+            note = answer.efi == 1 ? "EFI System" : answer.efi == 0 ? "not EFI" : "type ?";
+        for (std::string &line : space->mount_lines)
+            if (line.compare(0, mount.mount_point.size() + 1, mount.mount_point + " ") == 0)
+                line += "  " + (answer.efi == 1 ? "EFI System (hidden)" : note);
+    }
+    *known = std::move(kept); // a device unplugged is asked again when it's back
+}
 
 void *watch(void *argument)
 {
@@ -588,21 +727,40 @@ void *watch(void *argument)
         }
     }
 #endif
-    std::vector<Destination> checked;
+    std::map<std::string, PartitionAnswer> partitions; // by device
     while (!shared->stop.load())
     {
         StorageSpace space = shadowmount_storage();
         if (!space.known)
         {
             const std::string why = space.how;
-            std::vector<Destination> destinations = std::move(space.destinations);
+            const StorageSpace answer = std::move(space);
             space = internal_storage();
             space.asked = true;
-            if (!destinations.empty())
-                space.destinations = std::move(destinations);
+            if (!answer.destinations.empty())
+                space.destinations = answer.destinations;
+            if (answer.drives_known)
+            {
+                space.drives_known = true;
+                space.drives = answer.drives;
+                space.drive_space = answer.drive_space;
+                space.mount_lines = answer.mount_lines;
+            }
             if (!space.known)
                 space.how = why + " | " + space.how;
         }
+        // The drives plugged in: ShadowMountPlus's mount table.
+        if (!space.drives_known)
+        {
+            // Nobody could tell this time: the last answer stands, so a
+            // drive doesn't seem unplugged while ShadowMountPlus is busy.
+            std::lock_guard<std::mutex> hold(shared->lock);
+            space.drives_known = shared->latest.drives_known;
+            space.drives = shared->latest.drives;
+            space.drive_space = shared->latest.drive_space;
+        }
+        read_partition_types(&space, &partitions);
+        merge_destinations(&space);
         // The games ShadowMountPlus knows. Kept from the last round when it
         // doesn't answer this time, so "On PS5" doesn't flicker.
         {
@@ -620,27 +778,15 @@ void *watch(void *argument)
                 space.games = shared->latest.games;
             }
         }
-        // Each folder is checked once while it stays listed (a drive plugged
-        // in again is checked again).
-        std::vector<Destination> seen;
+        // A folder takes copies when its drive isn't mounted read-only, as
+        // ShadowMountPlus decides for its own destinations. No test write:
+        // on a PS5 NASBridge's own watcher can't see /data or the drives
+        // ("folder e2") while its copies write there fine.
         for (Destination &destination : space.destinations)
         {
-            const Destination *before = nullptr;
-            for (const Destination &old : checked)
-                if (old.path == destination.path && old.mount_point == destination.mount_point)
-                    before = &old;
-            if (before != nullptr)
-            {
-                destination.writable = before->writable;
-                destination.why = before->why;
-            }
-            else if (destination.writable < 0 && !shared->stop.load())
-            {
-                check_destination(&destination);
-            }
-            seen.push_back(destination);
+            destination.writable = destination.read_only ? 0 : 1;
+            destination.why = destination.read_only ? "read-only" : "";
         }
-        checked = std::move(seen);
         {
             std::lock_guard<std::mutex> hold(shared->lock);
             shared->latest = space;

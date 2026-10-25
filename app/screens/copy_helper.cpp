@@ -8,6 +8,7 @@
 
 #include <arpa/inet.h>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -39,6 +40,8 @@ constexpr const char *kProto = "NBC1";
 constexpr const char *kBatchProto = "NBB1";
 constexpr const char *kSmbProto = "NBS1";      // one file over SMB
 constexpr const char *kSmbBatchProto = "NBT1"; // small files over SMB
+constexpr const char *kPartitionProto = "NBP1"; // a partition's type
+constexpr const char *kFileStepProto = "NBF1";  // a step on a drive's files
 constexpr int kStartMs = 20000;   // the loader can take a while to run it
 constexpr int kSilentMs = 90000;  // longer than the helper ever goes quiet
 
@@ -505,6 +508,69 @@ HelperBatch copy_smb_batch_with_helper(const std::string &ip, int port, int work
 bool copy_helper_enabled()
 {
     return !g_elf.empty();
+}
+
+std::string partition_type(const std::string &device, std::string *why)
+{
+    if (!copy_helper_enabled())
+    {
+        *why = "no copy helper";
+        return "";
+    }
+    std::string buffer;
+    const int fd = open_helper(&buffer);
+    if (fd < 0)
+    {
+        *why = "the copy helper didn't start";
+        return "";
+    }
+    const std::string job = std::string(kPartitionProto) + "\t" + device + "\n";
+    std::string line;
+    const bool answered = send_all(fd, job.data(), job.size()) && read_line(fd, &buffer, &line, 10000);
+    ::close(fd);
+    if (answered && line.compare(0, 2, "T ") == 0)
+        return line.substr(2);
+    *why = !answered ? "the copy helper didn't answer"
+           : line.compare(0, 4, "ERR ") == 0 ? line.substr(4)
+                                             : "an older copy helper";
+    return "";
+}
+
+int helper_file_step(const char *step, const std::string &path, const std::string &to,
+                     std::uint64_t *size, bool *folder)
+{
+    if (!copy_helper_enabled())
+        return ENOSYS;
+    std::string buffer;
+    const int fd = open_helper(&buffer);
+    if (fd < 0)
+        return EIO;
+    std::string job = std::string(kFileStepProto) + "\t" + step + "\t" + path;
+    if (!to.empty())
+        job += "\t" + to;
+    job += "\n";
+    std::string line;
+    const bool answered = send_all(fd, job.data(), job.size()) && read_line(fd, &buffer, &line, 30000);
+    ::close(fd);
+    if (!answered)
+        return EIO;
+    if (line.compare(0, 2, "OK") == 0)
+    {
+        unsigned long long bytes = 0;
+        char kind = 'f';
+        if (std::sscanf(line.c_str(), "OK %llu %c", &bytes, &kind) == 2)
+        {
+            if (size != nullptr)
+                *size = bytes;
+            if (folder != nullptr)
+                *folder = kind == 'd';
+        }
+        return 0;
+    }
+    int error = 0;
+    if (std::sscanf(line.c_str(), "ERR %d", &error) == 1 && error > 0)
+        return error;
+    return ENOSYS; // "ERR request ...": an older helper
 }
 
 void set_copy_helper(const std::string &elf_path, int loader_port, int helper_port)
