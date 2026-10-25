@@ -59,7 +59,7 @@ bool answered(const FtpFailure &failure)
     using Kind = FtpFailure::Kind;
     return failure.kind != Kind::address && failure.kind != Kind::connect &&
            failure.kind != Kind::refused && failure.kind != Kind::timeout &&
-           failure.kind != Kind::lost && failure.kind != Kind::passive;
+           failure.kind != Kind::lost; // passive: signed in, so it answered
 }
 
 template <typename Entry>

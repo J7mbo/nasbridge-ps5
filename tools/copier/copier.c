@@ -819,6 +819,7 @@ typedef struct fetcher {
   struct smb2_context *smb2; /* over SMB: this connection's sign-in, kept chunk to chunk */
   struct smb2fh *fh;
   ftp_t ftp; /* over FTP: the same */
+  int ftp_counted; /* in multi_t's ftp_up */
 } fetcher_t;
 
 static int smb_fetch_chunk(fetcher_t *f, uint64_t chunk, char *buf, size_t *got, char *why,
@@ -839,9 +840,7 @@ static void *fetcher_main(void *arg) {
     char why[160] = "";
     int rc = ftp_fetcher_start(f, why, sizeof why);
     pthread_mutex_lock(&j->mu);
-    if (rc == 0) {
-      ++m->ftp_up;
-    } else if (rc != 6 && !(rc == 8 && m->ftp_up > 0) && !m->net_err) {
+    if (rc != 0 && rc != 6 && !(rc == 8 && m->ftp_up > 0) && !m->net_err) {
       m->net_err = rc == 8 ? 1 : rc;
       snprintf(m->why, sizeof m->why, "%s", why);
     }
@@ -1696,6 +1695,11 @@ static int ftp_fetcher_start(fetcher_t *f, char *why, size_t why_size) {
   pthread_mutex_lock(&j->mu);
   j->nas[f->slot] = f->ftp.ctl; /* a stop cuts it off */
   rc = j->abort;
+  if (!rc && !f->ftp_counted) {
+    /* Counted under the same lock, so one turned away sees it's not alone. */
+    f->ftp_counted = 1;
+    ++m->ftp_up;
+  }
   pthread_mutex_unlock(&j->mu);
   return rc ? 6 : 0;
 }

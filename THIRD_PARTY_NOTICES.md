@@ -124,7 +124,8 @@ tests also build libsmb2 for the computer they run on, and run
 [Samba](https://www.samba.org/)'s `smbd` (GPL-3.0-or-later) with
 [nss_wrapper](https://cwrap.org/nss_wrapper.html) (BSD-3-Clause) from the
 toolchain image as their test NAS. The FTP tests run
-[pyftpdlib](https://github.com/giampaolo/pyftpdlib) (MIT) from the toolchain
+[pyftpdlib](https://github.com/giampaolo/pyftpdlib) (MIT; Copyright (c) 2007
+Giampaolo Rodola') from the toolchain
 image as theirs. NASBridge's FTP client is its own: no library.
 
 ## Disclaimer
