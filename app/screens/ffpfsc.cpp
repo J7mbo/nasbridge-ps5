@@ -17,6 +17,8 @@ namespace hui::concepts
 namespace
 {
 
+constexpr int kMaxAttempts = 16;
+
 bool ends_with_nocase(const std::string &text, const char *suffix)
 {
     const std::size_t n = std::strlen(suffix);
@@ -50,6 +52,7 @@ bool image_name(const std::string &name)
 
 bool FfpfscReader::open(std::string *why)
 {
+    attempts_ = 0;
     PfsReader outer(read_);
     if (!outer.open(why))
     {
@@ -79,6 +82,12 @@ bool FfpfscReader::open_container(PfsReader &container, int depth, std::string *
     std::string first_why;
     for (const PfsFile *file : candidates)
     {
+        if (++attempts_ > kMaxAttempts)
+        {
+            if (first_why.empty())
+                first_why = "the compressed image holds too many files to look through";
+            break;
+        }
         ReadAt inner;
         std::uint64_t length = 0;
         std::string problem;

@@ -57,6 +57,9 @@ class FfpfscReader
     bool open_inner(const ReadAt &inner, int depth, std::string *why);
 
     ReadAt read_;
+    // Files tried as the image inside, across every level: a real image has
+    // one, so a container listing thousands can't keep the library busy.
+    int attempts_ = 0;
     std::string format_;
     std::vector<std::string> names_;
     // The image inside, as whichever reader it needs, and its sce_sys.

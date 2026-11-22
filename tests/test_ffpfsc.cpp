@@ -189,6 +189,27 @@ void damaged(const std::string &fixtures)
         check(!opens(bad, &why), "a block that doesn't inflate is refused", why);
     }
 
+    // A decompressed length near 2^64 must not round to zero blocks and let
+    // a one-entry table through.
+    {
+        std::string pfsc_header(0x38, '\0');
+        const auto put = [&pfsc_header](std::size_t at, std::uint64_t value, int size)
+        {
+            for (int i = 0; i < size; ++i)
+                pfsc_header[at + static_cast<std::size_t>(i)] = static_cast<char>(value >> (8 * i));
+        };
+        put(0, 0x43534650, 4); // "PFSC"
+        put(0xc, 0x10000, 4);
+        put(0x10, 0x10000, 8);
+        put(0x18, 0x30, 8); // table
+        put(0x20, 0x38, 8); // data
+        put(0x30, 0x38, 8); // the only table entry
+        Image file;
+        file.data = pfsc_header;
+        PfscStream stream(file.reader(), 0, pfsc_header.size(), UINT64_MAX);
+        check(!stream.open(&why), "a decompressed length near 2^64 is refused", why);
+    }
+
     // Random damage where the structure is: the outer image's header, inodes
     // and folders (its first six 64 KiB blocks start with them) and the
     // container's header and block table.

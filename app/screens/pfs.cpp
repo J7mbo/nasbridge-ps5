@@ -107,16 +107,17 @@ bool PfscStream::open(std::string *why)
     }
     const unsigned char *h = bytes(header);
     const std::uint64_t data = u64(h + 0x20);
-    blocks_ = (length_ + kPfscBlock - 1) / kPfscBlock;
+    blocks_ = length_ / kPfscBlock + (length_ % kPfscBlock != 0); // no overflow near 2^64
     table_ = u64(h + 0x18);
     if (u32(h) != kPfscMagic || u32(h + 0xc) != kPfscBlock || u64(h + 0x10) != kPfscBlock)
     {
         *why = "the compressed image isn't a PFSC container with 64 KiB blocks";
         return false;
     }
-    if (u64(h + 0x28) < blocks_ * kPfscBlock || table_ < kPfscHeader ||
-        table_ > stored_ || (stored_ - table_) / 8 < blocks_ + 1 || table_ + (blocks_ + 1) * 8 > data ||
-        data > stored_)
+    // The table must fit the file before blocks_ is multiplied by anything.
+    if (table_ < kPfscHeader || table_ > stored_ || (stored_ - table_) / 8 < blocks_ + 1 ||
+        table_ + (blocks_ + 1) * 8 > data || data > stored_ ||
+        u64(h + 0x28) / kPfscBlock < blocks_)
     {
         *why = "the compressed image's block table doesn't fit it";
         return false;
