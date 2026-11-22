@@ -116,7 +116,10 @@ bool FfpfscReader::open_inner(const ReadAt &inner, int depth, std::string *why)
         return false;
     }
     const unsigned char *s = reinterpret_cast<const unsigned char *>(start.data());
-    const bool exfat = std::memcmp(s + 3, "EXFAT   ", 8) == 0 || (s[510] == 0x55 && s[511] == 0xaa);
+    const bool exfat_name = std::memcmp(s + 3, "EXFAT   ", 8) == 0;
+    // A boot signature alone could also start a UFS2 image (its first 64 KiB
+    // are free), so that case falls back to UFS2 when exFAT doesn't open.
+    const bool exfat = exfat_name || (s[510] == 0x55 && s[511] == 0xaa);
     std::uint64_t magic = 0;
     for (int i = 7; i >= 0; --i)
         magic = (magic << 8) | s[8 + i];
@@ -145,12 +148,21 @@ bool FfpfscReader::open_inner(const ReadAt &inner, int depth, std::string *why)
     {
         format_ = "exFAT";
         exfat_ = std::make_unique<ExfatReader>(inner);
-        if (!exfat_->open(why) || !exfat_->find_sce_sys(&exfat_files_, why))
+        std::string exfat_why;
+        if (exfat_->open(&exfat_why) && exfat_->find_sce_sys(&exfat_files_, &exfat_why))
+        {
+            for (const ExfatFile &file : exfat_files_)
+                if (!file.directory)
+                    names_.push_back(file.name);
+            return true;
+        }
+        exfat_.reset();
+        exfat_files_.clear();
+        if (exfat_name)
+        {
+            *why = exfat_why;
             return false;
-        for (const ExfatFile &file : exfat_files_)
-            if (!file.directory)
-                names_.push_back(file.name);
-        return true;
+        }
     }
     format_ = "UFS2";
     ufs2_ = std::make_unique<Ufs2Reader>(inner);

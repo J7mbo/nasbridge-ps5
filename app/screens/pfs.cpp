@@ -335,7 +335,7 @@ bool PfsReader::extent(std::uint32_t inode, Extent *out, std::string *why)
     }
     // One run of blocks from the first direct block: the later direct
     // blocks are -1 (or name the run's next blocks) and no indirect ones.
-    const std::uint64_t needed = size == 0 ? 1 : (size + block_size_ - 1) / block_size_;
+    const std::uint64_t needed = size == 0 ? 1 : size / block_size_ + (size % block_size_ != 0);
     bool run = first > 0 && count >= needed && static_cast<std::uint64_t>(first) < blocks_ &&
                needed <= blocks_ - static_cast<std::uint64_t>(first);
     for (int k = 1; k < 12 && run; ++k)
