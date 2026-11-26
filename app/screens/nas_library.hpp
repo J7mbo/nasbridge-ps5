@@ -9,9 +9,9 @@
 // games are read again (param.json for the name, title ID and version, the
 // cover, and the key art, all saved for next time). Folder sizes come last.
 //
-// Game folders have sce_sys in them (up to four folders down). .exfat images,
-// on their own or alone in a folder, are looked inside by reading parts of
-// them (exfat.cpp) without copying them. Folders with no game inside
+// Game folders have sce_sys in them (up to four folders down). Images (.exfat,
+// and compressed .ffpfsc), on their own or alone in a folder, are looked inside
+// by reading parts of them (exfat.cpp, ffpfsc.cpp) without copying them. Folders with no game inside
 // (backports, patches, empty folders) are left out. The NAS is read over
 // WebDAV or SMB, as the connection says (nas.hpp).
 //
@@ -35,15 +35,16 @@ namespace hui::concepts
 struct NasGame
 {
     std::string entry;    // the folder or file name on the NAS (the game's key)
-    bool image = false;   // an .exfat image (otherwise a game folder)
+    bool image = false;   // an .exfat or .ffpfsc image (otherwise a game folder)
     std::string title;    // from param.json, else the entry's name
     std::string title_id; // "PPSA01234", or "" when unknown
     std::string version;  // "01.000.000", or ""
     std::uint64_t size = 0; // bytes: the image, or everything in the folder
     bool size_known = false;
     std::string base;       // folder games: the sce_sys folder, under the games folder
-    std::string image_path; // image games: the .exfat file, under the games folder
-    // Image games, once their sce_sys was found inside the image:
+    std::string image_path; // image games: the image file, under the games folder
+    // Image games, once their sce_sys was found inside the image (for a
+    // .ffpfsc only the pictures' names: it is opened again to read them):
     bool inside = false;
     ExfatGeometry geometry;
     ExfatFile cover_file; // icon0.png (or pic0.png standing in); empty name: none

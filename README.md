@@ -15,7 +15,8 @@ A native PS5 homebrew app to browse and install games from your NAS.
 - **Browses your NAS over WebDAV or SMB**. Your games show up as a library with 
   their names, covers and
   sizes, read from each game's `sce_sys` folder. Game folders are found up to
-  four folders down, and `.exfat` images are read without downloading them.
+  four folders down, and `.exfat` and `.ffpfsc` images are read without
+  downloading them.
 - **Copies games to the PS5.** Queue as many as you like. The queue can be
   reordered, paused and resumed, and it picks up where it left off if
   NASBridge or the PS5 restarts. Free space is checked before each game.
@@ -124,6 +125,7 @@ Your NAS's games folder can hold:
 | A game folder | `Games/Astro Bot/sce_sys/...` |
 | A game folder nested inside others (up to 4 levels) | `Games/Astro Bot/dump/PPSA01234-app/sce_sys/...` |
 | An `.exfat` image, on its own or in a folder | `Games/Astro Bot.exfat` |
+| A compressed `.ffpfsc` image (holding an `.exfat`, `.ffpkg` or `.ffpfs`), on its own or in a folder | `Games/Astro Bot.ffpfsc` |
 
 NASBridge only reads from your NAS. It never changes or deletes anything there.
 
@@ -135,6 +137,10 @@ NASBridge only reads from your NAS. It never changes or deletes anything there.
 - **Copy speed depends on your NAS.** A NAS with a single spinning disk is
   slowest on folders of many small files. If copies make it struggle, lower
   the connection counts in Settings.
+- **`.ffpfsc` images are copied as they are.** They stay compressed on the
+  PS5, and ShadowMountPlus mounts them (its support for them is still
+  experimental). Images made by MkPFS and Dump Forge are read, with an
+  `.exfat`, `.ffpkg` or `.ffpfs` image inside.
 - **Patches and backports aren't copied.** For a game folder, NASBridge copies
   the folder holding `sce_sys`, and leaves out patch folders, archives and
   hidden files beside it.

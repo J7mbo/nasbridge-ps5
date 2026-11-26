@@ -48,7 +48,7 @@ std::vector<Listed> listed(const std::vector<Entry> &entries)
     return out;
 }
 
-// What the games folder holds: folders (possible game folders) and .exfat images.
+// What the games folder holds: folders (possible game folders) and images.
 ProbeResult describe_entries(const Connection &connection, const std::vector<Listed> &entries)
 {
     int folders = 0;
@@ -58,7 +58,7 @@ ProbeResult describe_entries(const Connection &connection, const std::vector<Lis
     {
         if (entry.folder)
             ++folders;
-        else if (ends_with_nocase(entry.name, ".exfat"))
+        else if (is_image_name(entry.name))
             ++images;
         else
             ++other;
@@ -69,7 +69,7 @@ ProbeResult describe_entries(const Connection &connection, const std::vector<Lis
     result.headline = "Connected";
     if (folders == 0 && images == 0)
         result.detail = other == 0 ? where + " is empty. Pick the folder your games are in."
-                                   : where + " has no folders or .exfat images, only " +
+                                   : where + " has no folders or game images, only " +
                                          plural(other, "other file", "other files") +
                                          ". Pick the folder your games are in.";
     else
@@ -220,8 +220,12 @@ bool count_in(const std::string &root, const std::vector<Listed> &top, const Lis
     {
         if (entry.folder)
             ++total;
-        else if (ends_with_nocase(entry.name, ".exfat"))
+        else if (is_image_name(entry.name))
+        {
             ++count->image_games;
+            if (is_compressed_image_name(entry.name))
+                ++count->compressed_games;
+        }
     }
     int done = 0;
     if (progress)
@@ -240,7 +244,7 @@ bool count_in(const std::string &root, const std::vector<Listed> &top, const Lis
         };
         std::vector<Folder> queue{{root + entry.name + "/", 0}};
         bool sce_sys = false;
-        bool image = false;
+        std::string image; // the first image found
         bool unreadable = false;
         int listings = 0;
         for (std::size_t next = 0; next < queue.size() && listings < kListings && !sce_sys;
@@ -257,7 +261,10 @@ bool count_in(const std::string &root, const std::vector<Listed> &top, const Lis
             for (const Listed &item : inside)
             {
                 if (!item.folder)
-                    image = image || ends_with_nocase(item.name, ".exfat");
+                {
+                    if (image.empty() && is_image_name(item.name))
+                        image = item.name;
+                }
                 else if (lowered(item.name) == "sce_sys")
                     sce_sys = true;
                 else if (folder.depth + 1 <= kDepth)
@@ -268,8 +275,12 @@ bool count_in(const std::string &root, const std::vector<Listed> &top, const Lis
             ++count->unreadable;
         else if (sce_sys)
             ++count->folder_games;
-        else if (image)
+        else if (!image.empty())
+        {
             ++count->image_games;
+            if (is_compressed_image_name(image))
+                ++count->compressed_games;
+        }
         else
             ++count->other_folders;
         if (progress)
@@ -279,6 +290,16 @@ bool count_in(const std::string &root, const std::vector<Listed> &top, const Lis
 }
 
 } // namespace
+
+bool is_image_name(const std::string &name)
+{
+    return ends_with_nocase(name, ".exfat") || is_compressed_image_name(name);
+}
+
+bool is_compressed_image_name(const std::string &name)
+{
+    return ends_with_nocase(name, ".ffpfsc");
+}
 
 std::string describe_count(const Connection &connection, const GameCount &count)
 {
@@ -292,13 +313,31 @@ std::string describe_count(const Connection &connection, const GameCount &count)
     else
     {
         text = "Found " + plural(games, "game", "games") + ": ";
-        if (count.folder_games > 0 && count.image_games > 0)
-            text += plural(count.folder_games, "folder game", "folder games") + " and " +
-                    plural(count.image_games, ".exfat game", ".exfat games");
+        const int exfat = count.image_games - count.compressed_games;
+        std::vector<std::string> kinds;
+        if (count.folder_games > 0)
+            kinds.push_back(plural(count.folder_games, "folder game", "folder games"));
+        if (exfat > 0)
+            kinds.push_back(plural(exfat, ".exfat game", ".exfat games"));
+        if (count.compressed_games > 0)
+            kinds.push_back(plural(count.compressed_games, ".ffpfsc game", ".ffpfsc games"));
+        if (kinds.size() > 1)
+        {
+            for (std::size_t i = 0; i < kinds.size(); ++i)
+                text += (i == 0 ? "" : i + 1 == kinds.size() ? " and " : ", ") + kinds[i];
+        }
         else if (count.folder_games > 0)
+        {
             text += count.folder_games == 1 ? "a folder game" : "all folder games";
+        }
+        else if (exfat > 0)
+        {
+            text += exfat == 1 ? "an .exfat game" : "all .exfat games";
+        }
         else
-            text += count.image_games == 1 ? "an .exfat game" : "all .exfat games";
+        {
+            text += count.compressed_games == 1 ? "a .ffpfsc game" : "all .ffpfsc games";
+        }
         text += ".";
     }
     if (count.other_folders > 0)

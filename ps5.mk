@@ -340,8 +340,17 @@ PICKER_SRCS := tests/test_folder_picker.cpp $(LIBSMB2_HOST) \
 HOST_COUNT := build/host/test_game_count
 COUNT_SRCS := tests/test_game_count.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,nas_probe.cpp http.cpp connection.cpp nas_library.cpp \
-    library_cache.cpp exfat.cpp png.cpp nas.cpp) \
+    library_cache.cpp exfat.cpp pfs.cpp ufs2.cpp ffpfsc.cpp png.cpp nas.cpp) \
   $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
+
+# Compressed images (.ffpfsc): the readers on images made by MkPFS and Dump
+# Forge (tests/fixtures, unpacked first), damaged ones, and the library.
+HOST_FFPFSC := build/host/test_ffpfsc
+FFPFSC_SRCS := tests/test_ffpfsc.cpp $(LIBSMB2_HOST) \
+  $(addprefix $(APP_WORK)/src/concepts/,nas_probe.cpp http.cpp connection.cpp nas_library.cpp \
+    library_cache.cpp exfat.cpp pfs.cpp ufs2.cpp ffpfsc.cpp png.cpp nas.cpp) \
+  $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
+FFPFSC_FIXTURES := build/host/ffpfsc-fixtures
 
 # The Connection screen's lock while a copy needs its settings.
 HOST_LOCK := build/host/test_connection_lock
@@ -384,9 +393,9 @@ SMB_SRCS := tests/test_smb.cpp $(LIBSMB2_HOST) $(APP_WORK)/src/concepts/connecti
 # (tests/smb_server.py), through the copy helper as well as in-app.
 HOST_SMB_NAS := build/host/test_smb_nas
 SMB_NAS_SRCS := tests/test_smb_nas.cpp $(LIBSMB2_HOST) \
-  $(addprefix $(APP_WORK)/src/concepts/,nas.cpp nas_library.cpp library_cache.cpp exfat.cpp png.cpp \
-    nas_probe.cpp http.cpp connection.cpp transfer.cpp copy_helper.cpp delete_helper.cpp \
-    file_calls.cpp smp.cpp json_scan.cpp notify.cpp storage.cpp) \
+  $(addprefix $(APP_WORK)/src/concepts/,nas.cpp nas_library.cpp library_cache.cpp exfat.cpp pfs.cpp \
+    ufs2.cpp ffpfsc.cpp png.cpp nas_probe.cpp http.cpp connection.cpp transfer.cpp copy_helper.cpp \
+    delete_helper.cpp file_calls.cpp smp.cpp json_scan.cpp notify.cpp storage.cpp) \
   $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
 
 HOST_DELETE := build/host/test_delete
@@ -396,12 +405,13 @@ DELETE_SRCS := tests/test_delete.cpp \
 $(HOST_TRANSFER): $(call host_objs,$(TRANSFER_SRCS))
 $(HOST_PICKER): $(call host_objs,$(PICKER_SRCS))
 $(HOST_COUNT): $(call host_objs,$(COUNT_SRCS))
+$(HOST_FFPFSC): $(call host_objs,$(FFPFSC_SRCS))
 $(HOST_LOCK): $(call host_objs,$(LOCK_SRCS))
 $(HOST_QUEUE): $(call host_objs,$(QUEUE_SRCS))
 $(HOST_DELETE): $(call host_objs,$(DELETE_SRCS))
 $(HOST_SMB): $(call host_objs,$(SMB_SRCS))
 $(HOST_SMB_NAS): $(call host_objs,$(SMB_NAS_SRCS))
-$(HOST_TRANSFER) $(HOST_PICKER) $(HOST_COUNT) $(HOST_LOCK) $(HOST_QUEUE) $(HOST_DELETE) $(HOST_SMB) \
+$(HOST_TRANSFER) $(HOST_PICKER) $(HOST_COUNT) $(HOST_FFPFSC) $(HOST_LOCK) $(HOST_QUEUE) $(HOST_DELETE) $(HOST_SMB) \
   $(HOST_SMB_NAS):
 	@mkdir -p $(@D)
 	clang++-18 -o $@ $^ -lpthread
@@ -412,8 +422,8 @@ $(HOST_TRANSFER) $(HOST_PICKER) $(HOST_COUNT) $(HOST_LOCK) $(HOST_QUEUE) $(HOST_
 # The transfer suite, the longest, runs as three parts at once (its own ports
 # and work folder each): run-transfer runs all three.
 TRANSFER_PARTS := run-transfer-1 run-transfer-2 run-transfer-3
-HOST_RUNS := run-installer run-release $(TRANSFER_PARTS) run-picker run-count run-lock run-queue run-delete \
-  run-smb run-smb-nas
+HOST_RUNS := run-installer run-release $(TRANSFER_PARTS) run-picker run-count run-ffpfsc run-lock \
+  run-queue run-delete run-smb run-smb-nas
 .PHONY: $(HOST_RUNS) run-transfer
 run-installer: selftest $(HOST_INSTALLER)
 	python3 -u tests/test_installer.py
@@ -426,6 +436,11 @@ run-picker: $(HOST_PICKER)
 	$(HOST_PICKER) build/host/picker-test
 run-count: $(HOST_COUNT)
 	$(HOST_COUNT) build/host/count-test
+run-ffpfsc: $(HOST_FFPFSC)
+	@rm -rf $(FFPFSC_FIXTURES) && mkdir -p $(FFPFSC_FIXTURES)
+	@cp tests/fixtures/ffpfsc-sce_sys.txt $(FFPFSC_FIXTURES)/
+	@for f in tests/fixtures/*.ffpfsc.gz; do gzip -dc $$f > $(FFPFSC_FIXTURES)/$$(basename $$f .gz); done
+	$(HOST_FFPFSC) build/host/ffpfsc-test $(FFPFSC_FIXTURES)
 run-lock: $(HOST_LOCK)
 	cd build/host && ./test_connection_lock
 run-queue: $(HOST_QUEUE)

@@ -8,7 +8,7 @@
 //   - Library: a header and a grid of square covers over the waves backdrop,
 //     whose colours ease toward the focused game's cover. Game folders show
 //     their sce_sys/icon0.png and the name from sce_sys/param.json as they
-//     arrive; .exfat images show their file name for now.
+//     arrive; images (.exfat, .ffpfsc) the same, read from inside them.
 //   - Filter tabs (L2 / R2): every game, the ones not on the PS5 yet, and the
 //     installed ones (NASBridge can't check the PS5 yet: everything counts as
 //     not installed).
@@ -30,6 +30,7 @@
 #include "concepts/keep_awake.hpp"
 #include "concepts/library_cache.hpp"
 #include "concepts/nas_library.hpp"
+#include "concepts/nas_probe.hpp"
 #include "concepts/notify.hpp"
 #include "concepts/queue_panel.hpp"
 #include "concepts/storage.hpp"
@@ -887,7 +888,9 @@ class Library final : public app::Concept
     {
         Game game;
         game.title = found.title;
-        game.format = found.image ? "exFAT image" : "Game folder";
+        game.format = !found.image                              ? "Game folder"
+                      : is_compressed_image_name(found.image_path) ? "ffpfsc image"
+                                                                   : "exFAT image";
         game.label = game.format;
         game.title_id = found.title_id;
         game.version = found.version;
@@ -1810,8 +1813,8 @@ class Library final : public app::Concept
             if (games_.empty())
             {
                 headline = "No games here yet";
-                detail = "Put game folders or .exfat images in " + connection_.connection().folder +
-                         " on your NAS.";
+                detail = "Put game folders or game images (.exfat, .ffpfsc) in " +
+                         connection_.connection().folder + " on your NAS.";
             }
             else if (filter_ == kInstalled)
             {
