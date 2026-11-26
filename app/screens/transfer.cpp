@@ -2649,9 +2649,12 @@ void run_queue(const SharedPtr &shared)
 
         // Before each game: is there still room for what it needs? (Something
         // else may have filled the drive since it was queued.)
+        // A package the PS5's installer has started on already has its room:
+        // the installer sets aside the whole game when it starts.
         std::uint64_t free = 0;
         const std::uint64_t need = head.size() > head.done ? head.size() - head.done : 0;
-        if (shared->space && shared->space(head.plan.destination, &free) && need > free)
+        const bool reserved = head.plan.package && head.done > 0;
+        if (!reserved && shared->space && shared->space(head.plan.destination, &free) && need > free)
         {
             char text[200];
             std::snprintf(text, sizeof(text),
