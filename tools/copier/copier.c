@@ -2558,12 +2558,14 @@ static int system_install(const char *uri, const char *title, char *content_id, 
   appinst_init_t inst_init;
   appinst_install_t install;
   int rc;
+  install_log("loading the user service");
   user_h = dlopen("/system/common/lib/libSceUserService.sprx", RTLD_LAZY);
+  install_log("user service %s", user_h ? "loaded" : "NOT loaded");
   if (user_h) {
     user_init_t user_init = (user_init_t)dlsym(user_h, "sceUserServiceInitialize");
-    if (user_init) user_init(NULL);
+    if (user_init) install_log("user service init returned 0x%08X", (unsigned)user_init(NULL));
   }
-  install_log("user service %s", user_h ? "loaded" : "NOT loaded");
+  install_log("loading AppInstUtil");
   inst_h = dlopen("/system/common/lib/libSceAppInstUtil.sprx", RTLD_LAZY);
   install_log("AppInstUtil %s", inst_h ? "loaded" : "NOT loaded");
   if (!inst_h) return -1;
@@ -2705,6 +2707,62 @@ static int system_status(const char *content_id, appinst_status_t *st) {
 }
 #endif
 
+/* The installer's calls run on a thread of their own with a big stack (the
+ * system modules' start code can need far more than THREAD_STACK), watched:
+ * one that never returns can't keep the helper from answering. */
+#define CALL_STACK (8u << 20)
+#define CALL_WAIT_S 60
+static struct {
+  pthread_mutex_t mu;
+  int done, rc;
+  char uri[128], content_id[64];
+} g_call = {PTHREAD_MUTEX_INITIALIZER, 0, 0, "", ""};
+
+static void *call_main(void *arg) {
+  char content_id[64] = "";
+  int rc;
+  (void)arg;
+  rc = system_install(g_call.uri, g_inst.title, content_id, sizeof content_id);
+  pthread_mutex_lock(&g_call.mu);
+  g_call.rc = rc;
+  snprintf(g_call.content_id, sizeof g_call.content_id, "%s", content_id);
+  g_call.done = 1;
+  pthread_mutex_unlock(&g_call.mu);
+  return NULL;
+}
+
+/* system_install, given CALL_WAIT_S: 0/-1/code as it, or -2 when it didn't
+ * come back in time. */
+static int watched_install(const char *uri, char *content_id, size_t size) {
+  pthread_attr_t attr;
+  pthread_t t;
+  int k, rc = -2, made;
+  pthread_mutex_lock(&g_call.mu);
+  g_call.done = 0;
+  snprintf(g_call.uri, sizeof g_call.uri, "%s", uri);
+  pthread_mutex_unlock(&g_call.mu);
+  if (pthread_attr_init(&attr) != 0) return -1;
+  (void)pthread_attr_setstacksize(&attr, CALL_STACK);
+  made = pthread_create(&t, &attr, call_main, NULL);
+  pthread_attr_destroy(&attr);
+  if (made != 0) return -1;
+  pthread_detach(t);
+  for (k = 0; k < CALL_WAIT_S * 10; ++k) {
+    int done;
+    pthread_mutex_lock(&g_call.mu);
+    done = g_call.done;
+    if (done) {
+      rc = g_call.rc;
+      snprintf(content_id, size, "%s", g_call.content_id);
+    }
+    pthread_mutex_unlock(&g_call.mu);
+    if (done) break;
+    if (install_stopping()) break;
+    sleep_ms(100);
+  }
+  return rc;
+}
+
 /* Tells NASBridge (while it's there) or the PS5's notifications. */
 static void install_report(int done, const char *fmt, ...) {
   char text[600];
@@ -2764,9 +2822,12 @@ static void *install_main(void *arg) {
   pthread_mutex_unlock(&g_inst.mu);
   install_log("---- install of \"%s\" (%llu bytes), served at %s", g_inst.title,
               (unsigned long long)g_inst.size, uri);
-  rc = have_acceptor ? system_install(uri, g_inst.title, content_id, sizeof content_id) : -1;
+  rc = have_acceptor ? watched_install(uri, content_id, sizeof content_id) : -1;
   if (rc != 0) {
-    if (rc == -1)
+    if (rc == -2) {
+      install_log("the installer's calls didn't come back in %d s", CALL_WAIT_S);
+      install_report(1, "ERR install the PS5's installer didn't answer (see /data/nasbridge-install.log)");
+    } else if (rc == -1)
       install_report(1, "ERR install the PS5's installer couldn't be loaded");
     else
       install_report(1, "ERR install the PS5's installer refused it (code 0x%08X)", (unsigned)rc);
@@ -2894,6 +2955,12 @@ static int run_install(int ctl, char *line) {
     return 0;
   }
   pthread_mutex_lock(&g_inst.mu);
+  /* One that has ended (stop set) is only tidying up: give it a moment. */
+  for (k = 0; k < 100 && g_inst.active && g_inst.stop; ++k) {
+    pthread_mutex_unlock(&g_inst.mu);
+    sleep_ms(100);
+    pthread_mutex_lock(&g_inst.mu);
+  }
   if (g_inst.active) {
     pthread_mutex_unlock(&g_inst.mu);
     send_line(ctl, "ERR busy another install is running");
