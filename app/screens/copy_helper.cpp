@@ -43,6 +43,7 @@ constexpr const char *kSmbBatchProto = "NBT1"; // small files over SMB
 constexpr const char *kPartitionProto = "NBP1"; // a partition's type
 constexpr const char *kFileStepProto = "NBF1";  // a step on a drive's files
 constexpr const char *kInstallProto = "NBK1";   // installing a package
+constexpr const char *kQuitProto = "NBX1";      // a helper from before: make way
 constexpr int kStartMs = 20000;   // the loader can take a while to run it
 constexpr int kSilentMs = 90000;  // longer than the helper ever goes quiet
 
@@ -151,6 +152,29 @@ std::string helper_start_why()
                           : "the copy helper didn't start";
 }
 
+// Whether this run of NASBridge has asked a helper left from earlier (maybe
+// another build's) to make way for its own.
+bool g_replaced = false;
+
+// Asks the helper on fd to leave once idle ("NBX1"), and waits for its port
+// to come free. An older helper doesn't know the request and stays.
+void replace_helper(int fd, std::string *buffer)
+{
+    const std::string job = std::string(kQuitProto) + "\n";
+    std::string line;
+    const bool left = send_all(fd, job.data(), job.size()) && read_line(fd, buffer, &line, 3000) &&
+                      line == "OK";
+    ::close(fd);
+    for (int waited = 0; left && waited < 3000; waited += 100)
+    {
+        const int again = connect_local(g_helper_port, 1);
+        if (again < 0)
+            return;
+        ::close(again);
+        sleep_ms(100);
+    }
+}
+
 int open_helper(std::string *buffer, const std::function<bool()> &stopping = nullptr)
 {
     std::lock_guard<std::mutex> hold(g_launch);
@@ -158,8 +182,10 @@ int open_helper(std::string *buffer, const std::function<bool()> &stopping = nul
     for (int attempt = 0; attempt < 2; ++attempt)
     {
         int fd = connect_local(g_helper_port, 10);
+        bool launched = false;
         if (fd < 0)
         {
+            launched = true;
             if (!send_payload())
                 return -1;
             for (int waited = 0; waited < kStartMs && fd < 0; waited += 200)
@@ -175,7 +201,18 @@ int open_helper(std::string *buffer, const std::function<bool()> &stopping = nul
         buffer->clear();
         std::string line;
         if (read_line(fd, buffer, &line, 10000) && line == kProto)
-            return fd;
+        {
+            if (g_replaced || launched)
+            {
+                g_replaced = true;
+                return fd;
+            }
+            // One left from before this run of NASBridge: make way for ours.
+            g_replaced = true;
+            replace_helper(fd, buffer);
+            --attempt;
+            continue;
+        }
         t_helper_stuck = line.empty();
         // A helper that was just leaving (idle), or another version: once more.
         ::close(fd);

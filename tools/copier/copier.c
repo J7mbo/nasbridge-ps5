@@ -2003,6 +2003,11 @@ out:
 /* ------------------------------------------------- a partition's type */
 
 #define PART_PROTO "NBP1"
+/* "NBX1": NASBridge, starting, asks a helper left from earlier to make way
+ * (it may be another build); "OK" and it leaves once this job ends, unless an
+ * install is still running. */
+#define QUIT_PROTO "NBX1"
+static volatile int g_quit;
 
 /* The disk and the partition number of "/dev/da1p2" (GPT, 'p') or
  * "/dev/da1s1" (MBR, 's'); 0 when it isn't one. */
@@ -2217,9 +2222,14 @@ static void install_log(const char *fmt, ...) {
 #define MAX_TITLE 512
 #define MAX_SERVED 16        /* the installer's connections at once */
 
+/* The six pointers everyone publishes, then the 8 bytes the installer also
+ * reads (0 for a plain install) and zeroed room (as ps5upload's MetaInfo). */
 typedef struct {
   const char *uri, *ex_uri, *playgo_scenario_id, *content_id, *content_name, *icon_url;
+  uint64_t unknown_30;
+  uint64_t reserved[7];
 } appinst_meta_t;
+_Static_assert(sizeof(appinst_meta_t) == 0x70, "the install request's zeroed tail");
 typedef struct {
   char content_id[48];
   int type;
@@ -2231,25 +2241,6 @@ typedef struct {
   char content_ids[64][48];
   unsigned char unknown[6480];
 } appinst_playgo_t;
-typedef struct {
-  int32_t error_code;
-  int32_t version;
-  char description[512];
-  char type[9];
-} appinst_error_t;
-typedef struct {
-  char status[16];
-  char src_type[8];
-  uint32_t remain_time;
-  uint64_t downloaded_size;
-  uint64_t initial_chunk_size;
-  uint64_t total_size;
-  uint32_t promote_progress;
-  appinst_error_t error_info;
-  int32_t local_copy_percent;
-  bool is_copy_only;
-  unsigned char spare[1024]; /* room, in case a firmware's is longer */
-} appinst_status_t;
 
 static struct install {
   pthread_mutex_t mu;
@@ -2270,8 +2261,33 @@ static struct install {
   int conns[MAX_SERVED]; /* the installer's connections, to cut off on a stop */
   uint64_t served;       /* bytes sent to the installer */
   uint64_t last_asked;   /* when it last asked for anything (ms) */
+  unsigned char *blocks; /* which COVER_BLOCK pieces it has been sent in full */
+  uint64_t covered;      /* bytes in those pieces: the package as far as it has it */
+  int lingering;         /* done, only still serving: a new install may end it */
 } g_inst = {PTHREAD_MUTEX_INITIALIZER, 0, 0, -1, "", 0, 0, 0, NULL, 0, {0}, "", "", -1, 0,
-            {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1}, 0, 0};
+            {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1}, 0, 0, NULL, 0, 0};
+
+#define COVER_BLOCK (1ull << 20)
+
+/* The installer has been sent [from, to] in full: count the pieces that
+ * covers (each once, however often it asks again). */
+static void install_covered(uint64_t from, uint64_t to) {
+  uint64_t b, first = (from + COVER_BLOCK - 1) / COVER_BLOCK, last;
+  if (to + 1 >= g_inst.size)
+    last = (g_inst.size - 1) / COVER_BLOCK; /* the last piece may be short */
+  else if (to + 1 < COVER_BLOCK)
+    return;
+  else
+    last = (to + 1) / COVER_BLOCK - 1;
+  pthread_mutex_lock(&g_inst.mu);
+  for (b = first; g_inst.blocks && b <= last; ++b) {
+    if (g_inst.blocks[b / 8] & (1u << (b % 8))) continue;
+    g_inst.blocks[b / 8] |= (unsigned char)(1u << (b % 8));
+    g_inst.covered += b == (g_inst.size - 1) / COVER_BLOCK ? g_inst.size - b * COVER_BLOCK
+                                                           : COVER_BLOCK;
+  }
+  pthread_mutex_unlock(&g_inst.mu);
+}
 
 static int install_active(void) {
   int active;
@@ -2505,6 +2521,7 @@ static void *serve_main(void *arg) {
                      date, (unsigned long long)g_inst.size, keep ? "keep-alive" : "close");
       if (send_all(fd, line, (size_t)n) != 0) break;
       if (get && serve_bytes(fd, &s, from, to) != 0) break;
+      if (get) install_covered(from, to);
     }
     if (!keep) break;
   }
@@ -2539,41 +2556,87 @@ static void *accept_main(void *arg) {
   return NULL;
 }
 
-/* ---- the system installer ---- */
+/* ---- the system installer ----
+ *
+ * As ps5upload's installer daemon does it on 13.60 (phantomptr/ps5upload,
+ * payload/installer: sony.c, escalate.c, main.c), which serves a package to
+ * the installer from the console the same way:
+ *  - the system install authid (0x4801000000000013) for the calls, not ours;
+ *  - sceAppInstUtilInitialize once, and no sceUserServiceInitialize (in this
+ *    helper that one never came back);
+ *  - the install request's 8 bytes after icon_url zero (the installer reads
+ *    them: anything else takes the patch path or is refused, 0x80B2116F);
+ *  - no status calls: the install is done once the installer has fetched
+ *    every byte, and has failed once it asks for nothing for a while;
+ *  - a call that never returns ends the helper (nothing else frees it), so
+ *    NASBridge starts a fresh one next time.
+ */
+
+#define INSTALL_AUTHID 0x4801000000000013ull
+#define CALL_WAIT_S 60       /* a Sony call taking longer is stuck */
+#define INSTALL_LINGER_S 60  /* after the last byte, still served this long */
+
+static volatile uint64_t g_call_since; /* when the running Sony call began (ms), 0: none */
+static volatile int g_main_srv = -1;   /* the helper's own port, for the watchdog */
+
+static void call_begin(void) { __atomic_store_n(&g_call_since, now_ms(), __ATOMIC_RELEASE); }
+static void call_end(void) { __atomic_store_n(&g_call_since, 0, __ATOMIC_RELEASE); }
+
+/* Ends the helper when a Sony call has hung: its thread can't be stopped, and
+ * holds what the next call would need. Closes the ports first (_exit can wait
+ * on the stuck thread), so a fresh helper can have them. */
+static void *watchdog_main(void *arg) {
+  (void)arg;
+  for (;;) {
+    uint64_t since = __atomic_load_n(&g_call_since, __ATOMIC_ACQUIRE);
+    if (since && now_ms() - since > CALL_WAIT_S * 1000ull) {
+      int ctl = g_inst.ctl;
+      install_log("---- a call to the installer didn't come back in %d s: leaving", CALL_WAIT_S);
+      if (ctl >= 0) send_line(ctl, "ERR install the PS5's installer didn't answer");
+      if (g_main_srv >= 0) close(g_main_srv);
+      if (g_inst.srv >= 0) close(g_inst.srv);
+      _exit(3);
+    }
+    sleep_ms(1000);
+  }
+  return NULL;
+}
 
 #ifndef COPIER_HOST_TEST
 typedef int (*appinst_init_t)(void);
-typedef int (*appinst_install_t)(const appinst_meta_t *, appinst_pkg_t *, appinst_playgo_t *);
-typedef int (*appinst_status_fn_t)(const char *, appinst_status_t *);
-static appinst_status_fn_t g_status_fn;
+typedef int (*appinst_install_t)(appinst_meta_t *, appinst_pkg_t *, appinst_playgo_t *);
 
-/* Asks the installer for the package at `uri`. 0 with the content ID, or
+/* Asks the installer for the package at `uri`: 0, -1 (couldn't load it) or
  * the installer's code. */
-static int system_install(const char *uri, const char *title, char *content_id, size_t size) {
+static int system_install(const char *uri, const char *title) {
+  static int ready, init_rc = -1;
+  static appinst_install_t install;
   static appinst_meta_t meta;
   static appinst_pkg_t info;
   static appinst_playgo_t playgo; /* kept: the installer may read them later */
-  void *user_h, *inst_h;
-  appinst_init_t inst_init;
-  appinst_install_t install;
+  uint64_t saved;
   int rc;
-  /* The user service is loaded but not started: in the helper,
-   * sceUserServiceInitialize never came back (2026-11-26, 13.60), and
-   * AppInstUtil is tried without it. */
-  install_log("loading the user service (not starting it)");
-  user_h = dlopen("/system/common/lib/libSceUserService.sprx", RTLD_LAZY);
-  install_log("user service %s", user_h ? "loaded" : "NOT loaded");
-  install_log("loading AppInstUtil");
-  inst_h = dlopen("/system/common/lib/libSceAppInstUtil.sprx", RTLD_LAZY);
-  install_log("AppInstUtil %s", inst_h ? "loaded" : "NOT loaded");
-  if (!inst_h) return -1;
-  inst_init = (appinst_init_t)dlsym(inst_h, "sceAppInstUtilInitialize");
-  install = (appinst_install_t)dlsym(inst_h, "sceAppInstUtilInstallByPackage");
-  g_status_fn = (appinst_status_fn_t)dlsym(inst_h, "sceAppInstUtilGetInstallStatus");
-  install_log("init %p, install %p, status %p", (void *)inst_init, (void *)install,
-              (void *)g_status_fn);
-  if (!install || !g_status_fn) return -1;
-  if (inst_init) install_log("init returned 0x%08X", (unsigned)inst_init());
+  if (!ready) {
+    void *inst_h = dlopen("/system/common/lib/libSceAppInstUtil.sprx", RTLD_LAZY);
+    appinst_init_t inst_init;
+    install_log("AppInstUtil %s", inst_h ? "loaded" : "NOT loaded");
+    if (!inst_h) return -1;
+    inst_init = (appinst_init_t)dlsym(inst_h, "sceAppInstUtilInitialize");
+    install = (appinst_install_t)dlsym(inst_h, "sceAppInstUtilInstallByPackage");
+    if (!inst_init || !install) {
+      install_log("AppInstUtil's calls not found (init %p, install %p)", (void *)inst_init,
+                  (void *)install);
+      return -1;
+    }
+    saved = kernel_get_ucred_authid(getpid());
+    kernel_set_ucred_authid(getpid(), INSTALL_AUTHID);
+    call_begin();
+    init_rc = inst_init();
+    call_end();
+    kernel_set_ucred_authid(getpid(), saved);
+    install_log("init returned 0x%08X", (unsigned)init_rc);
+    ready = 1;
+  }
   memset(&meta, 0, sizeof meta);
   memset(&info, 0, sizeof info);
   memset(&playgo, 0, sizeof playgo);
@@ -2583,31 +2646,22 @@ static int system_install(const char *uri, const char *title, char *content_id, 
   meta.content_id = "";
   meta.content_name = title;
   meta.icon_url = "";
-  install_log("asking the installer for %s (\"%s\")", uri, title);
+  install_log("asking the installer for %s", uri);
+  saved = kernel_get_ucred_authid(getpid());
+  kernel_set_ucred_authid(getpid(), INSTALL_AUTHID);
+  call_begin();
   rc = install(&meta, &info, &playgo);
+  call_end();
+  kernel_set_ucred_authid(getpid(), saved);
   info.content_id[sizeof info.content_id - 1] = '\0';
-  install_log("install returned 0x%08X, content id \"%s\", type %d, platform %d", (unsigned)rc,
-              info.content_id, info.type, info.platform);
-  snprintf(content_id, size, "%s", info.content_id);
+  install_log("install returned 0x%08X, content id \"%s\"", (unsigned)rc, info.content_id);
   return rc;
-}
-
-static int system_status(const char *content_id, appinst_status_t *st) {
-  memset(st, 0, sizeof *st);
-  return g_status_fn ? g_status_fn(content_id, st) : -1;
 }
 #else
 /* Tests: a stand-in installer that reads the package from the server as the
  * PS5's does (its first 64 KiB, the .crc, then 16 MiB ranges over one
  * keep-alive connection) into $NB_TEST_PREFIX/installed.pkg.
  * $NB_TEST_PREFIX/install_refused makes the install call fail. */
-static struct {
-  pthread_mutex_t mu;
-  uint64_t downloaded;
-  int state; /* 0 going, 1 done, -1 failed */
-  char uri[256];
-} g_sim = {PTHREAD_MUTEX_INITIALIZER, 0, 0, ""};
-
 static int sim_get(int fd, const char *path, uint64_t from, uint64_t to, FILE *out, int *status) {
   char req[600], head[MAX_HEADER + 1], *buf;
   size_t hlen, body_at;
@@ -2632,9 +2686,6 @@ static int sim_get(int fd, const char *path, uint64_t from, uint64_t to, FILE *o
     if (got <= 0) break;
     if (out) fwrite(buf, 1, (size_t)got, out);
     left -= (uint64_t)got;
-    pthread_mutex_lock(&g_sim.mu);
-    if (out) g_sim.downloaded += (uint64_t)got;
-    pthread_mutex_unlock(&g_sim.mu);
   }
   free(buf);
   return left == 0 ? 0 : -1;
@@ -2669,97 +2720,24 @@ static void *sim_main(void *arg) {
   }
   if (out) fclose(out);
   if (fd >= 0) close(fd);
-  pthread_mutex_lock(&g_sim.mu);
-  g_sim.state = ok ? 1 : -1;
-  pthread_mutex_unlock(&g_sim.mu);
   return NULL;
 }
 
-static int system_install(const char *uri, const char *title, char *content_id, size_t size) {
+static int system_install(const char *uri, const char *title) {
   const char *prefix = getenv("NB_TEST_PREFIX");
   char flag[600];
   pthread_t t;
+  (void)uri;
   (void)title;
   snprintf(flag, sizeof flag, "%s/install_refused", prefix ? prefix : "");
+  call_begin(); /* as the PS5's calls are watched */
+  call_end();
   if (prefix && access(flag, F_OK) == 0) return (int)0x80990002u;
-  snprintf(g_sim.uri, sizeof g_sim.uri, "%s", uri);
-  g_sim.downloaded = 0;
-  g_sim.state = 0;
-  snprintf(content_id, size, "UP0000-TEST00000_00-0000000000000000");
   if (start_thread(&t, sim_main, NULL) != 0) return -1;
   pthread_detach(t);
   return 0;
 }
-
-static int system_status(const char *content_id, appinst_status_t *st) {
-  (void)content_id;
-  memset(st, 0, sizeof *st);
-  pthread_mutex_lock(&g_sim.mu);
-  st->downloaded_size = g_sim.downloaded;
-  st->total_size = g_inst.size;
-  snprintf(st->status, sizeof st->status, "%s",
-           g_sim.state > 0 ? "playable" : g_sim.state < 0 ? "error" : "transferring");
-  if (g_sim.state < 0) st->error_info.error_code = (int32_t)0x80B20001u;
-  pthread_mutex_unlock(&g_sim.mu);
-  return 0;
-}
 #endif
-
-/* The installer's calls run on a thread of their own with a big stack (the
- * system modules' start code can need far more than THREAD_STACK), watched:
- * one that never returns can't keep the helper from answering. */
-#define CALL_STACK (8u << 20)
-#define CALL_WAIT_S 60
-static struct {
-  pthread_mutex_t mu;
-  int done, rc;
-  char uri[128], content_id[64];
-} g_call = {PTHREAD_MUTEX_INITIALIZER, 0, 0, "", ""};
-
-static void *call_main(void *arg) {
-  char content_id[64] = "";
-  int rc;
-  (void)arg;
-  rc = system_install(g_call.uri, g_inst.title, content_id, sizeof content_id);
-  pthread_mutex_lock(&g_call.mu);
-  g_call.rc = rc;
-  snprintf(g_call.content_id, sizeof g_call.content_id, "%s", content_id);
-  g_call.done = 1;
-  pthread_mutex_unlock(&g_call.mu);
-  return NULL;
-}
-
-/* system_install, given CALL_WAIT_S: 0/-1/code as it, or -2 when it didn't
- * come back in time. */
-static int watched_install(const char *uri, char *content_id, size_t size) {
-  pthread_attr_t attr;
-  pthread_t t;
-  int k, rc = -2, made;
-  pthread_mutex_lock(&g_call.mu);
-  g_call.done = 0;
-  snprintf(g_call.uri, sizeof g_call.uri, "%s", uri);
-  pthread_mutex_unlock(&g_call.mu);
-  if (pthread_attr_init(&attr) != 0) return -1;
-  (void)pthread_attr_setstacksize(&attr, CALL_STACK);
-  made = pthread_create(&t, &attr, call_main, NULL);
-  pthread_attr_destroy(&attr);
-  if (made != 0) return -1;
-  pthread_detach(t);
-  for (k = 0; k < CALL_WAIT_S * 10; ++k) {
-    int done;
-    pthread_mutex_lock(&g_call.mu);
-    done = g_call.done;
-    if (done) {
-      rc = g_call.rc;
-      snprintf(content_id, size, "%s", g_call.content_id);
-    }
-    pthread_mutex_unlock(&g_call.mu);
-    if (done) break;
-    if (install_stopping()) break;
-    sleep_ms(100);
-  }
-  return rc;
-}
 
 /* Tells NASBridge (while it's there) or the PS5's notifications. */
 static void install_report(int done, const char *fmt, ...) {
@@ -2805,13 +2783,10 @@ static int install_listen(void) {
 /* The install, start to end, on a thread of its own: NASBridge's connection
  * (g_inst.ctl) is ours to close. */
 static void *install_main(void *arg) {
-  char uri[128], content_id[64] = "", message[700];
+  char uri[128], message[700];
   pthread_t acceptor;
-  int rc, k, stopped = 0, have_acceptor = 0, last_rc = 1;
-  int32_t last_error = 0;
-  char last_status[16] = "";
-  uint64_t started = now_ms(), last_down = 0, last_logged = 0;
-  appinst_status_t st;
+  int rc, k, have_acceptor = 0, finished = 0;
+  uint64_t done_at = 0;
   (void)arg;
   snprintf(uri, sizeof uri, "http://127.0.0.1:%d%s", g_inst.srv_port, g_inst.name);
   if (start_thread(&acceptor, accept_main, NULL) == 0) have_acceptor = 1;
@@ -2820,80 +2795,62 @@ static void *install_main(void *arg) {
   pthread_mutex_unlock(&g_inst.mu);
   install_log("---- install of \"%s\" (%llu bytes), served at %s", g_inst.title,
               (unsigned long long)g_inst.size, uri);
-  rc = have_acceptor ? watched_install(uri, content_id, sizeof content_id) : -1;
+  rc = have_acceptor ? system_install(uri, g_inst.title) : -1;
   if (rc != 0) {
-    if (rc == -2) {
-      install_log("the installer's calls didn't come back in %d s", CALL_WAIT_S);
-      install_report(1, "ERR install the PS5's installer didn't answer (see /data/nasbridge-install.log)");
-    } else if (rc == -1)
+    if (rc == -1)
       install_report(1, "ERR install the PS5's installer couldn't be loaded");
     else
       install_report(1, "ERR install the PS5's installer refused it (code 0x%08X)", (unsigned)rc);
     goto done;
   }
   for (;;) {
-    int heard = install_listen();
-    uint64_t asked;
+    uint64_t covered, asked;
+    int heard = finished ? 0 : install_listen();
     if (heard > 0) {
-      stopped = 1;
+      install_log("stopped by NASBridge");
       install_report(1, "STOPPED");
       break;
     }
-    rc = system_status(content_id, &st);
-    st.status[sizeof st.status - 1] = '\0';
-    st.error_info.description[sizeof st.error_info.description - 1] = '\0';
-    if (rc != last_rc || strcmp(st.status, last_status) != 0 ||
-        st.error_info.error_code != last_error || now_ms() - last_logged > 10000) {
-      install_log("status call 0x%08X: \"%s\" src \"%.8s\" %llu/%llu bytes, error 0x%08X \"%.120s\"",
-                  (unsigned)rc, st.status, st.src_type, (unsigned long long)st.downloaded_size,
-                  (unsigned long long)st.total_size, (unsigned)st.error_info.error_code,
-                  st.error_info.description);
-      last_rc = rc;
-      snprintf(last_status, sizeof last_status, "%s", st.status);
-      last_error = st.error_info.error_code;
-      last_logged = now_ms();
-    }
-    if (rc == 0) {
-      if (strcmp(st.status, "playable") == 0 || strcmp(st.status, "completed") == 0) {
-        install_report(0, "P %llu %llu", (unsigned long long)g_inst.size,
-                       (unsigned long long)g_inst.size);
+    pthread_mutex_lock(&g_inst.mu);
+    covered = g_inst.covered;
+    asked = g_inst.last_asked;
+    pthread_mutex_unlock(&g_inst.mu);
+    if (!finished) {
+      install_report(0, "P %llu %llu", (unsigned long long)covered,
+                     (unsigned long long)g_inst.size);
+      if (covered >= g_inst.size) {
+        /* The installer has it all; it goes on unpacking by itself. */
+        install_log("the installer has fetched every byte");
         if (g_inst.ctl >= 0)
           install_report(1, "OK");
         else {
           snprintf(message, sizeof message, "%s is installed.", g_inst.title);
           install_notify(message);
         }
-        break;
-      }
-      if (st.error_info.error_code != 0 || strcmp(st.status, "error") == 0 ||
-          (strcmp(st.status, "none") == 0 && now_ms() - started > 10000)) {
+        pthread_mutex_lock(&g_inst.mu);
+        if (g_inst.ctl >= 0) close(g_inst.ctl);
+        g_inst.ctl = -1;
+        pthread_mutex_unlock(&g_inst.mu);
+        finished = 1;
+        done_at = now_ms();
+        pthread_mutex_lock(&g_inst.mu);
+        g_inst.lingering = 1;
+        pthread_mutex_unlock(&g_inst.mu);
+      } else if (now_ms() - asked > INSTALL_IDLE_S * 1000ull) {
+        install_log("the installer asked for nothing for %d s (%llu of %llu bytes fetched)",
+                    INSTALL_IDLE_S, (unsigned long long)covered, (unsigned long long)g_inst.size);
         if (g_inst.ctl >= 0)
-          install_report(1, "ERR install the PS5's installer stopped (code 0x%08X)",
-                         (unsigned)st.error_info.error_code);
+          install_report(1, "ERR install the PS5's installer stopped asking for the package");
         else {
-          snprintf(message, sizeof message, "Couldn't install %s (code 0x%08X).", g_inst.title,
-                   (unsigned)st.error_info.error_code);
+          snprintf(message, sizeof message, "Couldn't install %s: the PS5's installer stopped.",
+                   g_inst.title);
           install_notify(message);
         }
         break;
       }
-      if (st.downloaded_size > last_down) last_down = st.downloaded_size;
-    }
-    {
-      uint64_t served;
-      pthread_mutex_lock(&g_inst.mu);
-      served = g_inst.served;
-      asked = g_inst.last_asked;
-      pthread_mutex_unlock(&g_inst.mu);
-      /* What the installer has, as far as it has been sent. */
-      install_report(0, "P %llu %llu",
-                     (unsigned long long)(last_down < served ? last_down : served),
-                     (unsigned long long)g_inst.size);
-    }
-    if (now_ms() - asked > INSTALL_IDLE_S * 1000ull && last_down < g_inst.size) {
-      install_report(1, "ERR install the PS5's installer didn't ask for the package (its status: %s)",
-                     last_status[0] ? last_status : "none");
-      break;
+    } else if (install_stopping() ||
+               now_ms() - (asked > done_at ? asked : done_at) > INSTALL_LINGER_S * 1000ull) {
+      break; /* it has asked for nothing more: done serving */
     }
     sleep_ms(INSTALL_POLL_MS);
   }
@@ -2905,7 +2862,6 @@ done:
     if (g_inst.conns[k] >= 0) shutdown(g_inst.conns[k], SHUT_RDWR);
   pthread_mutex_unlock(&g_inst.mu);
   if (have_acceptor) pthread_join(acceptor, NULL);
-  (void)stopped;
   /* The installer's connections end on their own (cut off above). */
   for (k = 0; k < 40; ++k) {
     int left = 0, i;
@@ -2923,7 +2879,10 @@ done:
   if (g_inst.source) memset(g_inst.source, 0, g_inst.source_len); /* the password */
   free(g_inst.source);
   g_inst.source = NULL;
+  free(g_inst.blocks);
+  g_inst.blocks = NULL;
   g_inst.active = 0;
+  g_inst.lingering = 0;
   pthread_mutex_unlock(&g_inst.mu);
   return NULL;
 }
@@ -2953,7 +2912,9 @@ static int run_install(int ctl, char *line) {
     return 0;
   }
   pthread_mutex_lock(&g_inst.mu);
-  /* One that has ended (stop set) is only tidying up: give it a moment. */
+  /* One that has ended (stop set) is only tidying up, and one that's done
+   * and only still serving makes way: give it a moment. */
+  if (g_inst.active && g_inst.lingering) g_inst.stop = 1;
   for (k = 0; k < 100 && g_inst.active && g_inst.stop; ++k) {
     pthread_mutex_unlock(&g_inst.mu);
     sleep_ms(100);
@@ -3004,6 +2965,16 @@ static int run_install(int ctl, char *line) {
            (unsigned long long)now_ms());
   g_inst.stop = 0;
   g_inst.served = 0;
+  g_inst.covered = 0;
+  g_inst.lingering = 0;
+  free(g_inst.blocks);
+  g_inst.blocks = calloc((size_t)((g_inst.size + COVER_BLOCK - 1) / COVER_BLOCK + 7) / 8, 1);
+  if (!g_inst.blocks) {
+    close(srv);
+    g_inst.srv = -1;
+    send_line(ctl, "ERR install out of memory");
+    goto fail;
+  }
   g_inst.ctl = ctl;
   for (k = 0; k < MAX_SERVED; ++k) g_inst.conns[k] = -1;
   {
@@ -3069,6 +3040,15 @@ static int run_job(int ctl) {
   }
   if (strncmp(line, INSTALL_PROTO "\t", sizeof INSTALL_PROTO) == 0) {
     kept = run_install(ctl, line);
+    goto out;
+  }
+  if (strncmp(line, QUIT_PROTO, 4) == 0) {
+    if (install_active()) {
+      send_line(ctl, "ERR busy an install is running");
+    } else {
+      g_quit = 1;
+      send_line(ctl, "OK");
+    }
     goto out;
   }
   if (strncmp(line, PART_PROTO "\t", sizeof PART_PROTO) == 0) {
@@ -3188,6 +3168,11 @@ int main(void) {
    * does the copying and this one leaves quietly. */
   srv = bind_listen(port);
   if (srv < 0) return 0;
+  g_main_srv = srv;
+  {
+    pthread_t dog;
+    if (start_thread(&dog, watchdog_main, NULL) == 0) pthread_detach(dog);
+  }
 #ifndef COPIER_HOST_TEST
   if (elevate() != 0)
     notify("NASBridge copy helper: couldn't get full access (is the jailbreak fully loaded?)");
@@ -3209,6 +3194,7 @@ int main(void) {
     tv.tv_usec = 0;
     setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     if (!run_job(cli)) close(cli); /* an install keeps its connection */
+    if (g_quit) break;
   }
   close(srv);
   return 0;
