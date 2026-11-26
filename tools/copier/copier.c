@@ -2156,8 +2156,11 @@ static void run_file_step(int ctl, char *line) {
  *                the GET request (WebDAV; ends "\r\n\r\n", no Range), or the
  *                SMB sign-in (share, path in it, user, domain, password, each
  *                ended by a NUL)
- *   helper  -> "P <downloaded> <total>"   progress, twice a second
- *              "OK"                      installed
+ *   helper  -> "P <fetched> <total> <connections>"  progress, twice a second:
+ *                                        the package as far as the installer
+ *                                        has it, and its connections to us
+ *              "OK"                      the installer has every byte (it
+ *                                        goes on installing by itself)
  *              "STOPPED"                 NASBridge said STOP
  *              "ERR <kind> <why>"        request, busy (another install is
  *                                        running), install (the installer
@@ -2802,13 +2805,16 @@ static void *install_main(void *arg) {
       install_report(1, "STOPPED");
       break;
     }
+    int conns = 0;
     pthread_mutex_lock(&g_inst.mu);
     covered = g_inst.covered;
     asked = g_inst.last_asked;
+    for (k = 0; k < MAX_SERVED; ++k) conns += g_inst.conns[k] >= 0;
     pthread_mutex_unlock(&g_inst.mu);
     if (!finished) {
-      install_report(0, "P %llu %llu", (unsigned long long)covered,
-                     (unsigned long long)g_inst.size);
+      /* "P <fetched> <size> <the installer's connections>" */
+      install_report(0, "P %llu %llu %d", (unsigned long long)covered,
+                     (unsigned long long)g_inst.size, conns);
       if (covered >= g_inst.size) {
         /* The installer has it all; it goes on unpacking by itself. */
         install_log("the installer has fetched every byte");

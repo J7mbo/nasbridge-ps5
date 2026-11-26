@@ -516,7 +516,7 @@ HelperBatch run_batch(const std::string &opening, const std::vector<BatchFile> &
 // One install: sends the job and what follows, then follows the helper to
 // the end.
 HelperInstall run_install(const std::string &job, const std::string &payload,
-                          const std::function<void(std::uint64_t, std::uint64_t)> &progress,
+                          const std::function<void(std::uint64_t, std::uint64_t, int)> &progress,
                           const std::function<bool()> &stopping)
 {
     HelperInstall result;
@@ -573,8 +573,9 @@ HelperInstall run_install(const std::string &job, const std::string &payload,
             char *end = nullptr;
             const std::uint64_t done = std::strtoull(line.c_str() + 2, &end, 10);
             const std::uint64_t total = std::strtoull(end, &end, 10);
+            const int connections = static_cast<int>(std::strtol(end, &end, 10)); // 0 from an older helper
             if (progress)
-                progress(done, total);
+                progress(done, total, connections);
         }
         else if (line == "OK" || line == "STOPPED")
         {
@@ -653,7 +654,7 @@ HelperBatch copy_smb_batch_with_helper(const std::string &ip, int port, int work
 
 HelperInstall install_with_helper(const std::string &ip, int port, std::uint64_t size,
                                   const std::string &title, const std::string &request,
-                                  const std::function<void(std::uint64_t, std::uint64_t)> &progress,
+                                  const std::function<void(std::uint64_t, std::uint64_t, int)> &progress,
                                   const std::function<bool()> &stopping)
 {
     const std::string job = std::string(kInstallProto) + "\t" + ip + "\t" + std::to_string(port) +
@@ -665,7 +666,7 @@ HelperInstall install_with_helper(const std::string &ip, int port, std::uint64_t
 HelperInstall install_smb_with_helper(const std::string &ip, int port, std::uint64_t size,
                                       const std::string &title, const SmbSignIn &sign_in,
                                       const std::string &path,
-                                      const std::function<void(std::uint64_t, std::uint64_t)> &progress,
+                                      const std::function<void(std::uint64_t, std::uint64_t, int)> &progress,
                                       const std::function<bool()> &stopping)
 {
     const std::string bytes = sign_in_bytes(sign_in, &path);

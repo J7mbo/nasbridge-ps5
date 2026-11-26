@@ -150,12 +150,12 @@ struct HelperInstall
 // going.
 HelperInstall install_with_helper(const std::string &ip, int port, std::uint64_t size,
                                   const std::string &title, const std::string &request,
-                                  const std::function<void(std::uint64_t, std::uint64_t)> &progress,
+                                  const std::function<void(std::uint64_t, std::uint64_t, int)> &progress,
                                   const std::function<bool()> &stopping);
 HelperInstall install_smb_with_helper(const std::string &ip, int port, std::uint64_t size,
                                       const std::string &title, const SmbSignIn &sign_in,
                                       const std::string &path,
-                                      const std::function<void(std::uint64_t, std::uint64_t)> &progress,
+                                      const std::function<void(std::uint64_t, std::uint64_t, int)> &progress,
                                       const std::function<bool()> &stopping);
 
 bool copy_helper_enabled();

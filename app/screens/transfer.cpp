@@ -2548,12 +2548,13 @@ Outcome install_package(const Connection &connection, const SharedPtr &shared, c
     }
     std::uint64_t last_done = 0;
     std::uint64_t last_ms = now_ms();
-    const auto progress = [&](std::uint64_t done, std::uint64_t)
+    const auto progress = [&](std::uint64_t done, std::uint64_t, int connections)
     {
         const std::uint64_t now = now_ms();
         std::lock_guard<std::mutex> hold(shared->lock);
         if (Item *item = shared->item(entry))
             item->done = done;
+        shared->connections = connections; // the installer's, to the helper
         if (done > 0)
             shared->phase = TransferState::copying;
         if (now - last_ms >= 1000)
@@ -2591,6 +2592,7 @@ Outcome install_package(const Connection &connection, const SharedPtr &shared, c
     {
         std::lock_guard<std::mutex> hold(shared->lock);
         shared->rate = 0.0;
+        shared->connections = 0;
     }
     using End = HelperInstall::End;
     switch (result.end)
