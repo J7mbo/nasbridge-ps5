@@ -66,6 +66,9 @@ COPIER_SMB_FLAGS := -std=c11 -O2 -g -w -DHAVE_CONFIG_H -Iapp/third_party/libsmb2
   -I$(LIBSMB2)/include -I$(LIBSMB2)/include/smb2 -I$(LIBSMB2)/lib \
   -ffile-prefix-map=$(LIBSMB2)/=libsmb2/ -ffile-prefix-map=/src/=./
 COPIER_INCLUDES := -I$(LIBSMB2)/include
+# The system installer, linked in as ps5upload's installer links it:
+# -lSceIpmi must come before -lSceAppInstUtil, or the loader refuses the ELF.
+COPIER_LIBS := -lSceSystemService -lSceUserService -lSceIpmi -lSceAppInstUtil -lkernel_sys
 
 # Home-screen app: the kit's app (renderer, shell, input, sound) with our
 # screens (app/screens) in place of its demo designs, our overrides
@@ -120,7 +123,7 @@ $(BUILD_DIR)/libsmb2/%.o: app/third_party/libsmb2/%.c app/third_party/libsmb2/co
 	@$(CC) $(COPIER_SMB_FLAGS) -c -o $@ $<
 
 $(COPIER): $(COPIER_SRCS) $(COPIER_SMB_OBJS) $(BUILD_DIR)/toolchain.id | $(OUT_DIR)
-	$(CC) $(CFLAGS) $(COPIER_INCLUDES) -o $@ $(COPIER_SRCS) $(COPIER_SMB_OBJS)
+	$(CC) $(CFLAGS) $(COPIER_INCLUDES) -o $@ $(COPIER_SRCS) $(COPIER_SMB_OBJS) $(COPIER_LIBS)
 	@sha256sum $@
 
 # ---- release: one ELF that installs the app ----

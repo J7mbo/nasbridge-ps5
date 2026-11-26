@@ -90,7 +90,6 @@
 #include <smb2/smb2-errors.h>
 
 #ifndef COPIER_HOST_TEST
-#include <dlfcn.h>
 #include <ps5/kernel.h>
 #endif
 
@@ -2603,35 +2602,27 @@ static void *watchdog_main(void *arg) {
 }
 
 #ifndef COPIER_HOST_TEST
-typedef int (*appinst_init_t)(void);
-typedef int (*appinst_install_t)(appinst_meta_t *, appinst_pkg_t *, appinst_playgo_t *);
+/* Linked in (ps5.mk: -lSceIpmi before -lSceAppInstUtil), as ps5upload does:
+ * loaded at start, before the helper leaves the sandbox. Loading it later
+ * with dlopen never came back in the helper (2026-11-26, 13.60). */
+int sceAppInstUtilInitialize(void);
+int sceAppInstUtilInstallByPackage(appinst_meta_t *meta, appinst_pkg_t *info,
+                                   appinst_playgo_t *playgo);
 
-/* Asks the installer for the package at `uri`: 0, -1 (couldn't load it) or
- * the installer's code. */
+/* Asks the installer for the package at `uri`: 0 or the installer's code. */
 static int system_install(const char *uri, const char *title) {
   static int ready, init_rc = -1;
-  static appinst_install_t install;
   static appinst_meta_t meta;
   static appinst_pkg_t info;
   static appinst_playgo_t playgo; /* kept: the installer may read them later */
   uint64_t saved;
   int rc;
   if (!ready) {
-    void *inst_h = dlopen("/system/common/lib/libSceAppInstUtil.sprx", RTLD_LAZY);
-    appinst_init_t inst_init;
-    install_log("AppInstUtil %s", inst_h ? "loaded" : "NOT loaded");
-    if (!inst_h) return -1;
-    inst_init = (appinst_init_t)dlsym(inst_h, "sceAppInstUtilInitialize");
-    install = (appinst_install_t)dlsym(inst_h, "sceAppInstUtilInstallByPackage");
-    if (!inst_init || !install) {
-      install_log("AppInstUtil's calls not found (init %p, install %p)", (void *)inst_init,
-                  (void *)install);
-      return -1;
-    }
+    install_log("starting AppInstUtil");
     saved = kernel_get_ucred_authid(getpid());
     kernel_set_ucred_authid(getpid(), INSTALL_AUTHID);
     call_begin();
-    init_rc = inst_init();
+    init_rc = sceAppInstUtilInitialize();
     call_end();
     kernel_set_ucred_authid(getpid(), saved);
     install_log("init returned 0x%08X", (unsigned)init_rc);
@@ -2650,7 +2641,7 @@ static int system_install(const char *uri, const char *title) {
   saved = kernel_get_ucred_authid(getpid());
   kernel_set_ucred_authid(getpid(), INSTALL_AUTHID);
   call_begin();
-  rc = install(&meta, &info, &playgo);
+  rc = sceAppInstUtilInstallByPackage(&meta, &info, &playgo);
   call_end();
   kernel_set_ucred_authid(getpid(), saved);
   info.content_id[sizeof info.content_id - 1] = '\0';
