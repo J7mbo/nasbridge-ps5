@@ -517,7 +517,8 @@ HelperBatch run_batch(const std::string &opening, const std::vector<BatchFile> &
 // the end.
 HelperInstall run_install(const std::string &job, const std::string &payload,
                           const std::function<void(std::uint64_t, std::uint64_t, int)> &progress,
-                          const std::function<bool()> &stopping)
+                          const std::function<bool()> &stopping,
+                          const std::function<void()> &accepted)
 {
     HelperInstall result;
     std::string buffer;
@@ -532,6 +533,13 @@ HelperInstall run_install(const std::string &job, const std::string &payload,
         result.why = helper_start_why();
         return result;
     }
+    // Paused while the helper was being reached: nothing has started.
+    if (stopping && stopping())
+    {
+        ::close(fd);
+        result.end = HelperInstall::End::stopped;
+        return result;
+    }
     if (!send_all(fd, job.data(), job.size()) || !send_all(fd, payload.data(), payload.size()))
     {
         ::close(fd);
@@ -544,11 +552,34 @@ HelperInstall run_install(const std::string &job, const std::string &payload,
     {
         if (stopping && stopping())
         {
+            // The helper answers STOPPED, or OK when the install had just
+            // finished; progress lines may come first.
             send_all(fd, "STOP\n", 5);
-            std::string line;
-            read_line(fd, &buffer, &line, 3000); // "STOPPED"
+            result.end = HelperInstall::End::lost;
+            result.why = "the copy helper didn't confirm the stop";
+            for (int waited = 0; waited < 5000;)
+            {
+                std::string line;
+                if (!read_line(fd, &buffer, &line, 250))
+                {
+                    waited += 250;
+                    continue;
+                }
+                if (line == "STOPPED" || line == "OK")
+                {
+                    result.end = line == "OK" ? HelperInstall::End::ok : HelperInstall::End::stopped;
+                    result.why.clear();
+                    break;
+                }
+                if (line.rfind("ERR ", 0) == 0)
+                {
+                    result.end = HelperInstall::End::failed;
+                    const std::size_t space = line.find(' ', 4);
+                    result.why = space == std::string::npos ? "" : line.substr(space + 1);
+                    break;
+                }
+            }
             ::close(fd);
-            result.end = HelperInstall::End::stopped;
             return result;
         }
         std::string line;
@@ -577,6 +608,12 @@ HelperInstall run_install(const std::string &job, const std::string &payload,
             if (progress)
                 progress(done, total, connections);
         }
+        else if (line == "A")
+        {
+            // The PS5's installer took the package (and set aside its room).
+            if (accepted)
+                accepted();
+        }
         else if (line == "OK" || line == "STOPPED")
         {
             ::close(fd);
@@ -592,6 +629,9 @@ HelperInstall run_install(const std::string &job, const std::string &payload,
             result.end = kind == "install" ? HelperInstall::End::failed
                          : kind == "busy"  ? HelperInstall::End::busy
                                            : HelperInstall::End::unavailable; // an older helper
+            if (kind == "request")
+                result.why = "an older copy helper is still running. Restart the PS5, or wait a "
+                             "few minutes for it to leave";
             ::close(fd);
             return result;
         }
@@ -655,25 +695,27 @@ HelperBatch copy_smb_batch_with_helper(const std::string &ip, int port, int work
 HelperInstall install_with_helper(const std::string &ip, int port, std::uint64_t size,
                                   const std::string &title, const std::string &request,
                                   const std::function<void(std::uint64_t, std::uint64_t, int)> &progress,
-                                  const std::function<bool()> &stopping)
+                                  const std::function<bool()> &stopping,
+                                  const std::function<void()> &accepted)
 {
     const std::string job = std::string(kInstallProto) + "\t" + ip + "\t" + std::to_string(port) +
                             "\t" + std::to_string(size) + "\t0\t" + std::to_string(title.size()) +
                             "\t" + std::to_string(request.size()) + "\n";
-    return run_install(job, title + request, progress, stopping);
+    return run_install(job, title + request, progress, stopping, accepted);
 }
 
 HelperInstall install_smb_with_helper(const std::string &ip, int port, std::uint64_t size,
                                       const std::string &title, const SmbSignIn &sign_in,
                                       const std::string &path,
                                       const std::function<void(std::uint64_t, std::uint64_t, int)> &progress,
-                                      const std::function<bool()> &stopping)
+                                      const std::function<bool()> &stopping,
+                                      const std::function<void()> &accepted)
 {
     const std::string bytes = sign_in_bytes(sign_in, &path);
     const std::string job = std::string(kInstallProto) + "\t" + ip + "\t" + std::to_string(port) +
                             "\t" + std::to_string(size) + "\t1\t" + std::to_string(title.size()) +
                             "\t" + std::to_string(bytes.size()) + "\n";
-    return run_install(job, title + bytes, progress, stopping);
+    return run_install(job, title + bytes, progress, stopping, accepted);
 }
 
 bool copy_helper_enabled()

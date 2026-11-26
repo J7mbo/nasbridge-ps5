@@ -71,6 +71,12 @@ struct CopyPlan
     std::string title_id;
     bool image = false;
     bool package = false;    // a .pkg: installed by the PS5, not copied (image too)
+    // Packages: a full game the PS5 didn't have when it was queued, so a
+    // stopped install of it can be uninstalled by title ID without taking an
+    // installed game (an update or add-on shares its game's title ID) along.
+    bool package_base = false;
+    bool accepted = false; // the PS5's installer took it: it holds a part install and its room
+    bool handed = false;   // with the helper right now (it goes on if NASBridge closes)
     std::string source;      // on the NAS, decoded: the folder ("/games/Game/") or the file
     std::string destination; // "/data/homebrew", "/mnt/usb0/homebrew", ...
     std::string name;        // the folder or file name it gets there
@@ -143,6 +149,7 @@ struct QueueEntry
     bool started = false;   // has files on the drive (removing it deletes them)
     bool image = false;     // an image (one file), not a folder game
     bool package = false;   // a .pkg the PS5 installs (`done`: what its installer has)
+    bool accepted = false;  // packages: the PS5 holds a part install (removing it uninstalls it)
 };
 
 struct QueueStatus
@@ -219,8 +226,10 @@ class Transfers
 
     // Each returns false (with *why) when it can't be done now.
     // Adds a game at the end; starts copying when the queue was empty.
+    // on_ps5: a game with its title ID is installed (packages: a stopped
+    // install of it then isn't uninstalled, which would take that game too).
     bool enqueue(const Connection &connection, const NasGame &game, const std::string &title,
-                 const std::string &destination, std::string *why);
+                 const std::string &destination, std::string *why, bool on_ps5 = false);
     bool pause();
     bool resume(const Connection &connection, std::string *why);
     // Moves the game at `index` one place (delta -1 up, +1 down). The game

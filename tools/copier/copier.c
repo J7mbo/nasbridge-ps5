@@ -2156,7 +2156,10 @@ static void run_file_step(int ctl, char *line) {
  *                the GET request (WebDAV; ends "\r\n\r\n", no Range), or the
  *                SMB sign-in (share, path in it, user, domain, password, each
  *                ended by a NUL)
- *   helper  -> "P <fetched> <total> <connections>"  progress, twice a second:
+ *   helper  -> "A"                       the PS5's installer took the package
+ *                                        (it holds a part install, and its
+ *                                        room, from now on)
+ *              "P <fetched> <total> <connections>"  progress, twice a second:
  *                                        the package as far as the installer
  *                                        has it, and its connections to us
  *              "OK"                      the installer has every byte (it
@@ -2204,6 +2207,10 @@ typedef struct {
   unsigned char unknown[6480];
 } appinst_playgo_t;
 
+struct span {
+  uint64_t lo, hi; /* [lo, hi) */
+};
+
 static struct install {
   pthread_mutex_t mu;
   int active;            /* an install is running (main keeps us alive) */
@@ -2223,32 +2230,61 @@ static struct install {
   int conns[MAX_SERVED]; /* the installer's connections, to cut off on a stop */
   uint64_t served;       /* bytes sent to the installer */
   uint64_t last_asked;   /* when it last asked for anything (ms) */
-  unsigned char *blocks; /* which COVER_BLOCK pieces it has been sent in full */
-  uint64_t covered;      /* bytes in those pieces: the package as far as it has it */
+  struct span *spans;    /* what it has been sent in full: sorted, apart */
+  size_t spans_n, spans_cap;
+  uint64_t covered;      /* bytes in those spans: the package as far as it has it */
   int lingering;         /* done, only still serving: a new install may end it */
+  int changed;           /* the package on the NAS isn't the size NASBridge said */
 } g_inst = {PTHREAD_MUTEX_INITIALIZER, 0, 0, -1, "", 0, 0, 0, NULL, 0, {0}, "", "", -1, 0,
-            {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1}, 0, 0, NULL, 0, 0};
+            {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1}, 0, 0, NULL, 0, 0,
+            0, 0, 0};
 
-#define COVER_BLOCK (1ull << 20)
-
-/* The installer has been sent [from, to] in full: count the pieces that
- * covers (each once, however often it asks again). */
+/* The installer has been sent [from, to] in full: adds it to what it has
+ * (a byte counts once, however the installer splits or repeats its asks). */
 static void install_covered(uint64_t from, uint64_t to) {
-  uint64_t b, first = (from + COVER_BLOCK - 1) / COVER_BLOCK, last;
-  if (to + 1 >= g_inst.size)
-    last = (g_inst.size - 1) / COVER_BLOCK; /* the last piece may be short */
-  else if (to + 1 < COVER_BLOCK)
-    return;
-  else
-    last = (to + 1) / COVER_BLOCK - 1;
+  uint64_t lo = from, hi = to + 1; /* [lo, hi) */
+  size_t i, first, last, k;
   pthread_mutex_lock(&g_inst.mu);
-  for (b = first; g_inst.blocks && b <= last; ++b) {
-    if (g_inst.blocks[b / 8] & (1u << (b % 8))) continue;
-    g_inst.blocks[b / 8] |= (unsigned char)(1u << (b % 8));
-    g_inst.covered += b == (g_inst.size - 1) / COVER_BLOCK ? g_inst.size - b * COVER_BLOCK
-                                                           : COVER_BLOCK;
+  /* The spans it touches or adjoins: [first, last). */
+  for (first = 0; first < g_inst.spans_n && g_inst.spans[first].hi < lo; ++first) {
   }
+  for (last = first; last < g_inst.spans_n && g_inst.spans[last].lo <= hi; ++last) {
+    if (g_inst.spans[last].lo < lo) lo = g_inst.spans[last].lo;
+    if (g_inst.spans[last].hi > hi) hi = g_inst.spans[last].hi;
+  }
+  if (first == last && g_inst.spans_n == g_inst.spans_cap) { /* one more span */
+    size_t cap = g_inst.spans_cap ? g_inst.spans_cap * 2 : 64;
+    struct span *more = realloc(g_inst.spans, cap * sizeof *more);
+    if (!more) {
+      pthread_mutex_unlock(&g_inst.mu);
+      return;
+    }
+    g_inst.spans = more;
+    g_inst.spans_cap = cap;
+  }
+  if (first == last) { /* a new span at `first` */
+    memmove(g_inst.spans + first + 1, g_inst.spans + first,
+            (g_inst.spans_n - first) * sizeof *g_inst.spans);
+    ++g_inst.spans_n;
+  } else if (last - first > 1) { /* several become one */
+    memmove(g_inst.spans + first + 1, g_inst.spans + last,
+            (g_inst.spans_n - last) * sizeof *g_inst.spans);
+    g_inst.spans_n -= last - first - 1;
+  }
+  g_inst.spans[first].lo = lo;
+  g_inst.spans[first].hi = hi;
+  g_inst.covered = 0;
+  for (i = 0, k = g_inst.spans_n; i < k; ++i)
+    g_inst.covered += g_inst.spans[i].hi - g_inst.spans[i].lo;
   pthread_mutex_unlock(&g_inst.mu);
+}
+
+/* The install is fed again from nothing. */
+static void install_forget(void) {
+  free(g_inst.spans);
+  g_inst.spans = NULL;
+  g_inst.spans_n = g_inst.spans_cap = 0;
+  g_inst.covered = 0;
 }
 
 static int install_active(void) {
@@ -2313,6 +2349,11 @@ typedef struct source {
   struct smb2_context *smb2;
   struct smb2fh *fh;
   char *buf;
+  /* Its own copy of the install's source (the GET request or the sign-in),
+   * so the install can end and free its own while this one winds down. */
+  char *src;
+  size_t src_len;
+  smb_sign_in_t in;
 } source_t;
 
 static void source_end(source_t *s) {
@@ -2332,12 +2373,26 @@ static int serve_bytes(int fd, source_t *s, uint64_t from, uint64_t to) {
       if (!s->smb2) {
         const char *kind;
         char why[200];
-        s->smb2 = smb_connect(g_inst.ip, g_inst.port, &g_inst.in, &kind, why, sizeof why);
+        s->smb2 = smb_connect(g_inst.ip, g_inst.port, &s->in, &kind, why, sizeof why);
         if (!s->smb2) return -1;
-        s->fh = smb2_open(s->smb2, g_inst.in.path, O_RDONLY);
+        s->fh = smb2_open(s->smb2, s->in.path, O_RDONLY);
         if (!s->fh) {
           source_end(s);
           return -1;
+        }
+        {
+          struct smb2_stat_64 st;
+          if (smb2_fstat(s->smb2, s->fh, &st) < 0) {
+            source_end(s);
+            return -1;
+          }
+          if (st.smb2_size != g_inst.size) {
+            pthread_mutex_lock(&g_inst.mu);
+            g_inst.changed = 1;
+            pthread_mutex_unlock(&g_inst.mu);
+            source_end(s);
+            return -1;
+          }
         }
       }
       if (smb_read_span(s->smb2, s->fh, at, want, s->buf) != 0) {
@@ -2348,6 +2403,7 @@ static int serve_bytes(int fd, source_t *s, uint64_t from, uint64_t to) {
       at += want;
       pthread_mutex_lock(&g_inst.mu);
       g_inst.served += want;
+      g_inst.last_asked = now_ms(); /* a long piece is still asking */
       pthread_mutex_unlock(&g_inst.mu);
     }
     return 0;
@@ -2355,7 +2411,7 @@ static int serve_bytes(int fd, source_t *s, uint64_t from, uint64_t to) {
   {
     size_t len, hlen, body_at;
     int nas, status;
-    char *request = with_range(g_inst.source, g_inst.source_len, from, (int64_t)to, &len);
+    char *request = with_range(s->src, s->src_len, from, (int64_t)to, &len);
     uint64_t left = to - from + 1;
     if (!request) return -1;
     nas = connect_nas(g_inst.ip, g_inst.port);
@@ -2368,6 +2424,27 @@ static int serve_bytes(int fd, source_t *s, uint64_t from, uint64_t to) {
     }
     free(request);
     {
+      /* Only a plain body from a file of the size NASBridge said can be
+       * passed on (a reply running past `to` is fine: only `left` is read). */
+      char value[128];
+      const char *slash;
+      int bad = header(s->buf, "transfer-encoding", value, sizeof value) && strstr(value, "chunked");
+      if (!bad && status == 206) {
+        bad = !header(s->buf, "content-range", value, sizeof value) ||
+              !(slash = strchr(value, '/')) || slash[1] == '*';
+        if (!bad && strtoull(slash + 1, NULL, 10) != g_inst.size) {
+          pthread_mutex_lock(&g_inst.mu);
+          g_inst.changed = 1;
+          pthread_mutex_unlock(&g_inst.mu);
+          bad = 1;
+        }
+      }
+      if (bad) {
+        close(nas);
+        return -1;
+      }
+    }
+    {
       size_t first = hlen - body_at;
       if (first > left) first = (size_t)left;
       if (first > 0 && send_all(fd, s->buf + body_at, first) != 0) {
@@ -2377,6 +2454,7 @@ static int serve_bytes(int fd, source_t *s, uint64_t from, uint64_t to) {
       left -= first;
       pthread_mutex_lock(&g_inst.mu);
       g_inst.served += first;
+      g_inst.last_asked = now_ms();
       pthread_mutex_unlock(&g_inst.mu);
     }
     while (left > 0) {
@@ -2388,12 +2466,15 @@ static int serve_bytes(int fd, source_t *s, uint64_t from, uint64_t to) {
       left -= (uint64_t)n;
       pthread_mutex_lock(&g_inst.mu);
       g_inst.served += (uint64_t)n;
+      g_inst.last_asked = now_ms();
       pthread_mutex_unlock(&g_inst.mu);
     }
     close(nas);
     return left == 0 ? 0 : -1;
   }
 }
+
+static int g_serving; /* serve_main threads still running */
 
 /* One of the installer's connections: requests until it closes. */
 static void *serve_main(void *arg) {
@@ -2405,7 +2486,24 @@ static void *serve_main(void *arg) {
   s.buf = malloc(SERVE_BUF > MAX_HEADER + 1 ? SERVE_BUF : MAX_HEADER + 1);
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
   pthread_mutex_lock(&g_inst.mu);
-  for (k = 0; k < MAX_SERVED && slot < 0; ++k)
+  if (g_inst.source && !g_inst.stop && (s.src = malloc(g_inst.source_len + 1)) != NULL) {
+    char *sign[5];
+    memcpy(s.src, g_inst.source, g_inst.source_len + 1);
+    s.src_len = g_inst.source_len;
+    if (g_inst.smb) {
+      if (smb_fields(s.src, s.src_len, sign, 5) == 0) {
+        s.in.share = sign[0];
+        s.in.path = sign[1];
+        s.in.user = sign[2];
+        s.in.domain = sign[3];
+        s.in.password = sign[4];
+      } else {
+        free(s.src);
+        s.src = NULL;
+      }
+    }
+  }
+  for (k = 0; s.src && k < MAX_SERVED && slot < 0; ++k)
     if (g_inst.conns[k] < 0) {
       g_inst.conns[k] = fd;
       slot = k;
@@ -2485,9 +2583,12 @@ static void *serve_main(void *arg) {
   if (slot >= 0) g_inst.conns[slot] = -1;
   pthread_mutex_unlock(&g_inst.mu);
   source_end(&s);
+  if (s.src) memset(s.src, 0, s.src_len); /* the password */
+  free(s.src);
   free(s.buf);
   free(head);
   close(fd);
+  __atomic_sub_fetch(&g_serving, 1, __ATOMIC_ACQ_REL);
   return NULL;
 }
 
@@ -2502,7 +2603,9 @@ static void *accept_main(void *arg) {
     if (poll(&p, 1, 250) <= 0) continue;
     fd = accept(g_inst.srv, NULL, NULL);
     if (fd < 0) continue;
+    __atomic_add_fetch(&g_serving, 1, __ATOMIC_ACQ_REL);
     if (start_thread(&t, serve_main, (void *)(intptr_t)fd) != 0) {
+      __atomic_sub_fetch(&g_serving, 1, __ATOMIC_ACQ_REL);
       close(fd);
       continue;
     }
@@ -2533,6 +2636,7 @@ static void *accept_main(void *arg) {
 
 static volatile uint64_t g_call_since; /* when the running Sony call began (ms), 0: none */
 static volatile int g_main_srv = -1;   /* the helper's own port, for the watchdog */
+static int g_watchdog;                 /* the watchdog runs: installs may start */
 
 static void call_begin(void) { __atomic_store_n(&g_call_since, now_ms(), __ATOMIC_RELEASE); }
 static void call_end(void) { __atomic_store_n(&g_call_since, 0, __ATOMIC_RELEASE); }
@@ -2601,7 +2705,9 @@ static int system_install(const char *uri, const char *title) {
 #else
 /* Tests: a stand-in installer that reads the package from the server as the
  * PS5's does (its first 64 KiB, the .crc, then 16 MiB ranges over one
- * keep-alive connection) into $NB_TEST_PREFIX/installed.pkg.
+ * keep-alive connection) into $NB_TEST_PREFIX/installed.pkg, there (renamed
+ * into place) only once it is whole. The first range is asked in two parts
+ * split mid-block, as the coverage must count across requests.
  * $NB_TEST_PREFIX/install_refused makes the install call fail. */
 static int sim_get(int fd, const char *path, uint64_t from, uint64_t to, FILE *out, int *status) {
   char req[600], head[MAX_HEADER + 1], *buf;
@@ -2634,14 +2740,15 @@ static int sim_get(int fd, const char *path, uint64_t from, uint64_t to, FILE *o
 
 static void *sim_main(void *arg) {
   const char *prefix = getenv("NB_TEST_PREFIX");
-  char file[600];
+  char file[600], part[620];
   FILE *out;
-  int fd = -1, status = 0, ok = 0;
+  int fd = -1, status = 0, ok = 0, split = 1;
   uint64_t at = 0;
   struct sockaddr_in addr;
   (void)arg;
   snprintf(file, sizeof file, "%s/installed.pkg", prefix ? prefix : ".");
-  out = fopen(file, "wb");
+  snprintf(part, sizeof part, "%s.part", file);
+  out = fopen(part, "wb");
   memset(&addr, 0, sizeof addr);
   addr.sin_family = AF_INET;
   addr.sin_port = htons((uint16_t)g_inst.srv_port);
@@ -2654,12 +2761,18 @@ static void *sim_main(void *arg) {
     ok = 1;
     while (ok && at < g_inst.size) {
       uint64_t to = at + (16ull << 20) - 1;
+      if (split && g_inst.size > (1ull << 20)) /* 0 .. mid-block, then the rest */
+        to = (1ull << 19) + 12345;
+      split = 0;
       if (to >= g_inst.size) to = g_inst.size - 1;
       ok = sim_get(fd, g_inst.name, at, to, out, &status) == 0 && status == 206;
       at = to + 1;
     }
   }
-  if (out) fclose(out);
+  if (out && fclose(out) == 0 && ok && at >= g_inst.size)
+    rename(part, file);
+  else
+    remove(part);
   if (fd >= 0) close(fd);
   return NULL;
 }
@@ -2697,6 +2810,10 @@ static void install_report(int done, const char *fmt, ...) {
     install_notify(text);
 }
 
+/* What NASBridge has sent so far that isn't a whole line yet. */
+static char g_heard[64];
+static size_t g_heard_n;
+
 /* Whether NASBridge said STOP (1), went away (-1) or is still there (0). */
 static int install_listen(void) {
   char buf[64];
@@ -2715,8 +2832,21 @@ static int install_listen(void) {
     return -1;
   }
   if (n > 0) {
-    buf[n] = '\0';
-    if (strstr(buf, "STOP")) return 1;
+    /* STOP may come in pieces: keep the tail between reads. */
+    size_t room = sizeof g_heard - 1 - g_heard_n;
+    if ((size_t)n > room) {
+      size_t keep = 4; /* "STO" plus one */
+      if (g_heard_n > keep) {
+        memmove(g_heard, g_heard + g_heard_n - keep, keep);
+        g_heard_n = keep;
+      }
+      room = sizeof g_heard - 1 - g_heard_n;
+      if ((size_t)n > room) n = (ssize_t)room;
+    }
+    memcpy(g_heard + g_heard_n, buf, (size_t)n);
+    g_heard_n += (size_t)n;
+    g_heard[g_heard_n] = '\0';
+    if (strstr(g_heard, "STOP")) return 1;
   }
   return 0;
 }
@@ -2742,9 +2872,10 @@ static void *install_main(void *arg) {
       install_report(1, "ERR install the PS5's installer refused it (code 0x%08X)", (unsigned)rc);
     goto done;
   }
+  install_report(0, "A"); /* the installer took it: the PS5 holds a part install now */
   for (;;) {
     uint64_t covered, asked;
-    int heard = finished ? 0 : install_listen();
+    int heard = finished ? 0 : install_listen(), changed;
     if (heard > 0) {
       install_report(1, "STOPPED");
       break;
@@ -2753,8 +2884,19 @@ static void *install_main(void *arg) {
     pthread_mutex_lock(&g_inst.mu);
     covered = g_inst.covered;
     asked = g_inst.last_asked;
+    changed = g_inst.changed;
     for (k = 0; k < MAX_SERVED; ++k) conns += g_inst.conns[k] >= 0;
     pthread_mutex_unlock(&g_inst.mu);
+    if (!finished && changed) {
+      if (g_inst.ctl >= 0)
+        install_report(1, "ERR install the package on the NAS is a different size now");
+      else {
+        snprintf(message, sizeof message,
+                 "Couldn't install %s: the package on the NAS changed.", g_inst.title);
+        install_notify(message);
+      }
+      break;
+    }
     if (!finished) {
       /* "P <fetched> <size> <the installer's connections>" */
       install_report(0, "P %llu %llu %d", (unsigned long long)covered,
@@ -2764,7 +2906,7 @@ static void *install_main(void *arg) {
         if (g_inst.ctl >= 0)
           install_report(1, "OK");
         else {
-          snprintf(message, sizeof message, "%s is installed.", g_inst.title);
+          snprintf(message, sizeof message, "%s is on the PS5: its installer is finishing the install.", g_inst.title);
           install_notify(message);
         }
         pthread_mutex_lock(&g_inst.mu);
@@ -2799,15 +2941,10 @@ done:
     if (g_inst.conns[k] >= 0) shutdown(g_inst.conns[k], SHUT_RDWR);
   pthread_mutex_unlock(&g_inst.mu);
   if (have_acceptor) pthread_join(acceptor, NULL);
-  /* The installer's connections end on their own (cut off above). */
-  for (k = 0; k < 40; ++k) {
-    int left = 0, i;
-    pthread_mutex_lock(&g_inst.mu);
-    for (i = 0; i < MAX_SERVED; ++i) left += g_inst.conns[i] >= 0;
-    pthread_mutex_unlock(&g_inst.mu);
-    if (!left) break;
-    sleep_ms(100);
-  }
+  /* The installer's connections end on their own (cut off above). Each has
+   * its own copy of the source, so one still winding down (a NAS read that
+   * hasn't timed out) doesn't hold up what follows. */
+  for (k = 0; k < 100 && __atomic_load_n(&g_serving, __ATOMIC_ACQUIRE) > 0; ++k) sleep_ms(100);
   pthread_mutex_lock(&g_inst.mu);
   close(g_inst.srv);
   g_inst.srv = -1;
@@ -2816,8 +2953,7 @@ done:
   if (g_inst.source) memset(g_inst.source, 0, g_inst.source_len); /* the password */
   free(g_inst.source);
   g_inst.source = NULL;
-  free(g_inst.blocks);
-  g_inst.blocks = NULL;
+  install_forget();
   g_inst.active = 0;
   g_inst.lingering = 0;
   pthread_mutex_unlock(&g_inst.mu);
@@ -2846,6 +2982,10 @@ static int run_install(int ctl, char *line) {
   if (title_len >= MAX_TITLE || source_len < 4 || source_len > MAX_REQUEST ||
       strtoull(field[3], NULL, 10) == 0) {
     send_line(ctl, "ERR request bad request");
+    return 0;
+  }
+  if (!g_watchdog) { /* a stuck installer call would hold the helper for good */
+    send_line(ctl, "ERR install the copy helper couldn't start its safety check. Restart the PS5");
     return 0;
   }
   pthread_mutex_lock(&g_inst.mu);
@@ -2902,16 +3042,10 @@ static int run_install(int ctl, char *line) {
            (unsigned long long)now_ms());
   g_inst.stop = 0;
   g_inst.served = 0;
-  g_inst.covered = 0;
   g_inst.lingering = 0;
-  free(g_inst.blocks);
-  g_inst.blocks = calloc((size_t)((g_inst.size + COVER_BLOCK - 1) / COVER_BLOCK + 7) / 8, 1);
-  if (!g_inst.blocks) {
-    close(srv);
-    g_inst.srv = -1;
-    send_line(ctl, "ERR install out of memory");
-    goto fail;
-  }
+  g_inst.changed = 0;
+  install_forget();
+  g_heard_n = 0;
   g_inst.ctl = ctl;
   for (k = 0; k < MAX_SERVED; ++k) g_inst.conns[k] = -1;
   {
@@ -3108,7 +3242,10 @@ int main(void) {
   g_main_srv = srv;
   {
     pthread_t dog;
-    if (start_thread(&dog, watchdog_main, NULL) == 0) pthread_detach(dog);
+    if (start_thread(&dog, watchdog_main, NULL) == 0) {
+      pthread_detach(dog);
+      g_watchdog = 1;
+    }
   }
 #ifndef COPIER_HOST_TEST
   if (elevate() != 0)

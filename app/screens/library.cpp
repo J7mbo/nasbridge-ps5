@@ -1376,9 +1376,10 @@ class Library final : public app::Concept
         case Command::unqueue:
         {
             const int at = queued_at(game);
-            if (at >= 0 && queue_.entries[static_cast<std::size_t>(at)].started)
+            if (at >= 0 && (queue_.entries[static_cast<std::size_t>(at)].started ||
+                            queue_.entries[static_cast<std::size_t>(at)].accepted))
             {
-                open_confirm(command, game, feedback); // it has files to delete
+                open_confirm(command, game, feedback); // it has files to delete, or a part install
                 return;
             }
             ok = at >= 0 && transfers_.remove(at, &why);
@@ -1386,7 +1387,7 @@ class Library final : public app::Concept
         }
         case Command::enqueue:
             ok = transfers_.enqueue(connection_.connection(), game.source, game.title,
-                                    target_of(game), &why);
+                                    target_of(game), &why, game.on_ps5);
             if (ok)
             {
                 // Back to the library, with the queue open on the right to
@@ -1465,10 +1466,15 @@ class Library final : public app::Concept
             const int at = queued_at(game);
             const QueueEntry &item = queue_.entries[static_cast<std::size_t>(std::max(at, 0))];
             content.title = "Remove " + game.title + " from the queue?";
-            content.body = "The " + gigabytes(static_cast<double>(item.done) / 1e9) +
-                           " copied so far will be deleted from " +
-                           destination_name(item.destination) +
-                           ". The game on your NAS isn't touched.";
+            if (item.package)
+                content.body = "The PS5's part install of it will be removed, freeing the room it "
+                               "set aside (an update or add-on is left for you to remove from the "
+                               "PS5's Downloads). The package on your NAS isn't touched.";
+            else
+                content.body = "The " + gigabytes(static_cast<double>(item.done) / 1e9) +
+                               " copied so far will be deleted from " +
+                               destination_name(item.destination) +
+                               ". The game on your NAS isn't touched.";
             content.buttons = {{"Cancel"}, {"Remove", ui::ButtonKind::primary, true}};
         }
         else
@@ -2125,9 +2131,10 @@ class Library final : public app::Concept
         }
         else if (game.from_nas && queue_.finished_entry == game.source.entry)
         {
-            label = is_package(game) ? "Installed on" : "Copied to";
+            label = is_package(game) ? "Sent to" : "Copied to";
             heading = destination_name(queue_.finished_destination);
-            text = is_package(game) ? "The game is on your home screen"
+            text = is_package(game) ? "The PS5 is finishing the install: the game shows on the home "
+                                      "screen when it's done"
                                     : "ShadowMountPlus is adding the game to the home screen";
             progress = 1.0f;
         }

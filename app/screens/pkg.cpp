@@ -182,10 +182,25 @@ bool PkgReader::open(PkgInfo *info, std::string *why)
         const std::string name = name_at < names.size() ? printable(names, name_at, 64) : "";
         if ((flags & kEncrypted) != 0 || part.size == 0)
             continue;
+        // A param that is there but can't be read (the connection dropped)
+        // fails the look: a later one tries again, rather than listing the
+        // package without its title or kind.
         if ((id == 0x2000 || name == "param.json") && info->param.empty() && part.size <= kMaxParam)
-            read_(part.offset, part.size, &info->param);
+        {
+            if (!read_(part.offset, part.size, &info->param) || info->param.size() < part.size)
+            {
+                *why = "the package's param.json couldn't be read";
+                return false;
+            }
+        }
         else if ((id == 0x1000 || name == "param.sfo") && param_sfo.empty() && part.size <= kMaxParam)
-            read_(part.offset, part.size, &param_sfo);
+        {
+            if (!read_(part.offset, part.size, &param_sfo) || param_sfo.size() < part.size)
+            {
+                *why = "the package's param.sfo couldn't be read";
+                return false;
+            }
+        }
         else if ((id == 0x1200 || name == "icon0.png") && info->icon.size == 0)
             info->icon = part;
         else if ((id == 0x1220 || name == "pic0.png") && info->art.size == 0)

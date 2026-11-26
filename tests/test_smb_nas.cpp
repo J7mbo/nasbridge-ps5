@@ -75,6 +75,20 @@ bool same(const std::string &a, const std::string &b)
     return std::system(("cmp -s \"" + a + "\" \"" + b + "\"").c_str()) == 0;
 }
 
+// The stand-in installer's copy: it lands (renamed into place, whole) a
+// moment after the helper says the installer has everything.
+bool installed_same(const std::string &source, const std::string &installed)
+{
+    for (int i = 0; i < 100; ++i)
+    {
+        struct stat st;
+        if (::stat(installed.c_str(), &st) == 0)
+            return same(source, installed);
+        sleep_ms(100);
+    }
+    return false;
+}
+
 bool there(const std::string &path)
 {
     struct stat st;
@@ -404,7 +418,7 @@ int main(int argc, char **argv)
             package.entry = package.image_path = "Img.pkg";
             std::system(("cp \"" + g + "/Img.exfat\" \"" + g + "/Img.pkg\"").c_str());
             check(copy(transfers, connection, package, kInternalGames, &message) &&
-                      same(g + "/Img.pkg", work + "/ps5root/installed.pkg"),
+                      installed_same(g + "/Img.pkg", work + "/ps5root/installed.pkg"),
                   "a package installs over SMB, byte for byte", message);
             std::remove((g + "/Img.pkg").c_str());
         }

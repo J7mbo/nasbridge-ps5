@@ -102,6 +102,20 @@ bool same(const std::string &a, const std::string &b)
     return std::system(("cmp -s \"" + a + "\" \"" + b + "\"").c_str()) == 0;
 }
 
+// The stand-in installer's copy: it lands (renamed into place, whole) a
+// moment after the helper says the installer has everything.
+bool installed_same(const std::string &source, const std::string &installed)
+{
+    for (int i = 0; i < 100; ++i)
+    {
+        struct stat st;
+        if (::stat(installed.c_str(), &st) == 0)
+            return same(source, installed);
+        sleep_ms(100);
+    }
+    return false;
+}
+
 bool there(const std::string &path)
 {
     struct stat st;
@@ -1879,14 +1893,16 @@ int main(int argc, char **argv)
                 transfers.set_space_check(space);
                 check(transfers.enqueue(connection, package, "Pkg Game", kInternalGames, &why),
                       "a package joins the queue", why);
-                check(transfers.queue().entries.size() == 1 && transfers.queue().entries[0].package,
-                      "as an install");
+                {
+                    const QueueStatus queued = transfers.queue();
+                    check(queued.entries.size() == 1 && queued.entries[0].package, "as an install");
+                }
                 wait_for(transfers, stopped, 120);
                 const QueueStatus q = transfers.queue();
                 check(q.state == QueueState::idle && q.finished_entry == "Game.pkg" &&
-                          same(nas + "/games/Game.pkg", ps5root + "/installed.pkg"),
+                          installed_same(nas + "/games/Game.pkg", ps5root + "/installed.pkg"),
                       "the installer gets the whole package, range by range", q.message);
-                check(noted(notes(), "Pkg Game is installed."), "a finished install is announced");
+                check(noted(notes(), "Pkg Game is on the PS5: its installer is finishing the install."), "a finished install is announced");
                 check(!there(g_work + "/app/queue.txt"), "nothing is left in the queue");
 
                 // The installer refuses it: the queue stops and says why.
@@ -1894,14 +1910,21 @@ int main(int argc, char **argv)
                 check(transfers.enqueue(connection, package, "Pkg Game", kInternalGames, &why),
                       "queued again", why);
                 wait_for(transfers, stopped, 60);
-                check(transfers.queue().state == QueueState::failed &&
-                          transfers.queue().message.find("refused it (code 0x80990002)") !=
-                              std::string::npos,
-                      "a refused install stops the queue with the installer's code",
-                      transfers.queue().message);
+                {
+                    const QueueStatus refused = transfers.queue();
+                    check(refused.state == QueueState::failed &&
+                              refused.message.find("refused it (code 0x80990002)") != std::string::npos,
+                          "a refused install stops the queue with the installer's code",
+                          refused.message);
+                    check(!refused.entries.empty() && !refused.entries[0].accepted,
+                          "a refused package holds no part install");
+                }
                 check(noted(notes(), "Installing Pkg Game stopped: "), "and is announced");
                 std::remove((ps5root + "/install_refused").c_str());
                 check(transfers.remove(0, &why), "it can be removed", why);
+                check(wait_for(transfers, [](const QueueStatus &q) { return q.discarding.empty(); }, 10) &&
+                          read_text(ps5root + "/uninstalled.txt").find("PPSA04444") == std::string::npos,
+                      "removing it uninstalls nothing: the PS5 never took it");
                 std::remove((ps5root + "/installed.pkg").c_str());
             }
             notes();
