@@ -10,6 +10,7 @@
 #include "concepts/http.hpp"
 #include "concepts/library_cache.hpp"
 #include "concepts/nas.hpp"
+#include "concepts/nas_probe.hpp"
 #include "concepts/notify.hpp"
 #include "concepts/smp.hpp"
 #include "concepts/storage.hpp"
@@ -422,6 +423,8 @@ std::string plan_to_text(const CopyPlan &plan)
     line("title", plan.title);
     line("title_id", plan.title_id);
     line("image", plan.image ? "1" : "0");
+    if (plan.package)
+        line("package", "1");
     line("source", plan.source);
     line("destination", plan.destination);
     line("name", plan.name);
@@ -467,6 +470,8 @@ bool plan_from_text(const std::string &text, CopyPlan *plan)
             plan->title_id = value;
         else if (key == "image")
             plan->image = value == "1";
+        else if (key == "package")
+            plan->package = value == "1";
         else if (key == "source")
             plan->source = value;
         else if (key == "destination")
@@ -2520,6 +2525,98 @@ void wait_for_drive(const SharedPtr &shared, const Item &head)
                " isn't connected. It carries on when the drive is back.");
 }
 
+// Installs the front game when it's a package (.pkg): the copy helper serves
+// it from the NAS to the PS5's installer. `done` follows what the installer
+// has. NASBridge closing doesn't stop it: the helper carries on alone.
+Outcome install_package(const Connection &connection, const SharedPtr &shared, const Item &head,
+                        std::string *why)
+{
+    const std::string entry = head.plan.entry;
+    const std::uint64_t size = head.size();
+    if (size == 0)
+    {
+        *why = "the package's size isn't known yet";
+        return Outcome::failed;
+    }
+    {
+        std::lock_guard<std::mutex> hold(shared->lock);
+        if (Item *item = shared->item(entry))
+            item->done = 0;
+        shared->phase = TransferState::preparing;
+        shared->detail.clear();
+        shared->rate = 0.0;
+    }
+    std::uint64_t last_done = 0;
+    std::uint64_t last_ms = now_ms();
+    const auto progress = [&](std::uint64_t done, std::uint64_t)
+    {
+        const std::uint64_t now = now_ms();
+        std::lock_guard<std::mutex> hold(shared->lock);
+        if (Item *item = shared->item(entry))
+            item->done = done;
+        if (done > 0)
+            shared->phase = TransferState::copying;
+        if (now - last_ms >= 1000)
+        {
+            const double rate = static_cast<double>(done > last_done ? done - last_done : 0) * 1000.0 /
+                                static_cast<double>(now - last_ms);
+            shared->rate = shared->rate <= 0.0 ? rate : shared->rate * 0.7 + rate * 0.3;
+            last_done = done;
+            last_ms = now;
+        }
+    };
+    // Pause stops the install; closing NASBridge leaves it to the helper.
+    const auto stopping = [&] { return shared->pause.load() && !shared->stop.load(); };
+    // The installer shows this while it installs.
+    std::string title = head.plan.title.substr(0, 200);
+    HelperInstall result;
+    if (connection.type == ConnectionType::smb)
+    {
+        SmbSignIn sign_in;
+        sign_in.share = smb_location(folder_path(connection)).share;
+        split_smb_user(connection.username, &sign_in.domain, &sign_in.user);
+        if (sign_in.user.empty())
+            sign_in.user = "guest";
+        sign_in.password = connection.password;
+        result = install_smb_with_helper(connection.host, connection.effective_port(), size, title,
+                                         sign_in, smb_location(head.plan.source).path, progress,
+                                         stopping);
+    }
+    else
+    {
+        result = install_with_helper(connection.host, connection.effective_port(), size, title,
+                                     build_request(connection, "GET", head.plan.source, "", ""),
+                                     progress, stopping);
+    }
+    {
+        std::lock_guard<std::mutex> hold(shared->lock);
+        shared->rate = 0.0;
+    }
+    using End = HelperInstall::End;
+    switch (result.end)
+    {
+    case End::ok:
+        return Outcome::done;
+    case End::stopped:
+        return Outcome::paused;
+    case End::unavailable:
+        *why = "the copy helper couldn't install it" +
+               (result.why.empty() ? std::string() : " (" + result.why + ")") +
+               ". Is the jailbreak loaded?";
+        return Outcome::failed;
+    case End::busy:
+        *why = "an earlier install is still running. Try again once it's finished";
+        return Outcome::failed;
+    case End::failed:
+        *why = result.why.empty() ? "the PS5's installer stopped" : result.why;
+        return Outcome::failed;
+    case End::lost:
+        *why = result.why.empty() ? "the copy helper stopped answering" : result.why;
+        return Outcome::failed;
+    }
+    return Outcome::failed;
+}
+
 void run_queue(const SharedPtr &shared)
 {
     while (true)
@@ -2569,6 +2666,30 @@ void run_queue(const SharedPtr &shared)
             shared->message.clear();
         }
         std::string why;
+        if (head.plan.package)
+        {
+            const Outcome outcome = install_package(connection, shared, head, &why);
+            if (outcome == Outcome::done)
+            {
+                {
+                    std::lock_guard<std::mutex> hold(shared->lock);
+                    for (std::size_t i = 0; i < shared->queue.size(); ++i)
+                        if (shared->queue[i].plan.entry == head.plan.entry)
+                            shared->queue.erase(shared->queue.begin() + static_cast<long>(i));
+                    shared->finished_entry = head.plan.entry;
+                    shared->finished_destination = head.plan.destination;
+                    shared->phase = TransferState::idle;
+                    shared->save();
+                }
+                ps5_notify(head.plan.title + " is installed.");
+                continue;
+            }
+            if (outcome == Outcome::paused)
+                return stop_queue(shared, QueueState::paused, "");
+            stop_queue(shared, QueueState::failed, why);
+            ps5_notify("Installing " + head.plan.title + " stopped: " + why);
+            return;
+        }
         Copier copier(connection, shared, head.plan.entry);
         const Outcome outcome = copier.run(&why);
         switch (outcome)
@@ -3164,7 +3285,8 @@ void Transfers::load()
     std::lock_guard<std::mutex> hold(shared_->lock);
     shared_->queue.clear();
     for (const SavedItem &item : saved)
-        shared_->queue.push_back({item.plan, item.estimate, item.done, item.started});
+        if (!item.plan.package) // an install isn't resumed: the helper finished it
+            shared_->queue.push_back({item.plan, item.estimate, item.done, item.started});
     shared_->state = shared_->queue.empty() ? QueueState::idle : QueueState::paused;
     shared_->message = shared_->queue.empty() ? "" : "Stopped when NASBridge closed";
     shared_->save();
@@ -3221,6 +3343,7 @@ bool Transfers::enqueue(const Connection &connection, const NasGame &game, const
     plan.title = title;
     plan.title_id = game.title_id;
     plan.image = game.image;
+    plan.package = game.image && is_package_name(game.image_path);
     plan.source = copy_source(connection, game);
     plan.destination = destination;
     plan.name = copy_name(game);
@@ -3442,6 +3565,7 @@ QueueStatus Transfers::queue() const
         entry.done = std::min(item.done, item.size());
         entry.started = item.started;
         entry.image = item.plan.image;
+        entry.package = item.plan.package;
         status.entries.push_back(entry);
     }
     status.phase = shared_->phase;

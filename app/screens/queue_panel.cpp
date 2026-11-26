@@ -484,7 +484,7 @@ void QueuePanel::draw(gfx::DrawList &list, std::uint32_t glass, float clock,
             // The file count of a folder game is on its own row below.
             char text[96];
             std::vector<Part> parts;
-            parts.push_back({"Copying"});
+            parts.push_back({head.package ? "Installing" : "Copying"});
             std::snprintf(text, sizeof(text), "%d%%",
                           static_cast<int>(100.0 * static_cast<double>(head.done) /
                                            static_cast<double>(head.size)));

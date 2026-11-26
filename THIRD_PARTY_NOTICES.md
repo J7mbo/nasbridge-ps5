@@ -91,6 +91,15 @@ GPL-3.0-or-later), by way of the kit, whose source includes this code:
   [Dump Forge](https://github.com/quer3q/ps5-dump-forge) (quer3q), both
   GPL-3.0-or-later; UFS2's comes from FreeBSD's public headers. No code was
   copied from them. Its zlib blocks are inflated by stb_image's zlib decoder.
+- **Installing game packages** (`app/screens/pkg.cpp`, and the "installing
+  a package" part of `tools/copier/copier.c`) is NASBridge's own code. The
+  package layout, the PS5 installer's calls and structures
+  (`sceAppInstUtilInstallByPackage`, `sceAppInstUtilGetInstallStatus`) and
+  how the installer reads a package over HTTP were learned from
+  [ps5-pkg-manager](https://github.com/itsPLK/ps5-pkg-manager) (itsPLK,
+  GPL-3.0), [LibProsperoPKG](https://github.com/SvenGDK/LibProsperoPKG)
+  (SvenGDK) and etaHEN's package install write-up. Only the structure layouts
+  follow ps5-pkg-manager's.
 - **Home-screen artwork** (`app/sce_sys/icon0.png`, `pic0.dds`, `pic1.dds`) is
   NASBridge's own. The backgrounds are rendered by `tools/make_background.py`.
 

@@ -8,6 +8,7 @@
 #include "concepts/library_cache.hpp"
 #include "concepts/nas.hpp"
 #include "concepts/nas_probe.hpp"
+#include "concepts/pkg.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -564,7 +565,13 @@ struct LibraryLoader::Job
             {
                 if (!entry.folder)
                 {
-                    if (image_path.empty() && is_image_name(entry.name))
+                    // An image wins over a package; of several packages
+                    // (a game, its update, add-ons), the biggest: the game.
+                    const bool better =
+                        image_path.empty() ||
+                        (is_package_name(image.name) &&
+                         (!is_package_name(entry.name) || entry.size > image.size));
+                    if (is_image_name(entry.name) && better)
                     {
                         image = entry;
                         image_path = folder.path + "/" + entry.name;
@@ -637,6 +644,11 @@ struct LibraryLoader::Job
         if (is_compressed_image_name(game->image_path))
         {
             read_compressed_image(root, game);
+            return;
+        }
+        if (is_package_name(game->image_path))
+        {
+            read_package(root, game);
             return;
         }
         ExfatReader reader(image_reader(root + game->image_path));
@@ -731,6 +743,32 @@ struct LibraryLoader::Job
             game->note = "the image's sce_sys has no cover picture";
     }
 
+    // A package (.pkg): its metadata, at its start. The pictures' places
+    // aren't cached: a later fetch reads the metadata again.
+    void read_package(const std::string &root, NasGame *game)
+    {
+        PkgReader reader(image_reader(root + game->image_path));
+        PkgInfo info;
+        std::string why;
+        if (!reader.open(&info, &why))
+        {
+            if (!cancelled)
+                game->note = "couldn't look inside the package: " + why;
+            return;
+        }
+        game->inside = true;
+        if (!info.title.empty())
+            game->title = info.title;
+        if (!info.kind().empty())
+            game->title += " (" + info.kind() + ")";
+        game->title_id = info.title_id;
+        game->version = info.version;
+        game->cover_file.name = info.icon.size > 0 ? "icon0.png" : info.art.size > 0 ? "pic0.png" : "";
+        game->art_file.name = info.art.size > 0 ? "pic0.png" : "";
+        if (game->cover_file.name.empty() && game->note.empty())
+            game->note = "the package has no cover picture";
+    }
+
     // ---- pictures ----
 
     // One of a game's sce_sys pictures, from the NAS.
@@ -739,6 +777,20 @@ struct LibraryLoader::Job
     {
         if (file.name.empty())
             return false;
+        if (game.image && is_package_name(game.image_path))
+        {
+            if (!game.inside)
+                return false;
+            PkgReader reader(image_reader(root + game.image_path));
+            PkgInfo info;
+            if (!reader.open(&info, why) ||
+                !reader.read(file.name == "pic0.png" ? info.art : info.icon, kMaxIcon, data, why))
+            {
+                *why = file.name + " in the package: " + *why;
+                return false;
+            }
+            return true;
+        }
         if (game.image && is_compressed_image_name(game.image_path))
         {
             if (!game.inside)

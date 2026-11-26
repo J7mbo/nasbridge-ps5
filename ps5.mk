@@ -340,7 +340,7 @@ PICKER_SRCS := tests/test_folder_picker.cpp $(LIBSMB2_HOST) \
 HOST_COUNT := build/host/test_game_count
 COUNT_SRCS := tests/test_game_count.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,nas_probe.cpp http.cpp connection.cpp nas_library.cpp \
-    library_cache.cpp exfat.cpp pfs.cpp ufs2.cpp ffpfsc.cpp png.cpp nas.cpp) \
+    library_cache.cpp exfat.cpp pfs.cpp ufs2.cpp ffpfsc.cpp pkg.cpp png.cpp nas.cpp) \
   $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
 
 # Compressed images (.ffpfsc): the readers on images made by MkPFS and Dump
@@ -348,7 +348,7 @@ COUNT_SRCS := tests/test_game_count.cpp $(LIBSMB2_HOST) \
 HOST_FFPFSC := build/host/test_ffpfsc
 FFPFSC_SRCS := tests/test_ffpfsc.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,nas_probe.cpp http.cpp connection.cpp nas_library.cpp \
-    library_cache.cpp exfat.cpp pfs.cpp ufs2.cpp ffpfsc.cpp png.cpp nas.cpp) \
+    library_cache.cpp exfat.cpp pfs.cpp ufs2.cpp ffpfsc.cpp pkg.cpp png.cpp nas.cpp) \
   $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
 FFPFSC_FIXTURES := build/host/ffpfsc-fixtures
 
@@ -394,7 +394,7 @@ SMB_SRCS := tests/test_smb.cpp $(LIBSMB2_HOST) $(APP_WORK)/src/concepts/connecti
 HOST_SMB_NAS := build/host/test_smb_nas
 SMB_NAS_SRCS := tests/test_smb_nas.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,nas.cpp nas_library.cpp library_cache.cpp exfat.cpp pfs.cpp \
-    ufs2.cpp ffpfsc.cpp png.cpp nas_probe.cpp http.cpp connection.cpp transfer.cpp copy_helper.cpp \
+    ufs2.cpp ffpfsc.cpp pkg.cpp png.cpp nas_probe.cpp http.cpp connection.cpp transfer.cpp copy_helper.cpp \
     delete_helper.cpp file_calls.cpp smp.cpp json_scan.cpp notify.cpp storage.cpp) \
   $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
 

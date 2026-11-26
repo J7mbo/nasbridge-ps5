@@ -33,6 +33,12 @@
 // knows each file from the plan; it can't list folders in its sandbox). The
 // game being copied can only be removed once the queue is paused.
 //
+// A game package (.pkg) takes its turn in the queue too, but isn't copied:
+// the copy helper serves it from the NAS to the PS5's own installer
+// (install_with_helper). Pause stops the install (the installer can't pause);
+// Resume starts it again. An install isn't saved with the queue: if NASBridge
+// closes, the helper finishes it on its own.
+//
 // Deleting a game on the PS5 is separate (it can run while the queue copies):
 // ShadowMountPlus deletes its files, then removes it from the home screen.
 
@@ -64,6 +70,7 @@ struct CopyPlan
     std::string title;
     std::string title_id;
     bool image = false;
+    bool package = false;    // a .pkg: installed by the PS5, not copied (image too)
     std::string source;      // on the NAS, decoded: the folder ("/games/Game/") or the file
     std::string destination; // "/data/homebrew", "/mnt/usb0/homebrew", ...
     std::string name;        // the folder or file name it gets there
@@ -135,6 +142,7 @@ struct QueueEntry
     std::uint64_t done = 0; // bytes already on the drive
     bool started = false;   // has files on the drive (removing it deletes them)
     bool image = false;     // an image (one file), not a folder game
+    bool package = false;   // a .pkg the PS5 installs (`done`: what its installer has)
 };
 
 struct QueueStatus

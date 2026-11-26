@@ -225,6 +225,8 @@ bool count_in(const std::string &root, const std::vector<Listed> &top, const Lis
             ++count->image_games;
             if (is_compressed_image_name(entry.name))
                 ++count->compressed_games;
+            if (is_package_name(entry.name))
+                ++count->package_games;
         }
     }
     int done = 0;
@@ -262,7 +264,9 @@ bool count_in(const std::string &root, const std::vector<Listed> &top, const Lis
             {
                 if (!item.folder)
                 {
-                    if (image.empty() && is_image_name(item.name))
+                    // An image wins over a package (as in the library).
+                    if (is_image_name(item.name) &&
+                        (image.empty() || (is_package_name(image) && !is_package_name(item.name))))
                         image = item.name;
                 }
                 else if (lowered(item.name) == "sce_sys")
@@ -280,6 +284,8 @@ bool count_in(const std::string &root, const std::vector<Listed> &top, const Lis
             ++count->image_games;
             if (is_compressed_image_name(image))
                 ++count->compressed_games;
+            if (is_package_name(image))
+                ++count->package_games;
         }
         else
             ++count->other_folders;
@@ -293,7 +299,13 @@ bool count_in(const std::string &root, const std::vector<Listed> &top, const Lis
 
 bool is_image_name(const std::string &name)
 {
-    return ends_with_nocase(name, ".exfat") || is_compressed_image_name(name);
+    return ends_with_nocase(name, ".exfat") || is_compressed_image_name(name) ||
+           is_package_name(name);
+}
+
+bool is_package_name(const std::string &name)
+{
+    return ends_with_nocase(name, ".pkg");
 }
 
 bool is_compressed_image_name(const std::string &name)
@@ -313,7 +325,7 @@ std::string describe_count(const Connection &connection, const GameCount &count)
     else
     {
         text = "Found " + plural(games, "game", "games") + ": ";
-        const int exfat = count.image_games - count.compressed_games;
+        const int exfat = count.image_games - count.compressed_games - count.package_games;
         std::vector<std::string> kinds;
         if (count.folder_games > 0)
             kinds.push_back(plural(count.folder_games, "folder game", "folder games"));
@@ -321,6 +333,8 @@ std::string describe_count(const Connection &connection, const GameCount &count)
             kinds.push_back(plural(exfat, ".exfat game", ".exfat games"));
         if (count.compressed_games > 0)
             kinds.push_back(plural(count.compressed_games, ".ffpfsc game", ".ffpfsc games"));
+        if (count.package_games > 0)
+            kinds.push_back(plural(count.package_games, ".pkg game", ".pkg games"));
         if (kinds.size() > 1)
         {
             for (std::size_t i = 0; i < kinds.size(); ++i)
@@ -334,9 +348,13 @@ std::string describe_count(const Connection &connection, const GameCount &count)
         {
             text += exfat == 1 ? "an .exfat game" : "all .exfat games";
         }
-        else
+        else if (count.compressed_games > 0)
         {
             text += count.compressed_games == 1 ? "a .ffpfsc game" : "all .ffpfsc games";
+        }
+        else
+        {
+            text += count.package_games == 1 ? "a .pkg game" : "all .pkg games";
         }
         text += ".";
     }

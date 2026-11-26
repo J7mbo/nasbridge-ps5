@@ -1864,6 +1864,48 @@ int main(int argc, char **argv)
             clean("Copy.exfat");
             notes();
 
+            // f. A package (.pkg) isn't copied: the helper serves it to the
+            //    PS5's installer (here a stand-in that reads it as the PS5's
+            //    does, into ps5root/installed.pkg), straight from the NAS.
+            {
+                write_file(nas + "/games/Game.pkg", (40u << 20) + 12345, 41);
+                NasGame package;
+                package.entry = "Game.pkg";
+                package.image = true;
+                package.image_path = "Game.pkg";
+                package.title_id = "PPSA04444";
+                package.size = (40u << 20) + 12345;
+                Transfers transfers;
+                transfers.set_space_check(space);
+                check(transfers.enqueue(connection, package, "Pkg Game", kInternalGames, &why),
+                      "a package joins the queue", why);
+                check(transfers.queue().entries.size() == 1 && transfers.queue().entries[0].package,
+                      "as an install");
+                wait_for(transfers, stopped, 120);
+                const QueueStatus q = transfers.queue();
+                check(q.state == QueueState::idle && q.finished_entry == "Game.pkg" &&
+                          same(nas + "/games/Game.pkg", ps5root + "/installed.pkg"),
+                      "the installer gets the whole package, range by range", q.message);
+                check(noted(notes(), "Pkg Game is installed."), "a finished install is announced");
+                check(!there(g_work + "/app/queue.txt"), "nothing is left in the queue");
+
+                // The installer refuses it: the queue stops and says why.
+                std::ofstream(ps5root + "/install_refused") << "";
+                check(transfers.enqueue(connection, package, "Pkg Game", kInternalGames, &why),
+                      "queued again", why);
+                wait_for(transfers, stopped, 60);
+                check(transfers.queue().state == QueueState::failed &&
+                          transfers.queue().message.find("refused it (code 0x80990002)") !=
+                              std::string::npos,
+                      "a refused install stops the queue with the installer's code",
+                      transfers.queue().message);
+                check(noted(notes(), "Installing Pkg Game stopped: "), "and is announced");
+                std::remove((ps5root + "/install_refused").c_str());
+                check(transfers.remove(0, &why), "it can be removed", why);
+                std::remove((ps5root + "/installed.pkg").c_str());
+            }
+            notes();
+
             // e. The helper can't be started (no loader answers): copied in-app.
             set_copy_helper(copier, 18099, 18098);
             {
