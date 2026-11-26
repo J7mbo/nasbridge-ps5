@@ -2787,9 +2787,23 @@ std::string discard_files(const CopyPlan &plan, const std::function<void(float)>
     return problem;
 }
 
+// A package install stopped partway: the PS5 keeps it (and the room it set
+// aside for the whole game) until it's uninstalled.
+std::string discard_install(const CopyPlan &plan)
+{
+    if (plan.title_id.empty())
+        return "its title ID isn't known. Delete it from the PS5's home screen";
+    const DeleteResult result = delete_with_helper(plan.title_id, "", nullptr);
+    if (!result.ok)
+        return (result.why.empty() ? std::string("the PS5 refused") : result.why) +
+               ". Delete it from the PS5's home screen";
+    ps5_notify("Removed the part-installed " + plan.title + " from the PS5.");
+    return "";
+}
+
 void run_discard(const SharedPtr &shared, const CopyPlan &plan)
 {
-    const std::string problem = discard_files(plan,
+    const std::string problem = plan.package ? discard_install(plan) : discard_files(plan,
                                               [&](float done)
                                               {
                                                   std::lock_guard<std::mutex> hold(shared->lock);
@@ -2802,7 +2816,8 @@ void run_discard(const SharedPtr &shared, const CopyPlan &plan)
         shared->discarded.erase(plan.entry);
     }
     if (!problem.empty())
-        ps5_notify("Couldn't delete the copied files of " + plan.title + ": " + problem);
+        ps5_notify(plan.package ? "Couldn't remove the part-installed " + plan.title + ": " + problem
+                                : "Couldn't delete the copied files of " + plan.title + ": " + problem);
 }
 
 // ---- deleting a game on the PS5 ----
@@ -3483,7 +3498,8 @@ bool Transfers::remove(int index, std::string *why)
         shared_->message.clear();
     }
     shared_->save();
-    if (item.started || item.plan.listed)
+    // A package the PS5's installer started on: its half install goes too.
+    if (item.started || item.plan.listed || (item.plan.package && item.done > 0))
     {
         // Its copied files go, on a thread of their own.
         shared_->discarding.push_back(item.plan.entry);
