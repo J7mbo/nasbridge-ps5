@@ -2171,9 +2171,49 @@ static void run_file_step(int ctl, char *line) {
 
 #define INSTALL_PROTO "NBK1"
 #define INSTALL_POLL_MS 500
-#define INSTALL_IDLE_S 300   /* the installer asked for nothing this long: failed */
+#define INSTALL_IDLE_S 120   /* the installer asked for nothing this long: failed */
 #define SERVE_BUF (4u << 20) /* one piece sent to the installer */
 #define SERVE_IDLE_S 120     /* a keep-alive connection the installer forgot */
+#ifndef COPIER_HOST_TEST
+#define INSTALL_LOG "/data/nasbridge-install.log"
+#endif
+
+/* A line in the install log (what the installer did, for working out why an
+ * install didn't go), with the time since the helper started. */
+static void install_log(const char *fmt, ...) {
+  static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+  char path[600];
+  const char *file;
+  FILE *f;
+  va_list ap;
+  struct timeval tv;
+  struct tm tm;
+  char when[32];
+#ifdef INSTALL_LOG
+  file = INSTALL_LOG;
+#else
+  {
+    const char *prefix = getenv("NB_TEST_PREFIX");
+    snprintf(path, sizeof path, "%s/install.log", prefix ? prefix : ".");
+    file = path;
+  }
+#endif
+  (void)path;
+  gettimeofday(&tv, NULL);
+  localtime_r(&tv.tv_sec, &tm);
+  strftime(when, sizeof when, "%H:%M:%S", &tm);
+  pthread_mutex_lock(&mu);
+  f = fopen(file, "a");
+  if (f) {
+    fprintf(f, "%s.%03d ", when, (int)(tv.tv_usec / 1000));
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+  }
+  pthread_mutex_unlock(&mu);
+}
 #define MAX_TITLE 512
 #define MAX_SERVED 16        /* the installer's connections at once */
 
@@ -2393,6 +2433,7 @@ static void *serve_main(void *arg) {
       slot = k;
     }
   pthread_mutex_unlock(&g_inst.mu);
+  install_log("installer connected (connection %d)", slot);
   while (head && s.buf && slot >= 0 && !install_stopping()) {
     size_t have = 0;
     char *end = NULL, method[16], path[1024], *query;
@@ -2412,6 +2453,11 @@ static void *serve_main(void *arg) {
     g_inst.last_asked = now_ms();
     pthread_mutex_unlock(&g_inst.mu);
     if (sscanf(head, "%15s %1023s", method, path) != 2) break;
+    {
+      char range_value[96] = "-";
+      header(head, "Range", range_value, sizeof range_value);
+      install_log("request on connection %d: %s %s range %s", slot, method, path, range_value);
+    }
     {
       char value[64];
       keep = !(header(head, "Connection", value, sizeof value) && strcasecmp(value, "close") == 0);
@@ -2462,6 +2508,7 @@ static void *serve_main(void *arg) {
     }
     if (!keep) break;
   }
+  install_log("connection %d closed", slot);
   pthread_mutex_lock(&g_inst.mu);
   if (slot >= 0) g_inst.conns[slot] = -1;
   pthread_mutex_unlock(&g_inst.mu);
@@ -2516,13 +2563,17 @@ static int system_install(const char *uri, const char *title, char *content_id, 
     user_init_t user_init = (user_init_t)dlsym(user_h, "sceUserServiceInitialize");
     if (user_init) user_init(NULL);
   }
+  install_log("user service %s", user_h ? "loaded" : "NOT loaded");
   inst_h = dlopen("/system/common/lib/libSceAppInstUtil.sprx", RTLD_LAZY);
+  install_log("AppInstUtil %s", inst_h ? "loaded" : "NOT loaded");
   if (!inst_h) return -1;
   inst_init = (appinst_init_t)dlsym(inst_h, "sceAppInstUtilInitialize");
   install = (appinst_install_t)dlsym(inst_h, "sceAppInstUtilInstallByPackage");
   g_status_fn = (appinst_status_fn_t)dlsym(inst_h, "sceAppInstUtilGetInstallStatus");
+  install_log("init %p, install %p, status %p", (void *)inst_init, (void *)install,
+              (void *)g_status_fn);
   if (!install || !g_status_fn) return -1;
-  if (inst_init) inst_init();
+  if (inst_init) install_log("init returned 0x%08X", (unsigned)inst_init());
   memset(&meta, 0, sizeof meta);
   memset(&info, 0, sizeof info);
   memset(&playgo, 0, sizeof playgo);
@@ -2532,8 +2583,11 @@ static int system_install(const char *uri, const char *title, char *content_id, 
   meta.content_id = "";
   meta.content_name = title;
   meta.icon_url = "";
+  install_log("asking the installer for %s (\"%s\")", uri, title);
   rc = install(&meta, &info, &playgo);
   info.content_id[sizeof info.content_id - 1] = '\0';
+  install_log("install returned 0x%08X, content id \"%s\", type %d, platform %d", (unsigned)rc,
+              info.content_id, info.type, info.platform);
   snprintf(content_id, size, "%s", info.content_id);
   return rc;
 }
@@ -2697,8 +2751,10 @@ static int install_listen(void) {
 static void *install_main(void *arg) {
   char uri[128], content_id[64] = "", message[700];
   pthread_t acceptor;
-  int rc, k, stopped = 0, have_acceptor = 0;
-  uint64_t started = now_ms(), last_down = 0;
+  int rc, k, stopped = 0, have_acceptor = 0, last_rc = 1;
+  int32_t last_error = 0;
+  char last_status[16] = "";
+  uint64_t started = now_ms(), last_down = 0, last_logged = 0;
   appinst_status_t st;
   (void)arg;
   snprintf(uri, sizeof uri, "http://127.0.0.1:%d%s", g_inst.srv_port, g_inst.name);
@@ -2706,6 +2762,8 @@ static void *install_main(void *arg) {
   pthread_mutex_lock(&g_inst.mu);
   g_inst.last_asked = now_ms();
   pthread_mutex_unlock(&g_inst.mu);
+  install_log("---- install of \"%s\" (%llu bytes), served at %s", g_inst.title,
+              (unsigned long long)g_inst.size, uri);
   rc = have_acceptor ? system_install(uri, g_inst.title, content_id, sizeof content_id) : -1;
   if (rc != 0) {
     if (rc == -1)
@@ -2722,8 +2780,21 @@ static void *install_main(void *arg) {
       install_report(1, "STOPPED");
       break;
     }
-    if (system_status(content_id, &st) == 0) {
-      st.status[sizeof st.status - 1] = '\0';
+    rc = system_status(content_id, &st);
+    st.status[sizeof st.status - 1] = '\0';
+    st.error_info.description[sizeof st.error_info.description - 1] = '\0';
+    if (rc != last_rc || strcmp(st.status, last_status) != 0 ||
+        st.error_info.error_code != last_error || now_ms() - last_logged > 10000) {
+      install_log("status call 0x%08X: \"%s\" src \"%.8s\" %llu/%llu bytes, error 0x%08X \"%.120s\"",
+                  (unsigned)rc, st.status, st.src_type, (unsigned long long)st.downloaded_size,
+                  (unsigned long long)st.total_size, (unsigned)st.error_info.error_code,
+                  st.error_info.description);
+      last_rc = rc;
+      snprintf(last_status, sizeof last_status, "%s", st.status);
+      last_error = st.error_info.error_code;
+      last_logged = now_ms();
+    }
+    if (rc == 0) {
       if (strcmp(st.status, "playable") == 0 || strcmp(st.status, "completed") == 0) {
         install_report(0, "P %llu %llu", (unsigned long long)g_inst.size,
                        (unsigned long long)g_inst.size);
@@ -2761,12 +2832,14 @@ static void *install_main(void *arg) {
                      (unsigned long long)g_inst.size);
     }
     if (now_ms() - asked > INSTALL_IDLE_S * 1000ull && last_down < g_inst.size) {
-      install_report(1, "ERR install the PS5's installer stopped asking for the package");
+      install_report(1, "ERR install the PS5's installer didn't ask for the package (its status: %s)",
+                     last_status[0] ? last_status : "none");
       break;
     }
     sleep_ms(INSTALL_POLL_MS);
   }
 done:
+  install_log("---- install ended");
   pthread_mutex_lock(&g_inst.mu);
   g_inst.stop = 1;
   for (k = 0; k < MAX_SERVED; ++k)

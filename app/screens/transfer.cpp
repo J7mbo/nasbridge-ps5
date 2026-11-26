@@ -2602,7 +2602,8 @@ Outcome install_package(const Connection &connection, const SharedPtr &shared, c
     case End::unavailable:
         *why = "the copy helper couldn't install it" +
                (result.why.empty() ? std::string() : " (" + result.why + ")") +
-               ". Is the jailbreak loaded?";
+               (result.why.find("Restart") != std::string::npos ? std::string(".")
+                                                                 : std::string(". Is the jailbreak loaded?"));
         return Outcome::failed;
     case End::busy:
         *why = "an earlier install is still running. Try again once it's finished";

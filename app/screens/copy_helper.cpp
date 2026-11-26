@@ -140,9 +140,21 @@ bool read_line(int fd, std::string *buffer, std::string *line, int ms)
 
 // A connection to a running helper that has said it's ready, starting one
 // through the loader when none answers. -1 when it can't be had.
-int open_helper(std::string *buffer)
+// Set by open_helper when a helper took the connection but never said it was
+// ready: one that's stuck, which a new one can't replace (it holds the port).
+thread_local bool t_helper_stuck = false;
+
+// Why open_helper gave nothing, for the screen.
+std::string helper_start_why()
+{
+    return t_helper_stuck ? "the copy helper is stuck from an earlier try. Restart the PS5 to clear it"
+                          : "the copy helper didn't start";
+}
+
+int open_helper(std::string *buffer, const std::function<bool()> &stopping = nullptr)
 {
     std::lock_guard<std::mutex> hold(g_launch);
+    t_helper_stuck = false;
     for (int attempt = 0; attempt < 2; ++attempt)
     {
         int fd = connect_local(g_helper_port, 10);
@@ -152,6 +164,8 @@ int open_helper(std::string *buffer)
                 return -1;
             for (int waited = 0; waited < kStartMs && fd < 0; waited += 200)
             {
+                if (stopping && stopping())
+                    return -1;
                 sleep_ms(200);
                 fd = connect_local(g_helper_port, 10);
             }
@@ -162,6 +176,7 @@ int open_helper(std::string *buffer)
         std::string line;
         if (read_line(fd, buffer, &line, 10000) && line == kProto)
             return fd;
+        t_helper_stuck = line.empty();
         // A helper that was just leaving (idle), or another version: once more.
         ::close(fd);
         sleep_ms(300);
@@ -188,11 +203,16 @@ HelperCopy run_copy(const std::string &job, const std::string &payload, const Pr
 {
     HelperCopy result;
     std::string buffer;
-    const int fd = open_helper(&buffer);
+    const int fd = open_helper(&buffer, stopping);
     if (fd < 0)
     {
+        if (stopping && stopping())
+        {
+            result.end = HelperCopy::End::stopped;
+            return result;
+        }
         result.end = HelperCopy::End::unavailable;
-        result.why = "the copy helper didn't start";
+        result.why = helper_start_why();
         return result;
     }
     if (!send_all(fd, job.data(), job.size()) || !send_all(fd, payload.data(), payload.size()))
@@ -464,10 +484,15 @@ HelperInstall run_install(const std::string &job, const std::string &payload,
 {
     HelperInstall result;
     std::string buffer;
-    const int fd = open_helper(&buffer);
+    const int fd = open_helper(&buffer, stopping);
     if (fd < 0)
     {
-        result.why = "the copy helper didn't start";
+        if (stopping && stopping())
+        {
+            result.end = HelperInstall::End::stopped;
+            return result;
+        }
+        result.why = helper_start_why();
         return result;
     }
     if (!send_all(fd, job.data(), job.size()) || !send_all(fd, payload.data(), payload.size()))
