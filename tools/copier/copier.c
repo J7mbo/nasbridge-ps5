@@ -2550,7 +2550,6 @@ static appinst_status_fn_t g_status_fn;
 /* Asks the installer for the package at `uri`. 0 with the content ID, or
  * the installer's code. */
 static int system_install(const char *uri, const char *title, char *content_id, size_t size) {
-  typedef int (*user_init_t)(const void *);
   static appinst_meta_t meta;
   static appinst_pkg_t info;
   static appinst_playgo_t playgo; /* kept: the installer may read them later */
@@ -2558,13 +2557,12 @@ static int system_install(const char *uri, const char *title, char *content_id, 
   appinst_init_t inst_init;
   appinst_install_t install;
   int rc;
-  install_log("loading the user service");
+  /* The user service is loaded but not started: in the helper,
+   * sceUserServiceInitialize never came back (2026-11-26, 13.60), and
+   * AppInstUtil is tried without it. */
+  install_log("loading the user service (not starting it)");
   user_h = dlopen("/system/common/lib/libSceUserService.sprx", RTLD_LAZY);
   install_log("user service %s", user_h ? "loaded" : "NOT loaded");
-  if (user_h) {
-    user_init_t user_init = (user_init_t)dlsym(user_h, "sceUserServiceInitialize");
-    if (user_init) install_log("user service init returned 0x%08X", (unsigned)user_init(NULL));
-  }
   install_log("loading AppInstUtil");
   inst_h = dlopen("/system/common/lib/libSceAppInstUtil.sprx", RTLD_LAZY);
   install_log("AppInstUtil %s", inst_h ? "loaded" : "NOT loaded");
