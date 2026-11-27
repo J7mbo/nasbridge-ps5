@@ -49,10 +49,12 @@ ProbeResult interpret_response(const Connection &connection, int status,
 // What a failed connect or read means (an errno value).
 ProbeResult interpret_socket_error(const Connection &connection, int error, bool connecting);
 
-// A game image the library reads: an .exfat, or a .ffpfsc (a compressed
-// image, see ffpfsc.hpp). Any case.
+// A game in one file the library reads: an .exfat, a .ffpfsc (a compressed
+// image, see ffpfsc.hpp) or a .pkg (a package the PS5 installs, see pkg.hpp).
+// Any case.
 bool is_image_name(const std::string &name);
 bool is_compressed_image_name(const std::string &name);
+bool is_package_name(const std::string &name);
 
 // How many games the games folder holds, found the way the library finds
 // them: each folder is a game folder when it has an sce_sys (up to four
@@ -61,8 +63,9 @@ bool is_compressed_image_name(const std::string &name);
 struct GameCount
 {
     int folder_games = 0;
-    int image_games = 0;      // .exfat and .ffpfsc
+    int image_games = 0;      // .exfat, .ffpfsc and .pkg
     int compressed_games = 0; // ... of which .ffpfsc
+    int package_games = 0;    // ... and of which .pkg
     int other_folders = 0; // no game inside (patches, backports, downloads...)
     int unreadable = 0;    // couldn't be listed (the library shows them with a note)
 };

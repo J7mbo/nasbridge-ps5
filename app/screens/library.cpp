@@ -890,6 +890,7 @@ class Library final : public app::Concept
         game.title = found.title;
         game.format = !found.image                              ? "Game folder"
                       : is_compressed_image_name(found.image_path) ? "ffpfsc image"
+                      : is_package_name(found.image_path)          ? "Game package"
                                                                    : "exFAT image";
         game.label = game.format;
         game.title_id = found.title_id;
@@ -1224,9 +1225,12 @@ class Library final : public app::Concept
     }
 
     // The game ShadowMountPlus has for this one (by title ID), if any.
+    // An update or add-on package shares its game's title ID: the game being
+    // there doesn't mean it is, and deleting "it" would delete the game.
+    // Those never count as on the PS5 (they can always be queued).
     const SmpGame *ps5_game(const Game &game) const
     {
-        if (game.title_id.empty())
+        if (game.title_id.empty() || is_addition(game))
             return nullptr;
         for (const SmpGame &smp : space_.games)
             if (smp.title_id == game.title_id && drive_connected(space_, smp.path))
@@ -1320,12 +1324,15 @@ class Library final : public app::Concept
         if (queue_.finished_entry == game.source.entry ||
             queue_.waiting(game.source.entry) != nullptr)
         {
-            out[0] = {"Copied", Command::none, false, false};
+            out[0] = {is_package(game) ? "Sent to PS5" : "Copied", Command::none, false, false};
             return 1;
         }
         const CopyCheck check = copy_check(game);
         // The first game starts copying at once; later ones wait their turn.
-        const char *label = queue_.entries.empty() ? "Download to PS5" : "Add to queue";
+        const bool package = is_package(game);
+        const char *label = !queue_.entries.empty() ? "Add to queue"
+                            : package               ? "Install on PS5"
+                                                    : "Download to PS5";
         switch (check)
         {
         case CopyCheck::too_big:
@@ -1349,6 +1356,8 @@ class Library final : public app::Concept
         }
         const bool blocked = check != CopyCheck::fits && check != CopyCheck::space_unknown;
         out[0] = {label, Command::enqueue, !blocked, !blocked};
+        if (package)
+            return 1; // the PS5 installs it to its internal storage
         out[1] = {destination_label(), Command::destination, true, false};
         return 2;
     }
@@ -1370,9 +1379,10 @@ class Library final : public app::Concept
         case Command::unqueue:
         {
             const int at = queued_at(game);
-            if (at >= 0 && queue_.entries[static_cast<std::size_t>(at)].started)
+            if (at >= 0 && (queue_.entries[static_cast<std::size_t>(at)].started ||
+                            queue_.entries[static_cast<std::size_t>(at)].accepted))
             {
-                open_confirm(command, game, feedback); // it has files to delete
+                open_confirm(command, game, feedback); // it has files to delete, or a part install
                 return;
             }
             ok = at >= 0 && transfers_.remove(at, &why);
@@ -1380,7 +1390,10 @@ class Library final : public app::Concept
         }
         case Command::enqueue:
             ok = transfers_.enqueue(connection_.connection(), game.source, game.title,
-                                    destination_, &why);
+                                    target_of(game), &why,
+                                    // Unknown counts as there: a part install of it is
+                                    // then never uninstalled by title ID.
+                                    game.on_ps5 || !space_.games_known);
             if (ok)
             {
                 // Back to the library, with the queue open on the right to
@@ -1459,10 +1472,15 @@ class Library final : public app::Concept
             const int at = queued_at(game);
             const QueueEntry &item = queue_.entries[static_cast<std::size_t>(std::max(at, 0))];
             content.title = "Remove " + game.title + " from the queue?";
-            content.body = "The " + gigabytes(static_cast<double>(item.done) / 1e9) +
-                           " copied so far will be deleted from " +
-                           destination_name(item.destination) +
-                           ". The game on your NAS isn't touched.";
+            if (item.package)
+                content.body = "The PS5's part install of it will be removed, freeing the room it "
+                               "set aside (an update or add-on is left for you to remove from the "
+                               "PS5's Downloads). The package on your NAS isn't touched.";
+            else
+                content.body = "The " + gigabytes(static_cast<double>(item.done) / 1e9) +
+                               " copied so far will be deleted from " +
+                               destination_name(item.destination) +
+                               ". The game on your NAS isn't touched.";
             content.buttons = {{"Cancel"}, {"Remove", ui::ButtonKind::primary, true}};
         }
         else
@@ -1576,10 +1594,36 @@ class Library final : public app::Concept
     // listed (a drive that was unplugged, or no list yet).
     const Destination *destination() const
     {
+        return destination(destination_);
+    }
+    const Destination *destination(const std::string &path) const
+    {
         for (const Destination &place : space_.destinations)
-            if (place.path == destination_)
+            if (place.path == path)
                 return &place;
         return nullptr;
+    }
+
+    // A package (.pkg): the PS5 installs it (to its internal storage).
+    static bool is_package(const Game &game)
+    {
+        return game.from_nas && game.source.image && is_package_name(game.source.image_path);
+    }
+    // An update or add-on package (the library marks them in the title).
+    static bool is_addition(const Game &game)
+    {
+        const auto ends = [&game](const std::string &tail)
+        {
+            return game.title.size() >= tail.size() &&
+                   game.title.compare(game.title.size() - tail.size(), tail.size(), tail) == 0;
+        };
+        return is_package(game) && (ends(" (update)") || ends(" (add-on)"));
+    }
+    // Where this game would go: the chosen destination, or internal storage
+    // for a package.
+    std::string target_of(const Game &game) const
+    {
+        return is_package(game) ? std::string(kInternalGames) : destination_;
     }
 
     enum class CopyCheck
@@ -1597,8 +1641,9 @@ class Library final : public app::Concept
     {
         if (!space_.asked)
             return CopyCheck::space_unknown;
+        const std::string target = target_of(game);
         std::uint64_t free = 0;
-        if (const Destination *place = destination())
+        if (const Destination *place = destination(target))
         {
             if (place->writable == 0)
                 return CopyCheck::not_writable;
@@ -1610,7 +1655,7 @@ class Library final : public app::Concept
         {
             return CopyCheck::unavailable;
         }
-        else if (destination_ == kInternalGames && space_.known)
+        else if (target == kInternalGames && space_.known)
         {
             free = space_.free; // no list from ShadowMountPlus: its own numbers
         }
@@ -1621,14 +1666,14 @@ class Library final : public app::Concept
         if (game.size_gb <= 0.0)
             return CopyCheck::size_unknown;
         // What the queue will still write to this drive is spoken for.
-        const std::uint64_t queued = queue_.queued_for(destination_);
+        const std::uint64_t queued = queue_.queued_for(target);
         const double room = free > queued ? static_cast<double>(free - queued) : 0.0;
         return game.size_gb * 1e9 > room ? CopyCheck::too_big : CopyCheck::fits;
     }
 
-    double destination_free_gb() const
+    double destination_free_gb(const std::string &target) const
     {
-        const Destination *place = destination();
+        const Destination *place = destination(target);
         return static_cast<double>(place != nullptr ? place->free : space_.free) / 1e9;
     }
 
@@ -1673,7 +1718,7 @@ class Library final : public app::Concept
         else if (queue_.running() && !queue_.entries.empty())
         {
             const QueueEntry &head = queue_.entries.front();
-            status = "Copying " + head.title;
+            status = (head.package ? "Installing " : "Copying ") + head.title;
             if (queue_.phase == TransferState::copying && head.size > 0)
             {
                 char text[64];
@@ -1705,7 +1750,8 @@ class Library final : public app::Concept
         }
         else if (queue_.state == QueueState::failed)
         {
-            status = "Copying stopped: " + queue_.message;
+            const bool package = !queue_.entries.empty() && queue_.entries.front().package;
+            status = (package ? "Install stopped: " : "Copying stopped: ") + queue_.message;
             status_ink = theme.danger;
         }
         else if (removal_.busy())
@@ -2012,11 +2058,11 @@ class Library final : public app::Concept
             switch (queue_.state)
             {
             case QueueState::running:
-                label = "Copying to";
+                label = item.package ? "Installing on" : "Copying to";
                 if (!queue_.detail.empty())
                     text = queue_.detail;
                 else if (queue_.phase == TransferState::preparing)
-                    text = "Listing the game's files";
+                    text = item.package ? "Starting the install" : "Listing the game's files";
                 else if (queue_.phase == TransferState::finishing)
                     text = "Adding the game to the home screen";
                 else
@@ -2029,14 +2075,16 @@ class Library final : public app::Concept
                 bar = theme.warning;
                 break;
             case QueueState::failed:
-                label = "Copy stopped";
+                label = item.package ? "Install stopped" : "Copy stopped";
                 text = queue_.message;
                 text_ink = theme.danger;
                 bar = theme.danger;
                 break;
             default:
                 label = "Paused";
-                text = item.started ? copy_progress(item, 0.0) + " copied" : "Not started yet";
+                text = item.package && item.done > 0 ? "Resume starts the install again"
+                       : item.started                 ? copy_progress(item, 0.0) + " copied"
+                                                      : "Not started yet";
                 if (!queue_.message.empty())
                     text = queue_.message + "  \u00b7  " + text;
                 break;
@@ -2099,17 +2147,20 @@ class Library final : public app::Concept
         }
         else if (game.from_nas && queue_.finished_entry == game.source.entry)
         {
-            label = "Copied to";
+            label = is_package(game) ? "Sent to" : "Copied to";
             heading = destination_name(queue_.finished_destination);
-            text = "ShadowMountPlus is adding the game to the home screen";
+            text = is_package(game) ? "The PS5 is finishing the install: the game shows on the home "
+                                      "screen when it's done"
+                                    : "ShadowMountPlus is adding the game to the home screen";
             progress = 1.0f;
         }
         else
         {
-            label = "Copy to";
-            heading = destination_name(destination_);
-            const double free_gb = destination_free_gb();
-            const double queued_gb = static_cast<double>(queue_.queued_for(destination_)) / 1e9;
+            const std::string target = target_of(game);
+            label = is_package(game) ? "Install on" : "Copy to";
+            heading = destination_name(target);
+            const double free_gb = destination_free_gb(target);
+            const double queued_gb = static_cast<double>(queue_.queued_for(target)) / 1e9;
             char free_text[160];
             switch (check)
             {
@@ -2120,8 +2171,9 @@ class Library final : public app::Concept
                                   free_gb, queued_gb, free_gb - queued_gb - game.size_gb);
                 else
                     std::snprintf(free_text, sizeof(free_text),
-                                  "%.1f GB free  \u00b7  %.1f GB left after copying", free_gb,
-                                  free_gb - game.size_gb);
+                                  "%.1f GB free  \u00b7  %.1f GB left after %s", free_gb,
+                                  free_gb - game.size_gb,
+                                  is_package(game) ? "installing" : "copying");
                 break;
             case CopyCheck::too_big:
                 if (queued_gb > 0.0)
@@ -2144,12 +2196,12 @@ class Library final : public app::Concept
                 break;
             case CopyCheck::unavailable:
                 std::snprintf(free_text, sizeof(free_text), "Not connected  \u00b7  %s",
-                              destination_.c_str());
+                              target.c_str());
                 text_ink = theme.danger;
                 break;
             case CopyCheck::not_writable:
             {
-                const Destination *place = destination();
+                const Destination *place = destination(target);
                 std::snprintf(free_text, sizeof(free_text), "NASBridge can't write here (%s)",
                               place != nullptr ? place->why.c_str() : "");
                 text_ink = theme.danger;

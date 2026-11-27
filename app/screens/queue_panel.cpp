@@ -484,7 +484,7 @@ void QueuePanel::draw(gfx::DrawList &list, std::uint32_t glass, float clock,
             // The file count of a folder game is on its own row below.
             char text[96];
             std::vector<Part> parts;
-            parts.push_back({"Copying"});
+            parts.push_back({head.package ? "Installing" : "Copying"});
             std::snprintf(text, sizeof(text), "%d%%",
                           static_cast<int>(100.0 * static_cast<double>(head.done) /
                                            static_cast<double>(head.size)));
@@ -645,12 +645,15 @@ void QueuePanel::draw(gfx::DrawList &list, std::uint32_t glass, float clock,
         // What doesn't fit goes, least useful first: where it's going, then
         // the time left (the status line has the queue's), never the size.
         std::vector<Part> parts;
-        if (head && item.started && item.size > 0 && queue.state != QueueState::idle)
+        // A package has nothing on the drive (`started` stays false): how much
+        // the PS5's installer has fetched is its progress.
+        const bool progressed = item.started || (item.package && item.done > 0);
+        if (head && progressed && item.size > 0 && queue.state != QueueState::idle)
         {
             parts.push_back({gb(item.done) + " of " + gb(item.size)});
             // A folder game: which file (thousands of small ones copy far
             // slower than their size suggests).
-            if (queue.files_total > 1)
+            if (!item.package && queue.files_total > 1)
                 parts.push_back({grouped(std::min(queue.files_done + 1, queue.files_total)) + "/" +
                                      grouped(queue.files_total) + " files",
                                  1});
@@ -664,7 +667,7 @@ void QueuePanel::draw(gfx::DrawList &list, std::uint32_t glass, float clock,
         parts.push_back({destination_name(item.destination), 3});
         paint.body(fit_parts(paint, parts, 19.0f, tw), tx, cy + 24.0f, 19,
                    kWhite.with_alpha(0.6f));
-        if (item.started && item.size > 0)
+        if (progressed && item.size > 0)
         {
             // How far it got: a thin bar under the text.
             const Rect track{tx, cy + 36.0f, tw, 4.0f};

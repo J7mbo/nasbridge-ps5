@@ -125,6 +125,41 @@ std::string partition_type(const std::string &device, std::string *why);
 int helper_file_step(const char *step, const std::string &path, const std::string &to = "",
                      std::uint64_t *size = nullptr, bool *folder = nullptr);
 
+// Installing a game package (.pkg): the helper serves it from the NAS to the
+// PS5's own installer, which unpacks it (see tools/copier/copier.c, NBK1).
+struct HelperInstall
+{
+    enum class End
+    {
+        ok,          // installed
+        stopped,     // stopping() said so
+        unavailable, // the helper couldn't be started or reached (or is older)
+        busy,        // another install is running
+        failed,      // the installer refused or stopped: `why`
+        lost,        // the helper went away mid-install
+    };
+    End end = End::unavailable;
+    std::string why;
+};
+
+// Installs the package `size` bytes long, shown as `title` while it installs.
+// WebDAV: `request` is the GET (sign-in and all, no Range). SMB: `sign_in`
+// and `path`, the package in the share. progress(bytes the installer has,
+// of `size`) comes about twice a second. Returning (other than stopped)
+// doesn't stop an install the helper still runs: closing NASBridge leaves it
+// going.
+HelperInstall install_with_helper(const std::string &ip, int port, std::uint64_t size,
+                                  const std::string &title, const std::string &request,
+                                  const std::function<void(std::uint64_t, std::uint64_t, int)> &progress,
+                                  const std::function<bool()> &stopping,
+                                  const std::function<void()> &accepted = nullptr);
+HelperInstall install_smb_with_helper(const std::string &ip, int port, std::uint64_t size,
+                                      const std::string &title, const SmbSignIn &sign_in,
+                                      const std::string &path,
+                                      const std::function<void(std::uint64_t, std::uint64_t, int)> &progress,
+                                      const std::function<bool()> &stopping,
+                                      const std::function<void()> &accepted = nullptr);
+
 bool copy_helper_enabled();
 
 // Tests: the helper file ("" turns the helper off), the loader's port and the

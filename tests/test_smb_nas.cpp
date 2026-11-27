@@ -9,6 +9,7 @@
 #include "concepts/nas.hpp"
 #include "concepts/nas_library.hpp"
 #include "concepts/smp.hpp"
+#include "concepts/storage.hpp"
 #include "concepts/transfer.hpp"
 
 #include <cstdio>
@@ -72,6 +73,20 @@ void write_file(const std::string &path, std::size_t size, unsigned seed)
 bool same(const std::string &a, const std::string &b)
 {
     return std::system(("cmp -s \"" + a + "\" \"" + b + "\"").c_str()) == 0;
+}
+
+// The stand-in installer's copy: it lands (renamed into place, whole) a
+// moment after the helper says the installer has everything.
+bool installed_same(const std::string &source, const std::string &installed)
+{
+    for (int i = 0; i < 100; ++i)
+    {
+        struct stat st;
+        if (::stat(installed.c_str(), &st) == 0)
+            return same(source, installed);
+        sleep_ms(100);
+    }
+    return false;
 }
 
 bool there(const std::string &path)
@@ -395,6 +410,18 @@ int main(int argc, char **argv)
               "a big file copies over four sign-ins, file for file", message);
         set_helper_streams(2);
         std::system(("rm -rf \"" + dest + "\"/*").c_str());
+
+        // A package (.pkg) is installed, not copied: the helper reads it over
+        // SMB for the PS5's installer (a stand-in writing ps5root/installed.pkg).
+        {
+            NasGame package = image;
+            package.entry = package.image_path = "Img.pkg";
+            std::system(("cp \"" + g + "/Img.exfat\" \"" + g + "/Img.pkg\"").c_str());
+            check(copy(transfers, connection, package, kInternalGames, &message) &&
+                      installed_same(g + "/Img.pkg", work + "/ps5root/installed.pkg"),
+                  "a package installs over SMB, byte for byte", message);
+            std::remove((g + "/Img.pkg").c_str());
+        }
 
         // A file that's gone from the NAS since the library was read.
         NasGame gone = image;

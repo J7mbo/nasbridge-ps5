@@ -10,6 +10,7 @@
 #include "concepts/http.hpp"
 #include "concepts/library_cache.hpp"
 #include "concepts/nas.hpp"
+#include "concepts/nas_probe.hpp"
 #include "concepts/notify.hpp"
 #include "concepts/smp.hpp"
 #include "concepts/storage.hpp"
@@ -422,6 +423,13 @@ std::string plan_to_text(const CopyPlan &plan)
     line("title", plan.title);
     line("title_id", plan.title_id);
     line("image", plan.image ? "1" : "0");
+    if (plan.package)
+    {
+        line("package", "1");
+        line("package_base", plan.package_base ? "1" : "0");
+        line("accepted", plan.accepted ? "1" : "0");
+        line("handed", plan.handed ? "1" : "0");
+    }
     line("source", plan.source);
     line("destination", plan.destination);
     line("name", plan.name);
@@ -467,6 +475,14 @@ bool plan_from_text(const std::string &text, CopyPlan *plan)
             plan->title_id = value;
         else if (key == "image")
             plan->image = value == "1";
+        else if (key == "package")
+            plan->package = value == "1";
+        else if (key == "package_base")
+            plan->package_base = value == "1";
+        else if (key == "accepted")
+            plan->accepted = value == "1";
+        else if (key == "handed")
+            plan->handed = value == "1";
         else if (key == "source")
             plan->source = value;
         else if (key == "destination")
@@ -2520,6 +2536,116 @@ void wait_for_drive(const SharedPtr &shared, const Item &head)
                " isn't connected. It carries on when the drive is back.");
 }
 
+// Installs the front game when it's a package (.pkg): the copy helper serves
+// it from the NAS to the PS5's installer. `done` follows what the installer
+// has. NASBridge closing doesn't stop it: the helper carries on alone.
+Outcome install_package(const Connection &connection, const SharedPtr &shared, const Item &head,
+                        std::string *why)
+{
+    const std::string entry = head.plan.entry;
+    const std::uint64_t size = head.size();
+    if (size == 0)
+    {
+        *why = "the package's size isn't known: remove it, then list the library again";
+        return Outcome::failed;
+    }
+    {
+        std::lock_guard<std::mutex> hold(shared->lock);
+        if (Item *item = shared->item(entry))
+            item->done = 0; // this attempt's meter; `accepted` keeps any part install
+        shared->phase = TransferState::preparing;
+        shared->detail.clear();
+        shared->rate = 0.0;
+    }
+    std::uint64_t last_done = 0;
+    std::uint64_t last_ms = now_ms();
+    const auto progress = [&](std::uint64_t done, std::uint64_t, int connections)
+    {
+        const std::uint64_t now = now_ms();
+        std::lock_guard<std::mutex> hold(shared->lock);
+        if (Item *item = shared->item(entry))
+            item->done = done;
+        shared->connections = connections; // the installer's, to the helper
+        if (done > 0)
+            shared->phase = TransferState::copying;
+        if (now - last_ms >= 1000)
+        {
+            const double rate = static_cast<double>(done > last_done ? done - last_done : 0) * 1000.0 /
+                                static_cast<double>(now - last_ms);
+            shared->rate = shared->rate <= 0.0 ? rate : shared->rate * 0.7 + rate * 0.3;
+            last_done = done;
+            last_ms = now;
+        }
+    };
+    // The installer took it: the PS5 now holds a part install, and the helper
+    // goes on with it if NASBridge closes.
+    const auto accepted = [&]
+    {
+        std::lock_guard<std::mutex> hold(shared->lock);
+        if (Item *item = shared->item(entry))
+        {
+            item->plan.accepted = true;
+            item->plan.handed = true;
+        }
+        shared->save();
+    };
+    // Pause stops the install; closing NASBridge leaves it to the helper.
+    const auto stopping = [&] { return shared->pause.load() && !shared->stop.load(); };
+    // The installer shows this while it installs.
+    std::string title = head.plan.title.substr(0, 200);
+    HelperInstall result;
+    if (connection.type == ConnectionType::smb)
+    {
+        SmbSignIn sign_in;
+        sign_in.share = smb_location(folder_path(connection)).share;
+        split_smb_user(connection.username, &sign_in.domain, &sign_in.user);
+        if (sign_in.user.empty())
+            sign_in.user = "guest";
+        sign_in.password = connection.password;
+        result = install_smb_with_helper(connection.host, connection.effective_port(), size, title,
+                                         sign_in, smb_location(head.plan.source).path, progress,
+                                         stopping, accepted);
+    }
+    else
+    {
+        result = install_with_helper(connection.host, connection.effective_port(), size, title,
+                                     build_request(connection, "GET", head.plan.source, "", ""),
+                                     progress, stopping, accepted);
+    }
+    {
+        std::lock_guard<std::mutex> hold(shared->lock);
+        shared->rate = 0.0;
+        shared->connections = 0;
+        if (Item *item = shared->item(entry))
+            item->plan.handed = false; // the helper has let it go
+        shared->save();
+    }
+    using End = HelperInstall::End;
+    switch (result.end)
+    {
+    case End::ok:
+        return Outcome::done;
+    case End::stopped:
+        return Outcome::paused;
+    case End::unavailable:
+        *why = "the copy helper couldn't install it" +
+               (result.why.empty() ? std::string() : " (" + result.why + ")") +
+               (result.why.find("Restart") != std::string::npos ? std::string(".")
+                                                                 : std::string(". Is the jailbreak loaded?"));
+        return Outcome::failed;
+    case End::busy:
+        *why = "an earlier install is still running. Try again once it's finished";
+        return Outcome::failed;
+    case End::failed:
+        *why = result.why.empty() ? "the PS5's installer stopped" : result.why;
+        return Outcome::failed;
+    case End::lost:
+        *why = result.why.empty() ? "the copy helper stopped answering" : result.why;
+        return Outcome::failed;
+    }
+    return Outcome::failed;
+}
+
 void run_queue(const SharedPtr &shared)
 {
     while (true)
@@ -2549,9 +2675,12 @@ void run_queue(const SharedPtr &shared)
 
         // Before each game: is there still room for what it needs? (Something
         // else may have filled the drive since it was queued.)
+        // A package the PS5's installer has started on already has its room:
+        // the installer sets aside the whole game when it starts.
         std::uint64_t free = 0;
         const std::uint64_t need = head.size() > head.done ? head.size() - head.done : 0;
-        if (shared->space && shared->space(head.plan.destination, &free) && need > free)
+        const bool reserved = head.plan.package && head.plan.accepted;
+        if (!reserved && shared->space && shared->space(head.plan.destination, &free) && need > free)
         {
             char text[200];
             std::snprintf(text, sizeof(text),
@@ -2569,6 +2698,30 @@ void run_queue(const SharedPtr &shared)
             shared->message.clear();
         }
         std::string why;
+        if (head.plan.package)
+        {
+            const Outcome outcome = install_package(connection, shared, head, &why);
+            if (outcome == Outcome::done)
+            {
+                {
+                    std::lock_guard<std::mutex> hold(shared->lock);
+                    for (std::size_t i = 0; i < shared->queue.size(); ++i)
+                        if (shared->queue[i].plan.entry == head.plan.entry)
+                            shared->queue.erase(shared->queue.begin() + static_cast<long>(i));
+                    shared->finished_entry = head.plan.entry;
+                    shared->finished_destination = head.plan.destination;
+                    shared->phase = TransferState::idle;
+                    shared->save();
+                }
+                ps5_notify(head.plan.title + " is on the PS5: its installer is finishing the install.");
+                continue;
+            }
+            if (outcome == Outcome::paused)
+                return stop_queue(shared, QueueState::paused, "");
+            stop_queue(shared, QueueState::failed, why);
+            ps5_notify("Installing " + head.plan.title + " stopped: " + why);
+            return;
+        }
         Copier copier(connection, shared, head.plan.entry);
         const Outcome outcome = copier.run(&why);
         switch (outcome)
@@ -2660,9 +2813,26 @@ std::string discard_files(const CopyPlan &plan, const std::function<void(float)>
     return problem;
 }
 
+// A package install stopped partway: the PS5 keeps it (and the room it set
+// aside for the whole game) until it's uninstalled.
+std::string discard_install(const CopyPlan &plan)
+{
+    if (!plan.package_base)
+        return "it may share its title ID with a game on the PS5, so NASBridge leaves it. Remove it "
+               "from the PS5's Downloads or home screen";
+    if (plan.title_id.empty())
+        return "its title ID isn't known. Delete it from the PS5's home screen";
+    const DeleteResult result = delete_with_helper(plan.title_id, "", nullptr);
+    if (!result.ok)
+        return (result.why.empty() ? std::string("the PS5 refused") : result.why) +
+               ". Delete it from the PS5's home screen";
+    ps5_notify("Removed the part-installed " + plan.title + " from the PS5.");
+    return "";
+}
+
 void run_discard(const SharedPtr &shared, const CopyPlan &plan)
 {
-    const std::string problem = discard_files(plan,
+    const std::string problem = plan.package ? discard_install(plan) : discard_files(plan,
                                               [&](float done)
                                               {
                                                   std::lock_guard<std::mutex> hold(shared->lock);
@@ -2675,7 +2845,8 @@ void run_discard(const SharedPtr &shared, const CopyPlan &plan)
         shared->discarded.erase(plan.entry);
     }
     if (!problem.empty())
-        ps5_notify("Couldn't delete the copied files of " + plan.title + ": " + problem);
+        ps5_notify(plan.package ? "Couldn't remove the part-installed " + plan.title + ": " + problem
+                                : "Couldn't delete the copied files of " + plan.title + ": " + problem);
 }
 
 // ---- deleting a game on the PS5 ----
@@ -3164,7 +3335,10 @@ void Transfers::load()
     std::lock_guard<std::mutex> hold(shared_->lock);
     shared_->queue.clear();
     for (const SavedItem &item : saved)
-        shared_->queue.push_back({item.plan, item.estimate, item.done, item.started});
+        // An install that was with the helper goes on without NASBridge (it
+        // says how it went); packages still waiting, or paused, stay queued.
+        if (!item.plan.package || !item.plan.handed)
+            shared_->queue.push_back({item.plan, item.estimate, item.done, item.started});
     shared_->state = shared_->queue.empty() ? QueueState::idle : QueueState::paused;
     shared_->message = shared_->queue.empty() ? "" : "Stopped when NASBridge closed";
     shared_->save();
@@ -3195,8 +3369,16 @@ void Transfers::load()
     }
 }
 
+namespace
+{
+bool ends_with(const std::string &text, const std::string &tail)
+{
+    return text.size() >= tail.size() && text.compare(text.size() - tail.size(), tail.size(), tail) == 0;
+}
+} // namespace
+
 bool Transfers::enqueue(const Connection &connection, const NasGame &game, const std::string &title,
-                        const std::string &destination, std::string *why)
+                        const std::string &destination, std::string *why, bool on_ps5)
 {
     std::lock_guard<std::mutex> hold(shared_->lock);
     if (shared_->item(game.entry) != nullptr)
@@ -3221,6 +3403,15 @@ bool Transfers::enqueue(const Connection &connection, const NasGame &game, const
     plan.title = title;
     plan.title_id = game.title_id;
     plan.image = game.image;
+    plan.package = game.image && is_package_name(game.image_path);
+    if (plan.package && game.size_known && game.size == 0)
+    {
+        *why = "This package is empty";
+        return false;
+    }
+    // The library marks updates and add-ons in the title (nas_library.cpp).
+    plan.package_base = plan.package && !on_ps5 && !game.title_id.empty() &&
+                        !ends_with(game.title, " (update)") && !ends_with(game.title, " (add-on)");
     plan.source = copy_source(connection, game);
     plan.destination = destination;
     plan.name = copy_name(game);
@@ -3354,7 +3545,8 @@ bool Transfers::remove(int index, std::string *why)
         shared_->message.clear();
     }
     shared_->save();
-    if (item.started || item.plan.listed)
+    // A package the PS5's installer started on: its half install goes too.
+    if (item.started || item.plan.listed || (item.plan.package && item.plan.accepted))
     {
         // Its copied files go, on a thread of their own.
         shared_->discarding.push_back(item.plan.entry);
@@ -3442,6 +3634,8 @@ QueueStatus Transfers::queue() const
         entry.done = std::min(item.done, item.size());
         entry.started = item.started;
         entry.image = item.plan.image;
+        entry.package = item.plan.package;
+        entry.accepted = item.plan.package && item.plan.accepted;
         status.entries.push_back(entry);
     }
     status.phase = shared_->phase;

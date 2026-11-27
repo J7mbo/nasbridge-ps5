@@ -66,6 +66,9 @@ COPIER_SMB_FLAGS := -std=c11 -O2 -g -w -DHAVE_CONFIG_H -Iapp/third_party/libsmb2
   -I$(LIBSMB2)/include -I$(LIBSMB2)/include/smb2 -I$(LIBSMB2)/lib \
   -ffile-prefix-map=$(LIBSMB2)/=libsmb2/ -ffile-prefix-map=/src/=./
 COPIER_INCLUDES := -I$(LIBSMB2)/include
+# The system installer, linked in as ps5upload's installer links it:
+# -lSceIpmi must come before -lSceAppInstUtil, or the loader refuses the ELF.
+COPIER_LIBS := -lSceSystemService -lSceUserService -lSceIpmi -lSceAppInstUtil -lkernel_sys
 
 # Home-screen app: the kit's app (renderer, shell, input, sound) with our
 # screens (app/screens) in place of its demo designs, our overrides
@@ -120,7 +123,7 @@ $(BUILD_DIR)/libsmb2/%.o: app/third_party/libsmb2/%.c app/third_party/libsmb2/co
 	@$(CC) $(COPIER_SMB_FLAGS) -c -o $@ $<
 
 $(COPIER): $(COPIER_SRCS) $(COPIER_SMB_OBJS) $(BUILD_DIR)/toolchain.id | $(OUT_DIR)
-	$(CC) $(CFLAGS) $(COPIER_INCLUDES) -o $@ $(COPIER_SRCS) $(COPIER_SMB_OBJS)
+	$(CC) $(CFLAGS) $(COPIER_INCLUDES) -o $@ $(COPIER_SRCS) $(COPIER_SMB_OBJS) $(COPIER_LIBS)
 	@sha256sum $@
 
 # ---- release: one ELF that installs the app ----
@@ -340,7 +343,7 @@ PICKER_SRCS := tests/test_folder_picker.cpp $(LIBSMB2_HOST) \
 HOST_COUNT := build/host/test_game_count
 COUNT_SRCS := tests/test_game_count.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,nas_probe.cpp http.cpp connection.cpp nas_library.cpp \
-    library_cache.cpp exfat.cpp pfs.cpp ufs2.cpp ffpfsc.cpp png.cpp nas.cpp) \
+    library_cache.cpp exfat.cpp pfs.cpp ufs2.cpp ffpfsc.cpp pkg.cpp png.cpp nas.cpp) \
   $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
 
 # Compressed images (.ffpfsc): the readers on images made by MkPFS and Dump
@@ -348,7 +351,7 @@ COUNT_SRCS := tests/test_game_count.cpp $(LIBSMB2_HOST) \
 HOST_FFPFSC := build/host/test_ffpfsc
 FFPFSC_SRCS := tests/test_ffpfsc.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,nas_probe.cpp http.cpp connection.cpp nas_library.cpp \
-    library_cache.cpp exfat.cpp pfs.cpp ufs2.cpp ffpfsc.cpp png.cpp nas.cpp) \
+    library_cache.cpp exfat.cpp pfs.cpp ufs2.cpp ffpfsc.cpp pkg.cpp png.cpp nas.cpp) \
   $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
 FFPFSC_FIXTURES := build/host/ffpfsc-fixtures
 
@@ -394,7 +397,7 @@ SMB_SRCS := tests/test_smb.cpp $(LIBSMB2_HOST) $(APP_WORK)/src/concepts/connecti
 HOST_SMB_NAS := build/host/test_smb_nas
 SMB_NAS_SRCS := tests/test_smb_nas.cpp $(LIBSMB2_HOST) \
   $(addprefix $(APP_WORK)/src/concepts/,nas.cpp nas_library.cpp library_cache.cpp exfat.cpp pfs.cpp \
-    ufs2.cpp ffpfsc.cpp png.cpp nas_probe.cpp http.cpp connection.cpp transfer.cpp copy_helper.cpp \
+    ufs2.cpp ffpfsc.cpp pkg.cpp png.cpp nas_probe.cpp http.cpp connection.cpp transfer.cpp copy_helper.cpp \
     delete_helper.cpp file_calls.cpp smp.cpp json_scan.cpp notify.cpp storage.cpp) \
   $(APP_WORK)/src/core/save_file.cpp $(APP_WORK)/src/third_party/stb_image/stb_image.c
 

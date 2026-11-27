@@ -57,6 +57,11 @@
  *   NASBridge -> "NBF1\t<step>\t<path>[\t<new path>]\n"
  *   helper  -> "OK" | "OK <size> <d|f>" (stat) | "ERR <errno>"
  * Steps: mkdir (mode FILE_MODE), stat, rename, unlink, rmdir.
+ *
+ * A game package (.pkg) is installed rather than copied: "NBK1" (see
+ * "installing a package" below) has the PS5's installer read it from this
+ * helper, which fetches it from the NAS as it goes. An install keeps the
+ * helper running until it ends, even after NASBridge closes.
  */
 
 #include <arpa/inet.h>
@@ -67,6 +72,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1996,6 +2002,11 @@ out:
 /* ------------------------------------------------- a partition's type */
 
 #define PART_PROTO "NBP1"
+/* "NBX1": NASBridge, starting, asks a helper left from earlier to make way
+ * (it may be another build); "OK" and it leaves once this job ends, unless an
+ * install is still running. */
+#define QUIT_PROTO "NBX1"
+static volatile int g_quit;
 
 /* The disk and the partition number of "/dev/da1p2" (GPT, 'p') or
  * "/dev/da1s1" (MBR, 's'); 0 when it isn't one. */
@@ -2130,11 +2141,943 @@ static void run_file_step(int ctl, char *line) {
 }
 
 /* Copies one file. Every path out sends its final line. */
-static void run_job(int ctl) {
+/* ------------------------------------------- installing a package (.pkg) */
+
+/* A .pkg isn't copied: the PS5's own installer unpacks it (AppInstUtil, the
+ * library the Debug Settings' Package Installer uses), and it takes the
+ * package from a file or from an http:// address. NASBridge's NAS is SMB or
+ * WebDAV with a sign-in, which the installer can't read, so this helper
+ * serves the package on 127.0.0.1 itself: each range the installer asks for
+ * is fetched from the NAS (over SMB, or a ranged GET) and passed straight on.
+ * Nothing is stored on the PS5 but the installed game.
+ *
+ *   NASBridge -> "NBK1\t<ip>\t<port>\t<size>\t<smb 0|1>\t<title length>\t<source length>\n"
+ *                then the title (shown by the installer), then the source:
+ *                the GET request (WebDAV; ends "\r\n\r\n", no Range), or the
+ *                SMB sign-in (share, path in it, user, domain, password, each
+ *                ended by a NUL)
+ *   helper  -> "A"                       the PS5's installer took the package
+ *                                        (it holds a part install, and its
+ *                                        room, from now on)
+ *              "P <fetched> <total> <connections>"  progress, twice a second:
+ *                                        the package as far as the installer
+ *                                        has it, and its connections to us
+ *              "OK"                      the installer has every byte (it
+ *                                        goes on installing by itself)
+ *              "STOPPED"                 NASBridge said STOP
+ *              "ERR <kind> <why>"        request, busy (another install is
+ *                                        running), install (the installer
+ *                                        refused or failed: why has its code)
+ *   NASBridge -> "STOP\n"                stops serving: the install fails
+ * NASBridge closing the connection without STOP leaves the install going:
+ * the helper keeps serving until the installer is done, then says how it
+ * went in a notification.
+ *
+ * What the installer asks for (as ps5-pkg-manager, itsPLK, GPL-3.0, found):
+ * GET and HEAD with a Range, a query string on the path, keep-alive; a
+ * "<content ID>.crc" next to the package must be 404 (serving the package
+ * there breaks the install); 206 replies carry Date, Last-Modified and
+ * Accept-Ranges. The AppInstUtil structures below are laid out as there. */
+
+#define INSTALL_PROTO "NBK1"
+#define INSTALL_POLL_MS 500
+#define INSTALL_IDLE_S 120   /* the installer asked for nothing this long: failed */
+#define SERVE_BUF (4u << 20) /* one piece sent to the installer */
+#define SERVE_IDLE_S 120     /* a keep-alive connection the installer forgot */
+#define MAX_TITLE 512
+#define MAX_SERVED 16        /* the installer's connections at once */
+
+/* The six pointers everyone publishes, then the 8 bytes the installer also
+ * reads (0 for a plain install) and zeroed room (as ps5upload's MetaInfo). */
+typedef struct {
+  const char *uri, *ex_uri, *playgo_scenario_id, *content_id, *content_name, *icon_url;
+  uint64_t unknown_30;
+  uint64_t reserved[7];
+} appinst_meta_t;
+_Static_assert(sizeof(appinst_meta_t) == 0x70, "the install request's zeroed tail");
+typedef struct {
+  char content_id[48];
+  int type;
+  int platform;
+} appinst_pkg_t;
+typedef struct {
+  char languages[30][8];
+  char playgo_scenario_ids[64][3];
+  char content_ids[64][48];
+  unsigned char unknown[6480];
+} appinst_playgo_t;
+
+struct span {
+  uint64_t lo, hi; /* [lo, hi) */
+};
+
+static struct install {
+  pthread_mutex_t mu;
+  int active;            /* an install is running (main keeps us alive) */
+  int stop;              /* stop serving */
+  int ctl;               /* NASBridge, or -1 once it went away */
+  char ip[64];
+  int port;
+  uint64_t size;
+  int smb;
+  char *source;          /* the GET request, or the sign-in bytes */
+  size_t source_len;
+  smb_sign_in_t in;
+  char title[MAX_TITLE];
+  char name[64];         /* the path the package is served at ("/nasbridge/<n>.pkg") */
+  int srv;               /* the server for the installer */
+  int srv_port;
+  int conns[MAX_SERVED]; /* the installer's connections, to cut off on a stop */
+  uint64_t served;       /* bytes sent to the installer */
+  uint64_t last_asked;   /* when it last asked for anything (ms) */
+  struct span *spans;    /* what it has been sent in full: sorted, apart */
+  size_t spans_n, spans_cap;
+  uint64_t covered;      /* bytes in those spans: the package as far as it has it */
+  int lingering;         /* done, only still serving: a new install may end it */
+  int changed;           /* the package on the NAS isn't the size NASBridge said */
+} g_inst = {PTHREAD_MUTEX_INITIALIZER, 0, 0, -1, "", 0, 0, 0, NULL, 0, {0}, "", "", -1, 0,
+            {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1}, 0, 0, NULL, 0, 0,
+            0, 0, 0};
+
+/* The installer has been sent [from, to] in full: adds it to what it has
+ * (a byte counts once, however the installer splits or repeats its asks). */
+static void install_covered(uint64_t from, uint64_t to) {
+  uint64_t lo = from, hi = to + 1; /* [lo, hi) */
+  size_t i, first, last, k;
+  pthread_mutex_lock(&g_inst.mu);
+  /* The spans it touches or adjoins: [first, last). */
+  for (first = 0; first < g_inst.spans_n && g_inst.spans[first].hi < lo; ++first) {
+  }
+  for (last = first; last < g_inst.spans_n && g_inst.spans[last].lo <= hi; ++last) {
+    if (g_inst.spans[last].lo < lo) lo = g_inst.spans[last].lo;
+    if (g_inst.spans[last].hi > hi) hi = g_inst.spans[last].hi;
+  }
+  if (first == last && g_inst.spans_n == g_inst.spans_cap) { /* one more span */
+    size_t cap = g_inst.spans_cap ? g_inst.spans_cap * 2 : 64;
+    struct span *more = realloc(g_inst.spans, cap * sizeof *more);
+    if (!more) {
+      pthread_mutex_unlock(&g_inst.mu);
+      return;
+    }
+    g_inst.spans = more;
+    g_inst.spans_cap = cap;
+  }
+  if (first == last) { /* a new span at `first` */
+    memmove(g_inst.spans + first + 1, g_inst.spans + first,
+            (g_inst.spans_n - first) * sizeof *g_inst.spans);
+    ++g_inst.spans_n;
+  } else if (last - first > 1) { /* several become one */
+    memmove(g_inst.spans + first + 1, g_inst.spans + last,
+            (g_inst.spans_n - last) * sizeof *g_inst.spans);
+    g_inst.spans_n -= last - first - 1;
+  }
+  g_inst.spans[first].lo = lo;
+  g_inst.spans[first].hi = hi;
+  g_inst.covered = 0;
+  for (i = 0, k = g_inst.spans_n; i < k; ++i)
+    g_inst.covered += g_inst.spans[i].hi - g_inst.spans[i].lo;
+  pthread_mutex_unlock(&g_inst.mu);
+}
+
+/* The install is fed again from nothing. */
+static void install_forget(void) {
+  free(g_inst.spans);
+  g_inst.spans = NULL;
+  g_inst.spans_n = g_inst.spans_cap = 0;
+  g_inst.covered = 0;
+}
+
+static int install_active(void) {
+  int active;
+  pthread_mutex_lock(&g_inst.mu);
+  active = g_inst.active;
+  pthread_mutex_unlock(&g_inst.mu);
+  return active;
+}
+
+static int install_stopping(void) {
+  int stop;
+  pthread_mutex_lock(&g_inst.mu);
+  stop = g_inst.stop;
+  pthread_mutex_unlock(&g_inst.mu);
+  return stop;
+}
+
+static void install_notify(const char *text) {
+#ifndef COPIER_HOST_TEST
+  notify(text);
+#else
+  fprintf(stderr, "[notify] %s\n", text);
+#endif
+}
+
+/* ---- the server the installer reads from ---- */
+
+/* An HTTP reply with no body. */
+static int serve_empty(int fd, const char *status, int keep) {
+  char line[256];
+  int n = snprintf(line, sizeof line, "HTTP/1.1 %s\r\nContent-Length: 0\r\nConnection: %s\r\n\r\n",
+                   status, keep ? "keep-alive" : "close");
+  return send_all(fd, line, (size_t)n);
+}
+
+/* "Range: bytes=a-b" (or "a-", or "-n"): 1 with *from and *to set, 0 when there's
+ * none, -1 when it can't be met. */
+static int serve_range(const char *head, uint64_t size, uint64_t *from, uint64_t *to) {
+  char value[128], *dash;
+  if (!header(head, "Range", value, sizeof value)) return 0;
+  if (strncasecmp(value, "bytes=", 6) != 0 || strchr(value, ',')) return -1;
+  dash = strchr(value + 6, '-');
+  if (!dash || size == 0) return -1;
+  if (dash == value + 6) { /* the last n bytes */
+    uint64_t n = strtoull(dash + 1, NULL, 10);
+    if (n == 0) return -1;
+    *from = n >= size ? 0 : size - n;
+    *to = size - 1;
+    return 1;
+  }
+  *from = strtoull(value + 6, NULL, 10);
+  *to = dash[1] ? strtoull(dash + 1, NULL, 10) : size - 1;
+  if (*to >= size) *to = size - 1;
+  if (*from > *to) return -1;
+  return 1;
+}
+
+/* One installer connection's way to the NAS: its own SMB sign-in, kept from
+ * request to request (WebDAV: a ranged GET per request). */
+typedef struct source {
+  struct smb2_context *smb2;
+  struct smb2fh *fh;
+  char *buf;
+  /* Its own copy of the install's source (the GET request or the sign-in),
+   * so the install can end and free its own while this one winds down. */
+  char *src;
+  size_t src_len;
+  smb_sign_in_t in;
+} source_t;
+
+static void source_end(source_t *s) {
+  if (s->smb2) smb2_destroy_context(s->smb2);
+  s->smb2 = NULL;
+  s->fh = NULL;
+}
+
+/* Sends [from, to] of the package to the installer. 0, or -1 (the
+ * connection is closed then: the installer asks again). */
+static int serve_bytes(int fd, source_t *s, uint64_t from, uint64_t to) {
+  uint64_t at = from;
+  if (g_inst.smb) {
+    while (at <= to) {
+      size_t want = to - at + 1 > SERVE_BUF ? SERVE_BUF : (size_t)(to - at + 1);
+      if (install_stopping()) return -1;
+      if (!s->smb2) {
+        const char *kind;
+        char why[200];
+        s->smb2 = smb_connect(g_inst.ip, g_inst.port, &s->in, &kind, why, sizeof why);
+        if (!s->smb2) return -1;
+        s->fh = smb2_open(s->smb2, s->in.path, O_RDONLY);
+        if (!s->fh) {
+          source_end(s);
+          return -1;
+        }
+        {
+          struct smb2_stat_64 st;
+          if (smb2_fstat(s->smb2, s->fh, &st) < 0) {
+            source_end(s);
+            return -1;
+          }
+          if (st.smb2_size != g_inst.size) {
+            pthread_mutex_lock(&g_inst.mu);
+            g_inst.changed = 1;
+            pthread_mutex_unlock(&g_inst.mu);
+            source_end(s);
+            return -1;
+          }
+        }
+      }
+      if (smb_read_span(s->smb2, s->fh, at, want, s->buf) != 0) {
+        source_end(s); /* signs in again next time */
+        return -1;
+      }
+      if (send_all(fd, s->buf, want) != 0) return -1;
+      at += want;
+      pthread_mutex_lock(&g_inst.mu);
+      g_inst.served += want;
+      g_inst.last_asked = now_ms(); /* a long piece is still asking */
+      pthread_mutex_unlock(&g_inst.mu);
+    }
+    return 0;
+  }
+  {
+    size_t len, hlen, body_at;
+    int nas, status;
+    char *request = with_range(s->src, s->src_len, from, (int64_t)to, &len);
+    uint64_t left = to - from + 1;
+    if (!request) return -1;
+    nas = connect_nas(g_inst.ip, g_inst.port);
+    if (nas < 0 || send_all(nas, request, len) != 0 ||
+        read_head(nas, s->buf, &hlen, &body_at, &status) != 0 ||
+        (status != 206 && !(status == 200 && from == 0 && to + 1 == g_inst.size))) {
+      free(request);
+      if (nas >= 0) close(nas);
+      return -1;
+    }
+    free(request);
+    {
+      /* Only a plain body from a file of the size NASBridge said can be
+       * passed on (a reply running past `to` is fine: only `left` is read). */
+      char value[128];
+      const char *slash;
+      int bad = header(s->buf, "transfer-encoding", value, sizeof value) && strstr(value, "chunked");
+      if (!bad && status == 206) {
+        bad = !header(s->buf, "content-range", value, sizeof value) ||
+              !(slash = strchr(value, '/')) || slash[1] == '*';
+        if (!bad && strtoull(slash + 1, NULL, 10) != g_inst.size) {
+          pthread_mutex_lock(&g_inst.mu);
+          g_inst.changed = 1;
+          pthread_mutex_unlock(&g_inst.mu);
+          bad = 1;
+        }
+      }
+      if (bad) {
+        close(nas);
+        return -1;
+      }
+    }
+    {
+      size_t first = hlen - body_at;
+      if (first > left) first = (size_t)left;
+      if (first > 0 && send_all(fd, s->buf + body_at, first) != 0) {
+        close(nas);
+        return -1;
+      }
+      left -= first;
+      pthread_mutex_lock(&g_inst.mu);
+      g_inst.served += first;
+      g_inst.last_asked = now_ms();
+      pthread_mutex_unlock(&g_inst.mu);
+    }
+    while (left > 0) {
+      ssize_t n;
+      if (install_stopping()) break;
+      n = recv(nas, s->buf, left > SERVE_BUF ? SERVE_BUF : (size_t)left, 0);
+      if (n < 0 && errno == EINTR) continue;
+      if (n <= 0 || send_all(fd, s->buf, (size_t)n) != 0) break;
+      left -= (uint64_t)n;
+      pthread_mutex_lock(&g_inst.mu);
+      g_inst.served += (uint64_t)n;
+      g_inst.last_asked = now_ms();
+      pthread_mutex_unlock(&g_inst.mu);
+    }
+    close(nas);
+    return left == 0 ? 0 : -1;
+  }
+}
+
+static int g_serving; /* serve_main threads still running */
+
+/* One of the installer's connections: requests until it closes. */
+static void *serve_main(void *arg) {
+  int fd = (int)(intptr_t)arg, slot = -1, k;
+  source_t s;
+  char *head = malloc(MAX_HEADER + 1);
+  struct timeval tv = {SERVE_IDLE_S, 0};
+  memset(&s, 0, sizeof s);
+  s.buf = malloc(SERVE_BUF > MAX_HEADER + 1 ? SERVE_BUF : MAX_HEADER + 1);
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  pthread_mutex_lock(&g_inst.mu);
+  if (g_inst.source && !g_inst.stop && (s.src = malloc(g_inst.source_len + 1)) != NULL) {
+    char *sign[5];
+    memcpy(s.src, g_inst.source, g_inst.source_len + 1);
+    s.src_len = g_inst.source_len;
+    if (g_inst.smb) {
+      if (smb_fields(s.src, s.src_len, sign, 5) == 0) {
+        s.in.share = sign[0];
+        s.in.path = sign[1];
+        s.in.user = sign[2];
+        s.in.domain = sign[3];
+        s.in.password = sign[4];
+      } else {
+        free(s.src);
+        s.src = NULL;
+      }
+    }
+  }
+  for (k = 0; s.src && k < MAX_SERVED && slot < 0; ++k)
+    if (g_inst.conns[k] < 0) {
+      g_inst.conns[k] = fd;
+      slot = k;
+    }
+  pthread_mutex_unlock(&g_inst.mu);
+  while (head && s.buf && slot >= 0 && !install_stopping()) {
+    size_t have = 0;
+    char *end = NULL, method[16], path[1024], *query;
+    uint64_t from = 0, to = 0;
+    int range, keep, get;
+    head[0] = '\0';
+    while (have < MAX_HEADER && !(end = strstr(head, "\r\n\r\n"))) {
+      ssize_t n = recv(fd, head + have, MAX_HEADER - have, 0);
+      if (n < 0 && errno == EINTR) continue;
+      if (n <= 0) break;
+      have += (size_t)n;
+      head[have] = '\0';
+    }
+    if (!end) break;
+    /* No request has a body: anything after the header is the next one's. */
+    pthread_mutex_lock(&g_inst.mu);
+    g_inst.last_asked = now_ms();
+    pthread_mutex_unlock(&g_inst.mu);
+    if (sscanf(head, "%15s %1023s", method, path) != 2) break;
+    {
+      char value[64];
+      keep = !(header(head, "Connection", value, sizeof value) && strcasecmp(value, "close") == 0);
+    }
+    get = strcmp(method, "GET") == 0;
+    if ((query = strchr(path, '?')) != NULL) *query = '\0';
+    if (!get && strcmp(method, "HEAD") != 0) {
+      if (serve_empty(fd, "405 Method Not Allowed", keep) != 0) break;
+    } else if (strcmp(path, g_inst.name) != 0) {
+      if (serve_empty(fd, "404 Not Found", keep) != 0) break; /* the .crc, say */
+    } else if ((range = serve_range(head, g_inst.size, &from, &to)) < 0) {
+      char line[256];
+      int n = snprintf(line, sizeof line,
+                       "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */%llu\r\n"
+                       "Content-Length: 0\r\nConnection: %s\r\n\r\n",
+                       (unsigned long long)g_inst.size, keep ? "keep-alive" : "close");
+      if (send_all(fd, line, (size_t)n) != 0) break;
+    } else {
+      char line[700], date[64];
+      time_t now = time(NULL);
+      struct tm tm;
+      int n;
+      if (!range) {
+        from = 0;
+        to = g_inst.size - 1;
+      }
+      gmtime_r(&now, &tm);
+      strftime(date, sizeof date, "%a, %d %b %Y %H:%M:%S GMT", &tm);
+      if (range)
+        n = snprintf(line, sizeof line,
+                     "HTTP/1.1 206 Partial Content\r\nDate: %s\r\n"
+                     "Last-Modified: Wed, 01 Jan 2025 00:00:00 GMT\r\n"
+                     "Content-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\n"
+                     "Content-Length: %llu\r\nContent-Range: bytes %llu-%llu/%llu\r\n"
+                     "Connection: %s\r\n\r\n",
+                     date, (unsigned long long)(to - from + 1), (unsigned long long)from,
+                     (unsigned long long)to, (unsigned long long)g_inst.size,
+                     keep ? "keep-alive" : "close");
+      else
+        n = snprintf(line, sizeof line,
+                     "HTTP/1.1 200 OK\r\nDate: %s\r\n"
+                     "Last-Modified: Wed, 01 Jan 2025 00:00:00 GMT\r\n"
+                     "Content-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\n"
+                     "Content-Length: %llu\r\nConnection: %s\r\n\r\n",
+                     date, (unsigned long long)g_inst.size, keep ? "keep-alive" : "close");
+      if (send_all(fd, line, (size_t)n) != 0) break;
+      if (get && serve_bytes(fd, &s, from, to) != 0) break;
+      if (get) install_covered(from, to);
+    }
+    if (!keep) break;
+  }
+  pthread_mutex_lock(&g_inst.mu);
+  if (slot >= 0) g_inst.conns[slot] = -1;
+  pthread_mutex_unlock(&g_inst.mu);
+  source_end(&s);
+  if (s.src) memset(s.src, 0, s.src_len); /* the password */
+  free(s.src);
+  free(s.buf);
+  free(head);
+  close(fd);
+  __atomic_sub_fetch(&g_serving, 1, __ATOMIC_ACQ_REL);
+  return NULL;
+}
+
+/* Takes the installer's connections until the install ends. */
+static void *accept_main(void *arg) {
+  (void)arg;
+  for (;;) {
+    struct pollfd p = {g_inst.srv, POLLIN, 0};
+    pthread_t t;
+    int fd;
+    if (install_stopping() || !install_active()) break;
+    if (poll(&p, 1, 250) <= 0) continue;
+    fd = accept(g_inst.srv, NULL, NULL);
+    if (fd < 0) continue;
+    __atomic_add_fetch(&g_serving, 1, __ATOMIC_ACQ_REL);
+    if (start_thread(&t, serve_main, (void *)(intptr_t)fd) != 0) {
+      __atomic_sub_fetch(&g_serving, 1, __ATOMIC_ACQ_REL);
+      close(fd);
+      continue;
+    }
+    pthread_detach(t);
+  }
+  return NULL;
+}
+
+/* ---- the system installer ----
+ *
+ * As ps5upload's installer daemon does it on 13.60 (phantomptr/ps5upload,
+ * payload/installer: sony.c, escalate.c, main.c), which serves a package to
+ * the installer from the console the same way:
+ *  - the system install authid (0x4801000000000013) for the calls, not ours;
+ *  - sceAppInstUtilInitialize once, and no sceUserServiceInitialize (in this
+ *    helper that one never came back);
+ *  - the install request's 8 bytes after icon_url zero (the installer reads
+ *    them: anything else takes the patch path or is refused, 0x80B2116F);
+ *  - no status calls: the install is done once the installer has fetched
+ *    every byte, and has failed once it asks for nothing for a while;
+ *  - a call that never returns ends the helper (nothing else frees it), so
+ *    NASBridge starts a fresh one next time.
+ */
+
+#define INSTALL_AUTHID 0x4801000000000013ull
+#define CALL_WAIT_S 60       /* a Sony call taking longer is stuck */
+#define INSTALL_LINGER_S 60  /* after the last byte, still served this long */
+
+static volatile uint64_t g_call_since; /* when the running Sony call began (ms), 0: none */
+static volatile int g_main_srv = -1;   /* the helper's own port, for the watchdog */
+static int g_watchdog;                 /* the watchdog runs: installs may start */
+
+static void call_begin(void) { __atomic_store_n(&g_call_since, now_ms(), __ATOMIC_RELEASE); }
+static void call_end(void) { __atomic_store_n(&g_call_since, 0, __ATOMIC_RELEASE); }
+
+/* Ends the helper when a Sony call has hung: its thread can't be stopped, and
+ * holds what the next call would need. Closes the ports first (_exit can wait
+ * on the stuck thread), so a fresh helper can have them. */
+static void *watchdog_main(void *arg) {
+  (void)arg;
+  for (;;) {
+    uint64_t since = __atomic_load_n(&g_call_since, __ATOMIC_ACQUIRE);
+    if (since && now_ms() - since > CALL_WAIT_S * 1000ull) {
+      int ctl = g_inst.ctl;
+      if (ctl >= 0) send_line(ctl, "ERR install the PS5's installer didn't answer");
+      if (g_main_srv >= 0) close(g_main_srv);
+      if (g_inst.srv >= 0) close(g_inst.srv);
+      _exit(3);
+    }
+    sleep_ms(1000);
+  }
+  return NULL;
+}
+
+#ifndef COPIER_HOST_TEST
+/* Linked in (ps5.mk: -lSceIpmi before -lSceAppInstUtil), as ps5upload does:
+ * loaded at start, before the helper leaves the sandbox. Loading it later
+ * with dlopen never came back in the helper (2026-11-26, 13.60). */
+int sceAppInstUtilInitialize(void);
+int sceAppInstUtilInstallByPackage(appinst_meta_t *meta, appinst_pkg_t *info,
+                                   appinst_playgo_t *playgo);
+
+/* Asks the installer for the package at `uri`: 0 or the installer's code. */
+static int system_install(const char *uri, const char *title) {
+  static int ready;
+  static appinst_meta_t meta;
+  static appinst_pkg_t info;
+  static appinst_playgo_t playgo; /* kept: the installer may read them later */
+  uint64_t saved;
+  int rc;
+  if (!ready) {
+    saved = kernel_get_ucred_authid(getpid());
+    kernel_set_ucred_authid(getpid(), INSTALL_AUTHID);
+    call_begin();
+    (void)sceAppInstUtilInitialize(); /* an install it refuses says why */
+    call_end();
+    kernel_set_ucred_authid(getpid(), saved);
+    ready = 1;
+  }
+  memset(&meta, 0, sizeof meta);
+  memset(&info, 0, sizeof info);
+  memset(&playgo, 0, sizeof playgo);
+  meta.uri = uri;
+  meta.ex_uri = "";
+  meta.playgo_scenario_id = "";
+  meta.content_id = "";
+  meta.content_name = title;
+  meta.icon_url = "";
+  saved = kernel_get_ucred_authid(getpid());
+  kernel_set_ucred_authid(getpid(), INSTALL_AUTHID);
+  call_begin();
+  rc = sceAppInstUtilInstallByPackage(&meta, &info, &playgo);
+  call_end();
+  kernel_set_ucred_authid(getpid(), saved);
+  return rc;
+}
+#else
+/* Tests: a stand-in installer that reads the package from the server as the
+ * PS5's does (its first 64 KiB, the .crc, then 16 MiB ranges over one
+ * keep-alive connection) into $NB_TEST_PREFIX/installed.pkg, there (renamed
+ * into place) only once it is whole. The first range is asked in two parts
+ * split mid-block, as the coverage must count across requests.
+ * $NB_TEST_PREFIX/install_refused makes the install call fail. */
+static int sim_get(int fd, const char *path, uint64_t from, uint64_t to, FILE *out, int *status) {
+  char req[600], head[MAX_HEADER + 1], *buf;
+  size_t hlen, body_at;
+  uint64_t left;
+  int n = snprintf(req, sizeof req,
+                   "GET %s?product=0287&serverIpAddr=127.0.0.1&r=00000000 HTTP/1.1\r\n"
+                   "Host: 127.0.0.1\r\nRange: bytes=%llu-%llu\r\nConnection: keep-alive\r\n\r\n",
+                   path, (unsigned long long)from, (unsigned long long)to);
+  if (send_all(fd, req, (size_t)n) != 0 || read_head(fd, head, &hlen, &body_at, status) != 0)
+    return -1;
+  if (*status != 206) return 0;
+  left = to - from + 1;
+  buf = malloc(1u << 20);
+  if (!buf) return -1;
+  if (out) {
+    fseeko(out, (off_t)from, SEEK_SET);
+    fwrite(head + body_at, 1, hlen - body_at, out);
+  }
+  left -= hlen - body_at;
+  while (left > 0) {
+    ssize_t got = recv(fd, buf, left > (1u << 20) ? (1u << 20) : (size_t)left, 0);
+    if (got <= 0) break;
+    if (out) fwrite(buf, 1, (size_t)got, out);
+    left -= (uint64_t)got;
+  }
+  free(buf);
+  return left == 0 ? 0 : -1;
+}
+
+static void *sim_main(void *arg) {
+  const char *prefix = getenv("NB_TEST_PREFIX");
+  char file[600], part[620];
+  FILE *out;
+  int fd = -1, status = 0, ok = 0, split = 1;
+  uint64_t at = 0;
+  struct sockaddr_in addr;
+  (void)arg;
+  snprintf(file, sizeof file, "%s/installed.pkg", prefix ? prefix : ".");
+  snprintf(part, sizeof part, "%s.part", file);
+  out = fopen(part, "wb");
+  memset(&addr, 0, sizeof addr);
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)g_inst.srv_port);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (out && fd >= 0 && connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0 &&
+      sim_get(fd, g_inst.name, 0, g_inst.size < 65536 ? g_inst.size - 1 : 65535, NULL, &status) == 0 &&
+      status == 206 && sim_get(fd, "/UP0000-TEST00000_00-0000000000000000.crc", 0, 0, NULL, &status) == 0 &&
+      status == 404) {
+    ok = 1;
+    while (ok && at < g_inst.size) {
+      uint64_t to = at + (16ull << 20) - 1;
+      if (split && g_inst.size > (1ull << 20)) /* 0 .. mid-block, then the rest */
+        to = (1ull << 19) + 12345;
+      split = 0;
+      if (to >= g_inst.size) to = g_inst.size - 1;
+      ok = sim_get(fd, g_inst.name, at, to, out, &status) == 0 && status == 206;
+      at = to + 1;
+    }
+  }
+  if (out && fclose(out) == 0 && ok && at >= g_inst.size)
+    rename(part, file);
+  else
+    remove(part);
+  if (fd >= 0) close(fd);
+  return NULL;
+}
+
+static int system_install(const char *uri, const char *title) {
+  const char *prefix = getenv("NB_TEST_PREFIX");
+  char flag[600];
+  pthread_t t;
+  (void)uri;
+  (void)title;
+  snprintf(flag, sizeof flag, "%s/install_refused", prefix ? prefix : "");
+  call_begin(); /* as the PS5's calls are watched */
+  call_end();
+  if (prefix && access(flag, F_OK) == 0) return (int)0x80990002u;
+  if (start_thread(&t, sim_main, NULL) != 0) return -1;
+  pthread_detach(t);
+  return 0;
+}
+#endif
+
+/* Tells NASBridge (while it's there) or the PS5's notifications. */
+static void install_report(int done, const char *fmt, ...) {
+  char text[600];
+  va_list ap;
+  int ctl;
+  va_start(ap, fmt);
+  vsnprintf(text, sizeof text, fmt, ap);
+  va_end(ap);
+  pthread_mutex_lock(&g_inst.mu);
+  ctl = g_inst.ctl;
+  pthread_mutex_unlock(&g_inst.mu);
+  if (ctl >= 0)
+    send_line(ctl, "%s", text);
+  else if (done)
+    install_notify(text);
+}
+
+/* What NASBridge has sent so far that isn't a whole line yet. */
+static char g_heard[64];
+static size_t g_heard_n;
+
+/* Whether NASBridge said STOP (1), went away (-1) or is still there (0). */
+static int install_listen(void) {
+  char buf[64];
+  ssize_t n;
+  int ctl;
+  pthread_mutex_lock(&g_inst.mu);
+  ctl = g_inst.ctl;
+  pthread_mutex_unlock(&g_inst.mu);
+  if (ctl < 0) return -1;
+  n = recv(ctl, buf, sizeof buf - 1, MSG_DONTWAIT);
+  if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+    pthread_mutex_lock(&g_inst.mu);
+    close(g_inst.ctl);
+    g_inst.ctl = -1;
+    pthread_mutex_unlock(&g_inst.mu);
+    return -1;
+  }
+  if (n > 0) {
+    /* STOP may come in pieces: keep the tail between reads. */
+    size_t room = sizeof g_heard - 1 - g_heard_n;
+    if ((size_t)n > room) {
+      size_t keep = 4; /* "STO" plus one */
+      if (g_heard_n > keep) {
+        memmove(g_heard, g_heard + g_heard_n - keep, keep);
+        g_heard_n = keep;
+      }
+      room = sizeof g_heard - 1 - g_heard_n;
+      if ((size_t)n > room) n = (ssize_t)room;
+    }
+    memcpy(g_heard + g_heard_n, buf, (size_t)n);
+    g_heard_n += (size_t)n;
+    g_heard[g_heard_n] = '\0';
+    if (strstr(g_heard, "STOP")) return 1;
+  }
+  return 0;
+}
+
+/* The install, start to end, on a thread of its own: NASBridge's connection
+ * (g_inst.ctl) is ours to close. */
+static void *install_main(void *arg) {
+  char uri[128], message[700];
+  pthread_t acceptor;
+  int rc, k, have_acceptor = 0, finished = 0;
+  uint64_t done_at = 0;
+  (void)arg;
+  snprintf(uri, sizeof uri, "http://127.0.0.1:%d%s", g_inst.srv_port, g_inst.name);
+  if (start_thread(&acceptor, accept_main, NULL) == 0) have_acceptor = 1;
+  pthread_mutex_lock(&g_inst.mu);
+  g_inst.last_asked = now_ms();
+  pthread_mutex_unlock(&g_inst.mu);
+  rc = have_acceptor ? system_install(uri, g_inst.title) : -1;
+  if (rc != 0) {
+    if (rc == -1)
+      install_report(1, "ERR install the PS5's installer couldn't be loaded");
+    else
+      install_report(1, "ERR install the PS5's installer refused it (code 0x%08X)", (unsigned)rc);
+    goto done;
+  }
+  install_report(0, "A"); /* the installer took it: the PS5 holds a part install now */
+  for (;;) {
+    uint64_t covered, asked;
+    int heard = finished ? 0 : install_listen(), changed;
+    if (heard > 0) {
+      install_report(1, "STOPPED");
+      break;
+    }
+    int conns = 0;
+    pthread_mutex_lock(&g_inst.mu);
+    covered = g_inst.covered;
+    asked = g_inst.last_asked;
+    changed = g_inst.changed;
+    for (k = 0; k < MAX_SERVED; ++k) conns += g_inst.conns[k] >= 0;
+    pthread_mutex_unlock(&g_inst.mu);
+    if (!finished && changed) {
+      if (g_inst.ctl >= 0)
+        install_report(1, "ERR install the package on the NAS is a different size now");
+      else {
+        snprintf(message, sizeof message,
+                 "Couldn't install %s: the package on the NAS changed.", g_inst.title);
+        install_notify(message);
+      }
+      break;
+    }
+    if (!finished) {
+      /* "P <fetched> <size> <the installer's connections>" */
+      install_report(0, "P %llu %llu %d", (unsigned long long)covered,
+                     (unsigned long long)g_inst.size, conns);
+      if (covered >= g_inst.size) {
+        /* The installer has it all; it goes on unpacking by itself. */
+        if (g_inst.ctl >= 0)
+          install_report(1, "OK");
+        else {
+          snprintf(message, sizeof message, "%s is on the PS5: its installer is finishing the install.", g_inst.title);
+          install_notify(message);
+        }
+        pthread_mutex_lock(&g_inst.mu);
+        if (g_inst.ctl >= 0) close(g_inst.ctl);
+        g_inst.ctl = -1;
+        pthread_mutex_unlock(&g_inst.mu);
+        finished = 1;
+        done_at = now_ms();
+        pthread_mutex_lock(&g_inst.mu);
+        g_inst.lingering = 1;
+        pthread_mutex_unlock(&g_inst.mu);
+      } else if (now_ms() - asked > INSTALL_IDLE_S * 1000ull) {
+        if (g_inst.ctl >= 0)
+          install_report(1, "ERR install the PS5's installer stopped asking for the package");
+        else {
+          snprintf(message, sizeof message, "Couldn't install %s: the PS5's installer stopped.",
+                   g_inst.title);
+          install_notify(message);
+        }
+        break;
+      }
+    } else if (install_stopping() ||
+               now_ms() - (asked > done_at ? asked : done_at) > INSTALL_LINGER_S * 1000ull) {
+      break; /* it has asked for nothing more: done serving */
+    }
+    sleep_ms(INSTALL_POLL_MS);
+  }
+done:
+  pthread_mutex_lock(&g_inst.mu);
+  g_inst.stop = 1;
+  for (k = 0; k < MAX_SERVED; ++k)
+    if (g_inst.conns[k] >= 0) shutdown(g_inst.conns[k], SHUT_RDWR);
+  pthread_mutex_unlock(&g_inst.mu);
+  if (have_acceptor) pthread_join(acceptor, NULL);
+  /* The installer's connections end on their own (cut off above). Each has
+   * its own copy of the source, so one still winding down (a NAS read that
+   * hasn't timed out) doesn't hold up what follows. */
+  for (k = 0; k < 100 && __atomic_load_n(&g_serving, __ATOMIC_ACQUIRE) > 0; ++k) sleep_ms(100);
+  pthread_mutex_lock(&g_inst.mu);
+  close(g_inst.srv);
+  g_inst.srv = -1;
+  if (g_inst.ctl >= 0) close(g_inst.ctl);
+  g_inst.ctl = -1;
+  if (g_inst.source) memset(g_inst.source, 0, g_inst.source_len); /* the password */
+  free(g_inst.source);
+  g_inst.source = NULL;
+  install_forget();
+  g_inst.active = 0;
+  g_inst.lingering = 0;
+  pthread_mutex_unlock(&g_inst.mu);
+  return NULL;
+}
+
+/* Starts an install (the NBK1 line). Returns 1 when the install's thread
+ * took the connection (the caller mustn't close it), 0 otherwise (the reply
+ * was sent). */
+static int run_install(int ctl, char *line) {
+  char *field[7], *save = NULL, *sign[5];
+  size_t title_len, source_len;
+  struct sockaddr_in addr;
+  socklen_t alen = sizeof addr;
+  pthread_t t;
+  int k, srv;
+  static unsigned serial;
+  field[0] = strtok_r(line, "\t", &save);
+  for (k = 1; k < 7; ++k) field[k] = strtok_r(NULL, "\t", &save);
+  if (!field[6]) {
+    send_line(ctl, "ERR request not a NASBridge install request");
+    return 0;
+  }
+  title_len = (size_t)strtoull(field[5], NULL, 10);
+  source_len = (size_t)strtoull(field[6], NULL, 10);
+  if (title_len >= MAX_TITLE || source_len < 4 || source_len > MAX_REQUEST ||
+      strtoull(field[3], NULL, 10) == 0) {
+    send_line(ctl, "ERR request bad request");
+    return 0;
+  }
+  if (!g_watchdog) { /* a stuck installer call would hold the helper for good */
+    send_line(ctl, "ERR install the copy helper couldn't start its safety check. Restart the PS5");
+    return 0;
+  }
+  pthread_mutex_lock(&g_inst.mu);
+  /* One that has ended (stop set) is only tidying up, and one that's done
+   * and only still serving makes way: give it a moment. */
+  if (g_inst.active && g_inst.lingering) g_inst.stop = 1;
+  for (k = 0; k < 100 && g_inst.active && g_inst.stop; ++k) {
+    pthread_mutex_unlock(&g_inst.mu);
+    sleep_ms(100);
+    pthread_mutex_lock(&g_inst.mu);
+  }
+  if (g_inst.active) {
+    pthread_mutex_unlock(&g_inst.mu);
+    send_line(ctl, "ERR busy another install is running");
+    return 0;
+  }
+  g_inst.active = 1; /* ours now; cleared below on a bad request */
+  pthread_mutex_unlock(&g_inst.mu);
+  g_inst.source = malloc(source_len + 1);
+  if (!g_inst.source || recv_exact(ctl, g_inst.title, title_len) != 0 ||
+      recv_exact(ctl, g_inst.source, source_len) != 0)
+    goto bad;
+  g_inst.title[title_len] = '\0';
+  g_inst.source[source_len] = '\0';
+  g_inst.source_len = source_len;
+  snprintf(g_inst.ip, sizeof g_inst.ip, "%s", field[1]);
+  g_inst.port = atoi(field[2]);
+  g_inst.size = strtoull(field[3], NULL, 10);
+  g_inst.smb = atoi(field[4]) != 0;
+  if (g_inst.smb) {
+    if (smb_fields(g_inst.source, source_len, sign, 5) != 0) goto bad;
+    g_inst.in.share = sign[0];
+    g_inst.in.path = sign[1];
+    g_inst.in.user = sign[2];
+    g_inst.in.domain = sign[3];
+    g_inst.in.password = sign[4];
+  } else if (memcmp(g_inst.source + source_len - 4, "\r\n\r\n", 4) != 0) {
+    goto bad;
+  }
+  /* The installer's server, on a port the system picks. */
+  srv = socket(AF_INET, SOCK_STREAM, 0);
+  memset(&addr, 0, sizeof addr);
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (srv < 0 || bind(srv, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(srv, 8) != 0 ||
+      getsockname(srv, (struct sockaddr *)&addr, &alen) != 0) {
+    if (srv >= 0) close(srv);
+    send_line(ctl, "ERR install couldn't open a port for the installer");
+    goto fail;
+  }
+  g_inst.srv = srv;
+  g_inst.srv_port = ntohs(addr.sin_port);
+  snprintf(g_inst.name, sizeof g_inst.name, "/nasbridge/%u-%llu.pkg", ++serial,
+           (unsigned long long)now_ms());
+  g_inst.stop = 0;
+  g_inst.served = 0;
+  g_inst.lingering = 0;
+  g_inst.changed = 0;
+  install_forget();
+  g_heard_n = 0;
+  g_inst.ctl = ctl;
+  for (k = 0; k < MAX_SERVED; ++k) g_inst.conns[k] = -1;
+  {
+    struct timeval tv = {0, 0}; /* the install thread polls it */
+    setsockopt(ctl, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  }
+  if (start_thread(&t, install_main, NULL) != 0) {
+    close(srv);
+    g_inst.srv = -1;
+    g_inst.ctl = -1;
+    send_line(ctl, "ERR install couldn't start");
+    goto fail;
+  }
+  pthread_detach(t);
+  return 1;
+bad:
+  send_line(ctl, "ERR request bad install request");
+fail:
+  pthread_mutex_lock(&g_inst.mu);
+  free(g_inst.source);
+  g_inst.source = NULL;
+  g_inst.active = 0;
+  pthread_mutex_unlock(&g_inst.mu);
+  return 0;
+}
+
+static int run_job(int ctl) {
   char line[MAX_FILE + 128], *field[7], *save = NULL, *request = NULL;
   char ip[64], path[MAX_FILE];
   int k, streams = 1, err;
   size_t reqlen;
+  int kept = 0;
   job_t j;
 
   memset(&j, 0, sizeof j);
@@ -2164,6 +3107,19 @@ static void run_job(int ctl) {
   }
   if (strncmp(line, PROTO_SMB "\t", sizeof PROTO_SMB) == 0) {
     run_smb_job(&j, line);
+    goto out;
+  }
+  if (strncmp(line, INSTALL_PROTO "\t", sizeof INSTALL_PROTO) == 0) {
+    kept = run_install(ctl, line);
+    goto out;
+  }
+  if (strncmp(line, QUIT_PROTO, 4) == 0) {
+    if (install_active()) {
+      send_line(ctl, "ERR busy an install is running");
+    } else {
+      g_quit = 1;
+      send_line(ctl, "OK");
+    }
     goto out;
   }
   if (strncmp(line, PART_PROTO "\t", sizeof PART_PROTO) == 0) {
@@ -2247,6 +3203,7 @@ out:
   if (j.fd >= 0) close(j.fd);
   pthread_mutex_destroy(&j.mu);
   pthread_cond_destroy(&j.cv);
+  return kept;
 }
 
 /* ------------------------------------------------------------------ main */
@@ -2282,6 +3239,14 @@ int main(void) {
    * does the copying and this one leaves quietly. */
   srv = bind_listen(port);
   if (srv < 0) return 0;
+  g_main_srv = srv;
+  {
+    pthread_t dog;
+    if (start_thread(&dog, watchdog_main, NULL) == 0) {
+      pthread_detach(dog);
+      g_watchdog = 1;
+    }
+  }
 #ifndef COPIER_HOST_TEST
   if (elevate() != 0)
     notify("NASBridge copy helper: couldn't get full access (is the jailbreak fully loaded?)");
@@ -2293,14 +3258,17 @@ int main(void) {
     int cli;
     FD_ZERO(&set);
     FD_SET(srv, &set);
-    if (select(srv + 1, &set, NULL, NULL, &tv) <= 0) break; /* idle: done */
+    if (select(srv + 1, &set, NULL, NULL, &tv) <= 0) {
+      if (install_active()) continue; /* an install outlasts NASBridge */
+      break;                          /* idle: done */
+    }
     cli = accept(srv, NULL, NULL);
     if (cli < 0) continue;
     tv.tv_sec = REQUEST_S;
     tv.tv_usec = 0;
     setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-    run_job(cli);
-    close(cli);
+    if (!run_job(cli)) close(cli); /* an install keeps its connection */
+    if (g_quit) break;
   }
   close(srv);
   return 0;
