@@ -1225,9 +1225,12 @@ class Library final : public app::Concept
     }
 
     // The game ShadowMountPlus has for this one (by title ID), if any.
+    // An update or add-on package shares its game's title ID: the game being
+    // there doesn't mean it is, and deleting "it" would delete the game.
+    // Those never count as on the PS5 (they can always be queued).
     const SmpGame *ps5_game(const Game &game) const
     {
-        if (game.title_id.empty())
+        if (game.title_id.empty() || is_addition(game))
             return nullptr;
         for (const SmpGame &smp : space_.games)
             if (smp.title_id == game.title_id && drive_connected(space_, smp.path))
@@ -1321,7 +1324,7 @@ class Library final : public app::Concept
         if (queue_.finished_entry == game.source.entry ||
             queue_.waiting(game.source.entry) != nullptr)
         {
-            out[0] = {is_package(game) ? "Installed" : "Copied", Command::none, false, false};
+            out[0] = {is_package(game) ? "Sent to PS5" : "Copied", Command::none, false, false};
             return 1;
         }
         const CopyCheck check = copy_check(game);
@@ -1387,7 +1390,10 @@ class Library final : public app::Concept
         }
         case Command::enqueue:
             ok = transfers_.enqueue(connection_.connection(), game.source, game.title,
-                                    target_of(game), &why, game.on_ps5);
+                                    target_of(game), &why,
+                                    // Unknown counts as there: a part install of it is
+                                    // then never uninstalled by title ID.
+                                    game.on_ps5 || !space_.games_known);
             if (ok)
             {
                 // Back to the library, with the queue open on the right to
@@ -1602,6 +1608,16 @@ class Library final : public app::Concept
     static bool is_package(const Game &game)
     {
         return game.from_nas && game.source.image && is_package_name(game.source.image_path);
+    }
+    // An update or add-on package (the library marks them in the title).
+    static bool is_addition(const Game &game)
+    {
+        const auto ends = [&game](const std::string &tail)
+        {
+            return game.title.size() >= tail.size() &&
+                   game.title.compare(game.title.size() - tail.size(), tail.size(), tail) == 0;
+        };
+        return is_package(game) && (ends(" (update)") || ends(" (add-on)"));
     }
     // Where this game would go: the chosen destination, or internal storage
     // for a package.

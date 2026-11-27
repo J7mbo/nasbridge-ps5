@@ -629,7 +629,9 @@ HelperInstall run_install(const std::string &job, const std::string &payload,
             result.end = kind == "install" ? HelperInstall::End::failed
                          : kind == "busy"  ? HelperInstall::End::busy
                                            : HelperInstall::End::unavailable; // an older helper
-            if (kind == "request")
+            // An older helper doesn't know installs; its other "request"
+            // replies (a bad request) keep their own reason.
+            if (kind == "request" && result.why.rfind("not a NASBridge", 0) == 0)
                 result.why = "an older copy helper is still running. Restart the PS5, or wait a "
                              "few minutes for it to leave";
             ::close(fd);
